@@ -1,3 +1,0 @@
-encounters=0
-shinies=0
-sinceshiny=0
