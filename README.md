@@ -36,7 +36,6 @@
   - [Discord Notifications](#discord-notifications)
   - [Savestate Slot Usage](#savestate-slot-usage)
   - [Simulating Randomness: RNG Manipulation in Deterministic Emulation](#simulating-randomness-rng-manipulation-in-deterministic-emulation)
-  - [Case Study: Pokémon Gen 1 & Gen 2 Soft Reset Automation](#case-study-pokémon-gen-1--gen-2-soft-reset-automation)
   - [How Headbutt Trees work in Gen 2](#how-headbutt-trees-work-in-gen-2)
 - [Roadmap](#roadmap)
 
@@ -387,10 +386,11 @@ Each module uses its own dedicated slot to avoid collisions if you switch betwee
 
 Slots 1-2 and 6-9 are free for your own manual use without conflicting with any module.
 
-Simulating Randomness: RNG Manipulation in Deterministic Emulation
-What "randomness" actually means in software
+# Simulating Randomness: RNG Manipulation in Deterministic Emulation
 
-Almost nothing in software is truly random. What games (and most computer systems) use is a pseudo-random number generator (PRNG)—a completely deterministic algorithm that takes some internal state, transforms it with a fixed mathematical formula, and produces output that looks statistically random.
+## What "randomness" actually means in software
+
+Almost nothing in software is truly random. What games (and most computer systems) use is a **pseudo-random number generator (PRNG)**—a completely deterministic algorithm that takes some internal state, transforms it with a fixed mathematical formula, and produces output that looks statistically random.
 
 Given the exact same starting state and the exact same sequence of calls, a PRNG produces the exact same "random" output every single time. That's not a bug—it's how PRNGs are built.
 
@@ -398,78 +398,162 @@ On real hardware, this determinism is normally invisible. A PRNG's internal stat
 
 The PRNG is still deterministic—it just never sees the same inputs twice, so it feels random.
 
-Where this breaks: Deterministic emulation
+---
 
-Tools like BizHawk are deliberately engineered for perfect, bit-exact determinism—a core requirement for tool-assisted speedrunning, where a recorded input sequence must replay identically on any machine, forever.
+## Where this breaks: Deterministic emulation
+
+Tools like **BizHawk** are deliberately engineered for perfect, bit-exact determinism—a core requirement for tool-assisted speedrunning, where a recorded input sequence must replay identically on any machine, forever.
 
 That same property is exactly what breaks "randomness" for automated, reset-based interaction with a game's PRNG:
 
-Reload the same save state, replay the same inputs, and you get the exact same PRNG state—and therefore the exact same "random" result—every single time.
+- Reload the same save state.
+- Replay the same inputs.
+- The emulator restores the exact same PRNG state.
+- The game produces the exact same "random" result every single time.
 
-This isn't specific to any one game; it affects any automation that resets and retries against a deterministic emulator's internal RNG.
+This isn't specific to any one game; it affects any automation that repeatedly resets and retries against a deterministic emulator.
 
-Simulating randomness on purpose
+---
+
+## Simulating randomness on purpose
 
 Since the natural source of entropy (human timing variance) is gone, an automation script has to manufacture some on purpose.
 
 Typically this is done by deliberately varying frame timing between attempts so the PRNG's state differs each time even though the algorithm itself stays perfectly deterministic.
 
-This is genuinely simulating randomness—not generating true entropy, but artificially reintroducing the kind of variance a human would have supplied by accident.
+This isn't generating true entropy—it's artificially reintroducing the timing variance that a human player would naturally provide.
 
-The naive approach, and its hidden trap
+---
 
-The obvious fix is adding a single random delay after each reset.
+## The naive approach—and its hidden trap
 
-The problem is that if the PRNG's state is tied to a countable deterministic quantity (such as elapsed frames), then a delay of 1–N frames can only ever reach N distinct PRNG states, regardless of how many times the script retries.
+The obvious solution is adding one random delay after every reset.
 
-A delay range that's too small doesn't merely add "some" randomness—it silently caps how many outcomes are even reachable, potentially locking a script out of ever producing specific rare results.
+The problem is that if the PRNG's state depends on a deterministic value such as elapsed frames, then a delay of **1–N frames** can only ever reach **N distinct PRNG states**, regardless of how many thousands of attempts are made.
 
-A better technique: Splitting delays across multiple points
+A delay range that's too small doesn't merely reduce randomness—it silently limits which outcomes are mathematically reachable, potentially preventing some rare results from ever occurring.
 
-Rather than one large delay (which can guarantee full coverage but at a steep average-time cost), splitting the delay across several different points in the automation sequence produces significantly better coverage per unit of waiting time.
+---
 
-Each delay is separated by real game logic, such as:
+## A better technique: Splitting delays across multiple points
 
-Button presses
-Dialogue
-Animations
-Menu transitions
+Rather than using one large delay (which guarantees better coverage but dramatically increases average attempt time), the delay can be split across several different points in the automation sequence.
 
-Testing consistently showed that adding more split points across genuinely different moments closed the gap toward true random-like behavior far more efficiently than one large combined delay.
+These split points occur naturally during gameplay, for example:
 
-Where splitting itself hits a ceiling
+- Button presses
+- Dialogue
+- Animations
+- Menu transitions
 
-Splitting helps, but it doesn't remove the underlying constraint—it just distributes the same cost more efficiently. Measured directly against Pokémon Crystal's DV roll, two things fell out of tuning the per-split delay range wider and wider:
+Testing consistently showed that distributing delays across genuinely different gameplay moments produced much better state coverage per unit of waiting time than placing all randomness into one large delay.
 
-Range mattered far more than count. Doubling how many split points fired barely moved measured coverage of the DV space. Doubling the range of each individual delay (256 → 512 frames) jumped measured coverage from roughly 2–6% to roughly 21%—by far the single biggest change tested.
-Coverage still never approached 100%, no matter how wide the range got. Even at 4–8x the original delay range, a large majority of the DV space stayed structurally unreachable from a single starting save state.
+---
 
-That second point ruled out "just keep widening the delay" as a real fix. Something underneath was capping the ceiling regardless of how the delay was shaped.
+## Where splitting reaches its limit
 
-The actual mechanism: a shared hardware timer, sampled once
+Splitting delays improves efficiency, but it doesn't remove the underlying limitation—it only distributes the same waiting time more effectively.
 
-Digging into the game's actual disassembly (not just observed behavior) explained why. Generation II's RNG isn't two independent random draws—both of its running totals are updated from the same single hardware timer sample on every call:
+When testing Pokémon Crystal's DV generation while gradually increasing the delay range, two clear observations emerged:
 
+- **Delay range mattered far more than the number of split points.**
+  - Doubling the number of split points barely changed measured DV coverage.
+  - Doubling the delay range (256 → 512 frames) increased measured coverage from roughly **2–6%** to roughly **21%**, making it by far the most significant improvement observed.
+
+- **Coverage never approached 100%.**
+  - Even with delay ranges four to eight times larger than the original implementation, most DV combinations remained permanently unreachable from a single save state.
+
+This ruled out the obvious conclusion of simply "making the delay bigger." Something deeper was imposing a hard ceiling.
+
+---
+
+## The actual mechanism: One shared hardware timer
+
+Inspecting the game's disassembly—not just its observed behavior—revealed why.
+
+Generation II's RNG is not two independent random draws.
+
+Instead, both running totals are updated from the same hardware timer sample every time the RNG function executes:
+
+```text
 hRandomAdd += [timer sample]
 hRandomSub -= [timer sample]
+```
 
-The Attack/Defense DV roll and the Speed/Special DV roll are two back-to-back calls to this same function. Because they draw from the same timer sample rather than two independent sources, they're correlated, not independent—inflating the delay range can't decouple them, since there's only one underlying value driving both.
+The Attack/Defense DV roll and the Speed/Special DV roll are simply two consecutive calls to this same routine.
 
-That timer itself only advances once every 256 CPU cycles, while a single emulated frame is 70,224 cycles long. The math on how the two line up (70,224 mod 256) means a delay measured in whole frames—the only granularity a frame-advance-based script can produce—can only ever land on 16 distinct phases of that timer, out of 256 possible. This ceiling is fixed by the hardware itself: it doesn't move no matter how wide the delay range gets, how many split points fire, or how long the script waits.
+Because both draws originate from the same timer sample instead of two independent sources, they are **correlated**.
 
-In short: splitting and widening delays optimizes how efficiently a script explores the states reachable from one save state. It cannot expand what's reachable from that save state in the first place. That's a structural property of the exact instant the save state was captured, not something later button-press timing can undo.
+Increasing delay ranges cannot make them independent because only one underlying timer value exists.
 
-The real fix: periodically re-rolling the save state itself
+---
 
-Since the ceiling belongs to the save state, not to the delay strategy, the only way past it is to stop reusing the same save state forever.
+### The hardware limitation
 
-The working fix: on a fixed timer (every 30 minutes, in this implementation), the script fires one large, full-range entropy injection—paying the steep average-time cost once—and then re-saves the save state at that new point. Every reset after that draws from a freshly re-baselined starting point, with its own, different set of reachable states. This mirrors what a human player would get for free just by walking away and coming back later: the game's RNG registers keep evolving in the background regardless, and capturing a new save state at a different moment inherits whatever they've drifted to by then.
+The timer itself advances only once every **256 CPU cycles**.
 
-Practically, this means a save state whose reachable set happens to exclude every winning outcome isn't a permanent dead end—it's just the current 30-minute window's bad luck, corrected automatically at the next re-roll.
+One Game Boy frame lasts **70,224 CPU cycles**.
 
-The trade-off this creates: wide-and-slow vs. narrow-and-fast
+Since:
 
-Once re-rolling exists, the earlier "wider range is better" conclusion actually flips. A wasted window—one whose reachable set happens to exclude every desired outcome—costs the same fixed 30 minutes either way, regardless of how large that window's reachable set was. Modeling realistic measured throughput at each range (a narrower, faster range completing many more attempts per window vs. a wider, slower range completing far fewer) showed that cycling through more 30-minute windows per hour matters more than any single window's odds of success. The delay range was deliberately dialed back down after adding the re-roll, for exactly this reason—speed wins once there's a guaranteed periodic reset of the ceiling itself.
+```text
+70,224 mod 256 = 64
+```
+
+A script that can only advance whole frames can only ever observe **16 distinct timer phases** out of the timer's 256 possible phases.
+
+That ceiling is imposed by the Game Boy hardware itself.
+
+It does **not** change by:
+
+- increasing the delay range,
+- adding more split points,
+- or simply waiting longer.
+
+Splitting delays only improves exploration of the states already reachable from a save state—it cannot expand that reachable set.
+
+That limitation belongs to the exact instant the save state was captured.
+
+---
+
+## The real fix: Re-rolling the save state
+
+Since the limitation belongs to the save state rather than the delay strategy, the only way to move beyond it is to periodically stop reusing the same save state.
+
+The implemented solution is straightforward:
+
+- Every **30 minutes**, the script performs one large, full-range entropy injection.
+- It then immediately creates a brand-new save state.
+- All subsequent resets begin from this newly generated baseline.
+
+Each newly captured save state has its own unique set of reachable RNG states.
+
+This mirrors real gameplay: if a human walks away and returns later, the game's internal RNG registers have naturally drifted, meaning a save captured later starts from an entirely different baseline.
+
+Practically, this means that if one save state's reachable set excludes every desired outcome, that state is no longer a permanent dead end—it simply represents one unlucky 30-minute window before the next automatic re-roll replaces it.
+
+---
+
+## The trade-off: Wide and slow vs. narrow and fast
+
+Introducing periodic save-state re-rolling changes the optimization problem completely.
+
+Before re-rolling existed, larger delay ranges were preferable because they expanded the portion of the reachable state space explored.
+
+Once the save state itself is periodically refreshed, however, spending additional time squeezing more coverage from a single save state becomes much less valuable.
+
+A "bad" save state—one whose reachable set excludes every desired outcome—lasts the same **30 minutes** regardless of how large that reachable set is.
+
+Modeling real measured throughput showed that:
+
+- Narrow delay ranges complete significantly more attempts within each 30-minute window.
+- Wider delay ranges complete far fewer attempts, despite slightly better coverage.
+
+The increased number of independent windows explored over time outweighs the improved coverage of any individual window.
+
+For that reason, the delay range was intentionally reduced after introducing periodic save-state re-rolling.
+
+Once the ceiling itself is guaranteed to reset, **speed becomes the dominant optimization.**
 
 ---
 
@@ -495,41 +579,8 @@ That distinction is empirically testable, even if complete coverage is not.
 
 ---
 
-# Case Study: Pokémon Gen 1 & Gen 2 Soft Reset Automation
 
-Applying the above concepts to a real example.
-
-Gen 1/2's RNG (documented by the **pokecrystal** disassembly project and the TAS/speedrunning community) is updated using the Game Boy hardware register **rDIV**, representing the upper 8 bits of a continuously incrementing 16-bit CPU cycle counter.
-
-```text
-hRandomAdd += rDIV
-hRandomSub -= rDIV
-```
-
-This updates every time the game's `Random()` function is called and once every V-Blank.
-
-Because it is CPU-cycle-based rather than simply incremented once per frame, it provides genuinely high entropy—not a small repeating cycle.
-
-Automated soft resetting (reload → check → reset → repeat) runs directly into the deterministic problem described above.
-
-Measured from real automated console logs:
-
-| Split Points | Delay | Unique / Total | Coverage | Worst Repeat |
-|--------------|-------|---------------:|---------:|-------------:|
-| 1 | 1–30 frames | ~20 / 80 | ~25% | Severe clustering |
-| 2 | 1–256 each | 193 / 270 | 71.5% | 5× |
-| 4 | 1–256 each | 234 / 249 | 94.0% | 3× |
-| 8 | 1–256 each | 248 / 251 | 98.8% | 2× |
-
-The theoretical ceiling for perfectly uniform randomness at this sample size is approximately **99.8%**.
-
-Using **8 split points** reached **98.8%**, placing it within roughly one percentage point of ideal randomness—a difference consistent with normal statistical variation rather than obvious structural bias.
-
-Average added delay was roughly **1,000 frames**, corresponding to only a few seconds at normal speed and effectively instantaneous while fast-forwarding.
-
----
-
-### The "True Randomness" checkbox
+### The "True Randomness" checkbox (legacy)
 
 Soft-reset modules (**Starters** and **Egg**) include a **True Randomness** option.
 
