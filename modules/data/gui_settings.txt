@@ -1,0 +1,2 @@
+pingenabled=0
+pingid=
