@@ -1,3 +1,0 @@
-encounters=963
-shinies=0
-sinceshiny=944
