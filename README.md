@@ -555,8 +555,6 @@ For that reason, the delay range was intentionally reduced after introducing per
 
 Once the ceiling itself is guaranteed to reset, **speed becomes the dominant optimization.**
 
----
-
 ## Honest limitations
 
 This approach **cannot mathematically prove 100% coverage**.
