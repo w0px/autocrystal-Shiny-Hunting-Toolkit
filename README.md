@@ -302,7 +302,9 @@ Instead, use the game's **battery save (SRAM)**—the same save data created whe
 | Unthrottled | Fully Supported ✅ |
 
 ## Discord Notifications
-<img width="571" height="173" alt="image" src="https://github.com/user-attachments/assets/4c882ee4-8eab-4c6c-a6d0-7c9113ad187b" />
+<img width="588" height="621" alt="image" src="https://github.com/user-attachments/assets/530c45ca-d68b-4b87-8ee5-4d622b405b92" />
+
+<img width="532" height="129" alt="image" src="https://github.com/user-attachments/assets/950b0fd4-ca53-470c-9db9-a6c77deb6126" />
 
 
 
