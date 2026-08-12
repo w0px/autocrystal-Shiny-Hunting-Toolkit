@@ -51,6 +51,7 @@
 - Automatic Level Grinding
 - Specific Encounter Hunting
 - Stuck Detection & Auto-Recovery
+- Auto Catch Shiny / Perfect DV / held items
 
 ### Starter Module ✅
 - Shiny Detection
@@ -67,12 +68,14 @@
 - Automatic Level Grinding
 - Specific Encounter Hunting
 - Stuck Detection & Auto-Recovery
+- Auto Catch Shiny / Perfect DV / held items
 
 ### Static EncounterModule ✅
 - Shiny Detection
 - Perfect DV Detection
 - Perfect Negative DV Detection
 - Discord Notifications
+- Auto Catch Shiny / Perfect DV 
 
 ### Headbutt Encounter Module ✅
 - Shiny Detection
@@ -83,6 +86,7 @@
 - Automatic Level Grinding
 - Specific Encounter Hunting
 - Stuck Detection & Auto-Recovery
+- Auto Catch Shiny / Perfect DV / held items 
 
 ### Egg Module ✅
 - Shiny Detection
@@ -738,7 +742,6 @@ This result shows that, if a single row or column of trees is traversed, moving 
 
 ## Roadmap
 
-- [ ] Auto Catch for Crystal
 
 
 
