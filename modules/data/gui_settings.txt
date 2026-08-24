@@ -1,2 +1,2 @@
-pingenabled=0
-pingid=
+pingenabled=1
+pingid=&1532011054190563568

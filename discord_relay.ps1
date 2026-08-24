@@ -1,9 +1,5 @@
 param(
-    # Fill in your own Discord webhook URL here (Server Settings ->
-    # Integrations -> Webhooks -> New Webhook -> Copy URL), or pass it
-    # with -DiscordWebhookUrl when launching this script instead of
-    # hardcoding it.
-    [string]$DiscordWebhookUrl = "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+    [string]$DiscordWebhookUrl = "YOUR WEBHOOK"
 )
 
 Add-Type -AssemblyName System.Web

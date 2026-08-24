@@ -9,6 +9,26 @@ local M = {}
 local script_path = debug.getinfo(1, "S").source:sub(2)
 local script_dir = script_path:match("(.*[/\\])") or "./"
 local STATS_FILE_PATH = script_dir .. "wild_stats.txt"
+-- Confirmed via a real user report: after a PC restart, TOTAL ENCOUNTERS
+-- read 0 in the live GUI AND in wild_stats.txt itself - a real lifetime
+-- total (hundreds of thousands of encounters) silently wiped. Nothing in
+-- this codebase ever intentionally resets these stats (verified - the
+-- only reads/writes of this file are M.load()/M.save() below), so the
+-- leading suspect is a race with something outside Lua's control - e.g.
+-- a cloud-synced folder (OneDrive Files On-Demand and similar) leaving
+-- this file as a 0-byte placeholder for a moment right after boot, until
+-- Windows actually re-downloads/hydrates it. If BizHawk's very first
+-- M.load() this session hits that window, io.open succeeds but the file
+-- reads as empty - completely indistinguishable, from here, from a
+-- genuinely fresh install. Every field then silently stays at its
+-- default of 0, and the very next M.save() (triggered by the first
+-- encounter) bakes those zeros over the real file, permanently.
+-- BAK_FILE_PATH exists specifically to survive that: M.save() only ever
+-- refreshes it from a primary file that just parsed successfully -
+-- never from a corrupted one - so it always holds the last CONFIRMED-
+-- good snapshot. M.load() falls back to it automatically if the primary
+-- file exists but nothing recognizable could be parsed from it.
+local BAK_FILE_PATH = STATS_FILE_PATH .. ".bak"
 
 M.totalEncounters = 0
 M.totalShinies = 0
@@ -36,13 +56,19 @@ M.speciesShinies = {}
 -- counters below.
 M.lastShinySpeciesId = nil
 
-function M.load()
-    local f = io.open(STATS_FILE_PATH, "r")
-    if f == nil then return end
+-- Parses one stats file (primary or backup) into M's fields. Returns
+-- true if a recognized "encounters=" line was actually found - the one
+-- signal M.load() below uses to tell "this file has real data" apart
+-- from "this file exists but is empty/corrupted" (a plain empty file
+-- and a fresh, hasn't-hunted-yet-but-genuinely-new file are otherwise
+-- indistinguishable).
+local function parse_stats_file(f)
+    local sawEncounters = false
     for line in f:lines() do
         local key, value = line:match("^(%a+)=(.+)$")
         if key == "encounters" then
             M.totalEncounters = tonumber(value)
+            sawEncounters = true
         elseif key == "shinies" then
             M.totalShinies = tonumber(value)
         elseif key == "sinceshiny" then
@@ -72,7 +98,42 @@ function M.load()
             end
         end
     end
+    return sawEncounters
+end
+
+function M.load()
+    local f = io.open(STATS_FILE_PATH, "r")
+    if f == nil then
+        -- No file at all yet - a genuinely fresh install. Nothing to
+        -- warn about, nothing to recover; M's fields stay at their
+        -- declared defaults (all 0 / empty), same as always.
+        return
+    end
+    local sawEncounters = parse_stats_file(f)
     f:close()
+
+    if not sawEncounters then
+        -- The file exists but nothing recognizable was in it - see the
+        -- BAK_FILE_PATH comment above for why this happens and what it
+        -- risks. Loud on purpose: silently proceeding here is exactly
+        -- what let a real user's stats get zeroed out and then
+        -- permanently overwritten by the next save.
+        print("WARNING: " .. STATS_FILE_PATH .. " exists but no valid stats could be read from it (empty or corrupted) - lifetime totals would start from 0 this session instead of your real history.")
+        local bak = io.open(BAK_FILE_PATH, "r")
+        if bak then
+            local recovered = parse_stats_file(bak)
+            bak:close()
+            if recovered then
+                print(string.format(
+                    "Recovered lifetime stats from backup (%s): encounters=%d, shinies=%d. This will be written back to %s the next time stats are saved.",
+                    BAK_FILE_PATH, M.totalEncounters, M.totalShinies, STATS_FILE_PATH))
+            else
+                print("WARNING: backup at " .. BAK_FILE_PATH .. " also has no valid stats in it - starting from 0 with no way to auto-recover this time.")
+            end
+        else
+            print("WARNING: no backup found at " .. BAK_FILE_PATH .. " to recover from - starting from 0 this time. This backup will start being kept automatically from now on.")
+        end
+    end
 end
 
 -- Serializes an {id = count} table into a sorted "id:count,id:count,..."
@@ -92,7 +153,42 @@ local function serialize_id_counts(idCounts)
     return table.concat(pairsList, ",")
 end
 
+-- Refreshes BAK_FILE_PATH from whatever's CURRENTLY on disk at
+-- STATS_FILE_PATH, right before that file gets overwritten below - but
+-- ONLY if the current on-disk content actually parses (a real
+-- "encounters=" line), never blindly. This is what keeps the backup
+-- always holding the last CONFIRMED-good snapshot: a corrupted/empty
+-- primary file is never allowed to propagate into the backup and wipe
+-- out the one remaining good copy.
+local function refresh_backup_if_current_file_is_valid()
+    local f = io.open(STATS_FILE_PATH, "rb")
+    if f == nil then return end
+    local content = f:read("*a")
+    f:close()
+    if not content then return end
+
+    -- "encounters=" must appear as a whole line, not just anywhere in
+    -- the content - check line by line rather than one big pattern, to
+    -- keep this obviously correct instead of relying on regex trickery.
+    local looksValid = false
+    for line in content:gmatch("[^\n]+") do
+        if line:match("^encounters=%d+$") then
+            looksValid = true
+            break
+        end
+    end
+    if not looksValid then return end
+
+    local bak = io.open(BAK_FILE_PATH, "wb")
+    if bak then
+        bak:write(content)
+        bak:close()
+    end
+end
+
 function M.save()
+    refresh_backup_if_current_file_is_valid()
+
     local f = io.open(STATS_FILE_PATH, "w")
     if f == nil then
         print("WARNING: couldn't write " .. STATS_FILE_PATH .. " - lifetime stats won't be saved")

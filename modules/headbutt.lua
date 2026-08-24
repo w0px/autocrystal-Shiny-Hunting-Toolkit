@@ -91,7 +91,17 @@ end
 -- top-level "content" field (Discord never triggers an actual
 -- ping/notification from text inside an embed itself).
 local function send_discord_embed(title, description, fields, color, spriteUrl)
-    if not Gui.discord_enabled(hud) then return end
+    if not Gui.discord_enabled(hud) then
+        -- Deliberately NOT silent - a real user log showed several
+        -- genuine shinies (confirmed via the Atk/Def/Spe/Spc printed
+        -- right above each one) with zero "Discord embed sent/failed"
+        -- line anywhere after them, indistinguishable from this gate
+        -- just quietly doing nothing. This print exists so a future
+        -- occurrence is unambiguous in the console/log instead of
+        -- looking identical to a silent success.
+        print("Discord embed skipped (Discord notifications disabled): " .. title)
+        return
+    end
 
     local parts = {}
     table.insert(parts, string.format('"title": "%s"', json_escape(title)))
@@ -289,6 +299,14 @@ local stopRequested = false
 local stopReason = ""
 local realEncounterConfirmed = false
 local pendingEncounterUpdate = false
+-- Snapshot of Stats.encountersSinceShiny taken in the ROM hook, BEFORE
+-- Stats.record_encounter/record_shiny run there - see the hook itself
+-- for why stats bookkeeping moved out of M.step(). M.step() reads this
+-- (instead of Stats.encountersSinceShiny directly) when building the
+-- shiny Discord embed's "Encounters Since Last Shiny" field, since by
+-- the time M.step() runs, Stats.encountersSinceShiny has already been
+-- reset to 0 for a shiny encounter.
+local pendingEncounterStatsBeforeShiny = 0
 local enemy_addr
 local LoadBattleMenuAddr
 -- Hooks the actual MoveSelectionScreen ROM routine (confirmed via
@@ -332,10 +350,15 @@ local BALL_ITEM_IDS = {5, 4, 2, 1} -- Poke, Great, Ultra, Master
 -- where these same fields get merged into the "found! attempting to
 -- catch" notification instead (see do_catch_sequence) so a successful
 -- auto-catch produces exactly 2 Discord messages, not 3.
-local function send_pending_shiny_embed(speciesName)
+-- titleOverride lets a specific call site (e.g. the "doesn't match the
+-- auto-catch filter, resuming hunt" case below) use wording that reflects
+-- what's actually happening instead of the generic "Found!" title, which
+-- read as misleadingly alarming/final for an encounter the bot is about
+-- to just skip past and keep hunting through.
+local function send_pending_shiny_embed(speciesName, titleOverride)
     if pendingShinyFields then
-        send_discord_embed(string.format("\xE2\x9C\xA8 Shiny %s Found!", speciesName),
-            nil, pendingShinyFields, COLOR_GOLD, pendingShinySpriteUrl)
+        local title = titleOverride or string.format("\xE2\x9C\xA8 Shiny %s Found!", speciesName)
+        send_discord_embed(title, nil, pendingShinyFields, COLOR_GOLD, pendingShinySpriteUrl)
     end
 end
 
@@ -1075,7 +1098,9 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl)
             if isShiny then
                 Stats.record_catch(caughtSpeciesId)
             end
-            send_catch_notification(string.format("%s%s caught successfully via auto-catch!", label, caughtSpeciesName),
+            local ballsUsed = throws + 1 -- throws only counts FAILED attempts; this successful one isn't in it yet
+            send_catch_notification(string.format("%s%s caught successfully via auto-catch! (used %d Ball%s)",
+                label, caughtSpeciesName, ballsUsed, ballsUsed == 1 and "" or "s"),
                 COLOR_GREEN, caughtSpeciesId, isShiny, caughtItemName)
             for i = 1, 400 do
                 if stop_was_requested() then
@@ -1089,11 +1114,41 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl)
         elseif catchOutcomeFailed then
             throws = throws + 1
             print(string.format("Ball thrown (%d/%d) - it broke free, trying again.", throws, maxThrows))
+            -- Budget raised from a flat 300 to 900, and a stop_was_requested()
+            -- check added (missing before, unlike every other wait loop in
+            -- this function): confirmed via a real user report (console log
+            -- showing "Ball thrown (1/20) - it broke free, trying again."
+            -- immediately followed by "Catch-mode: failed to navigate to
+            -- the ball") that the wild Pokemon getting its own turn here -
+            -- e.g. using Thunder Wave and paralyzing the player's Pokemon -
+            -- adds a SECOND message on top of "It broke free!", more
+            -- dialogue than 300 frames of A-mashing reliably clears. When
+            -- that happened, have_battle_controls was still false when this
+            -- loop gave up, and navigate_to_pack_and_select_ball() below -
+            -- whose own PACK-selection loop only runs `while have_battle_
+            -- controls`- silently skipped straight to scrolling a menu that
+            -- was never actually open, eventually failing with a confusing
+            -- "couldn't find the ball" instead of describing what actually
+            -- happened.
             have_battle_controls = false
             local recoverFrames = 0
-            while not have_battle_controls and recoverFrames < 300 do
+            while not have_battle_controls and recoverFrames < 900 do
+                if stop_was_requested() then
+                    print("Catch-mode: Stop requested - aborting.")
+                    return true
+                end
                 press_button("A")
                 recoverFrames = recoverFrames + 1
+            end
+            if not have_battle_controls then
+                -- Genuinely didn't recover in time - report this specific
+                -- failure instead of falling through into
+                -- navigate_to_pack_and_select_ball() with a false premise
+                -- (see comment above).
+                print("Catch-mode: battle menu didn't reload after the failed throw within the extended timeout - stopping so you can take over.")
+                send_catch_notification(string.format("%s%s could not be caught, bot stopped (battle menu didn't return after a failed throw).", label, caughtSpeciesName),
+                    COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
+                return true
             end
         else
             print("Catch-mode: timed out without a determined outcome - backing out with B and retrying.")
@@ -1492,6 +1547,21 @@ local function register_hooks()
 
     Mem.RegisterROMHook(EnemyWildmonInitialized, function()
         if ActiveModuleName ~= "headbutt" then return end
+        if pendingEncounterUpdate then
+            -- The previous hook firing's species/shinyvalue/atkdef/spespc
+            -- (about to get overwritten below) never got consumed by
+            -- M.step() - meaning that encounter's Stats.record_encounter/
+            -- record_shiny call, GUI update, and Discord notification
+            -- never ran for it. Flagged here rather than staying silent
+            -- because this is the leading suspect for reports of the
+            -- "since last shiny" counter not resetting despite a
+            -- confirmed shiny appearing in the console log - if this
+            -- warning shows up right before/around a shiny's encounter
+            -- line, that shiny's bookkeeping was silently dropped.
+            print(string.format(
+                "WARNING: encounter update overwritten before M.step() processed it - previous encounter (%s, shiny=%s) never reached Stats/GUI/Discord.",
+                get_pokemon_name(species), tostring(shinyvalue == 1)))
+        end
         realEncounterConfirmed = true
         pendingBattleSettle = true
         vprint("combat started")
@@ -1509,6 +1579,77 @@ local function register_hooks()
             speciesName, species, math.floor(atkdef/16), atkdef%16, math.floor(spespc/16), spespc%16, itemName))
 
         sessionEncounterCount = sessionEncounterCount + 1
+
+        -- Stats bookkeeping (record_encounter / record_shiny) happens
+        -- HERE, synchronously, instead of being deferred to M.step() via
+        -- pendingEncounterUpdate like the GUI/Discord side still is.
+        -- Deferring it bought nothing but risk: M.step()'s "in battle"
+        -- handling runs its own internal emu.frameadvance() loop (the
+        -- DV-wait below), so a SECOND hook firing during that window
+        -- could silently overwrite species/shinyvalue/atkdef/spespc
+        -- before M.step() ever got to record the FIRST encounter - a
+        -- real, confirmed shiny vanishing from Stats and the "since last
+        -- shiny" counter without a trace, while the console still prints
+        -- it correctly (since that print, and the later filter/auto-catch
+        -- decision, read shinyvalue directly rather than through Stats).
+        -- Recording immediately here closes that window entirely: by the
+        -- time anything could possibly clobber these locals, Stats
+        -- already has this encounter locked in. This is safe to do from
+        -- inside a hook - the documented callback restrictions are
+        -- specifically emu.frameadvance (throws) and forms.* drawing
+        -- (silently doesn't flush); Stats.record_* only touches Lua
+        -- tables and io.open, neither of which is affected.
+        local isShinyThisEncounter = (shinyvalue == 1)
+        pendingEncounterStatsBeforeShiny = Stats.encountersSinceShiny
+        Stats.record_encounter(species)
+
+        -- pendingShinyFields/pendingShinySpriteUrl (the Discord embed's
+        -- data) are ALSO built synchronously here now, for the exact same
+        -- reason Stats moved up here - a real user log showed two
+        -- confirmed shinies (Stats correctly recorded/reset, proven by
+        -- the "Stats: shiny recorded" print) that never got a Discord
+        -- notification at all, not even the "Discord embed skipped"
+        -- diagnostic - meaning send_pending_shiny_embed() ran with
+        -- pendingShinyFields still nil. That only happens if M.step()'s
+        -- OWN re-check of `shinyvalue == 1` (done independently, later,
+        -- possibly on a different tick) disagreed with this hook's
+        -- isShinyThisEncounter - the same shared-mutable-global race,
+        -- just hitting the embed-building code instead of Stats this
+        -- time. Building the embed here, atomically with Stats, removes
+        -- that race entirely: every field below is a pure computation
+        -- (string formatting, table construction, memory.readbyte) - none
+        -- of it touches emu.frameadvance or forms.*, so none of it is
+        -- restricted inside a hook callback.
+        pendingShinyFields = nil
+        pendingShinySpriteUrl = nil
+        if isShinyThisEncounter then
+            Stats.record_shiny(species)
+            print(string.format("Stats: shiny %s recorded - encounters since last shiny reset from %d to %d.",
+                speciesName, pendingEncounterStatsBeforeShiny, Stats.encountersSinceShiny))
+
+            local atkDV = math.floor(atkdef / 16)
+            local defDV = atkdef % 16
+            local speDV = math.floor(spespc / 16)
+            local spcDV = spespc % 16
+            local hpType, hpPower = hidden_power(atkDV, defDV, speDV, spcDV)
+            pendingShinyFields = {
+                {name = "Dex #", value = string.format("#%03d", species), inline = true},
+                {name = "DVs (Atk/Def/Spe/Spc)", value = string.format("%d/%d/%d/%d", atkDV, defDV, speDV, spcDV), inline = true},
+                {name = "Hidden Power", value = string.format("%s (%d)", hpType, hpPower), inline = true},
+                {name = "Location", value = current_location_name(), inline = true},
+                {name = "Held Item", value = itemName, inline = true},
+                divider_field(),
+                {name = "Encounters Since Last Shiny", value = tostring(pendingEncounterStatsBeforeShiny), inline = true},
+                {name = "Encounters This Session", value = tostring(sessionEncounterCount), inline = true},
+                {name = "Encounters Of This Species", value = tostring(Stats.species_encounter_count(species)), inline = true},
+                {name = "Shinies Of This Species", value = tostring(Stats.species_shiny_count(species)), inline = true},
+                divider_field(),
+                {name = "Total Shinies", value = tostring(Stats.totalShinies), inline = true},
+                {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
+            }
+            pendingShinySpriteUrl = shiny_sprite_url(species)
+        end
+
         pendingEncounterUpdate = true
     end, "Tell Display Battle Started / sending data")
 end
@@ -1565,7 +1706,7 @@ function M.init(sharedForm, yOffset, existingHud)
     end
 
     if version == 0x54 then
-        if region == 0x44 or region == 0x46 or region == 0x49 or region == 0x53 then
+        if region == 0x44 or region == 0x46 or region == 0x53 then
             enemy_addr = 0xd20c
             LoadBattleMenuAddr = Mem.BankAddressToLinear(0x9, 0x4EF2)
             EnemyWildmonInitialized = Mem.BankAddressToLinear(0xF, 0x7648)
@@ -1576,6 +1717,31 @@ function M.init(sharedForm, yOffset, existingHud)
             CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6bdc)
             -- Verified against pokecrystal.sym: MoveSelectionScreen,
             -- bank $0F.
+            MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x64bc)
+            Mem.SetRomBankAddress("Crystal")
+        elseif region == 0x49 then
+            -- Italian Crystal - split off from the merged EU branch above
+            -- after a real bug report (static encounters, e.g. Snorlax,
+            -- never detected) traced to EnemyWildmonInitialized firing at
+            -- the wrong address on this build. Found via byte-signature
+            -- scanning (diagnose_rom_addresses.lua) against a real Italian
+            -- ROM, not disassembly - LoadBattleMenuAddr/MoveSelectionAddr
+            -- happen to be byte-identical to English (same address);
+            -- EnemyWildmonInitialized/CatchSuccessAddr/CatchFailAddr/
+            -- LearnMoveAddr are shifted by a couple bytes. enemy_addr
+            -- (0xD20C, same as English) is now CONFIRMED for this build
+            -- too - a real mid-battle WRAM dump (diagnose_wram_addresses.lua)
+            -- from dynux90 showed sensible, internally-consistent values
+            -- (matching species, full-HP enemy_hp==enemy_max_hp, correct
+            -- held item) reading from this address during an actual
+            -- Lugia static battle, confirming WRAM layout is unchanged
+            -- from English here.
+            enemy_addr = 0xd20c
+            LoadBattleMenuAddr = Mem.BankAddressToLinear(0x9, 0x4EF2)
+            EnemyWildmonInitialized = Mem.BankAddressToLinear(0xF, 0x7649)
+            LearnMoveAddr = Mem.BankAddressToLinear(0x10, 0x64c4)
+            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x69f7)
+            CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6bde)
             MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x64bc)
             Mem.SetRomBankAddress("Crystal")
         elseif region == 0x45 then
@@ -1759,46 +1925,22 @@ function M.step()
         local speDV = math.floor(spespc / 16)
         local spcDV = spespc % 16
         local isShinyEncounter = (shinyvalue == 1)
-        Stats.record_encounter(species)
+        -- Stats.record_encounter/record_shiny already ran synchronously
+        -- inside the ROM hook above (see the comment there) - NOT
+        -- repeated here, to avoid double-counting every encounter.
 
         Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Checking encounter...")
         Gui.update_last_encounter(hud, sessionEncounterCount, species, speciesName, atkDV, defDV, speDV, spcDV, isShinyEncounter, itemName)
 
-        -- Reset every time, BEFORE the isShinyEncounter check below, so a
-        -- non-shiny encounter can never accidentally inherit a previous
-        -- shiny's leftover fields (see the declaration above for why).
-        pendingShinyFields = nil
-        pendingShinySpriteUrl = nil
-
+        -- pendingShinyFields/pendingShinySpriteUrl (and the Stats
+        -- bookkeeping that goes with them) are already built synchronously
+        -- inside the ROM hook above now - NOT rebuilt here, since redoing
+        -- it from this point's (possibly stale, possibly clobbered)
+        -- shinyvalue/species is exactly the race that used to cause a
+        -- confirmed shiny to end up with no Discord embed at all. Only
+        -- the GUI status text still needs updating from here.
         if isShinyEncounter then
-            -- Captured BEFORE Stats.record_shiny() resets this to 0, so
-            -- the embed shows the real encounter count leading up to
-            -- this find, not 0.
-            local encountersBeforeThisShiny = Stats.encountersSinceShiny
-            Stats.record_shiny(species)
             Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "SHINY FOUND!")
-            local hpType, hpPower = hidden_power(atkDV, defDV, speDV, spcDV)
-            -- Built here but NOT sent immediately - stored for whichever
-            -- branch handles this encounter next (see
-            -- send_pending_shiny_embed and do_catch_sequence) so a
-            -- successful auto-catch doesn't ALSO get this as a separate,
-            -- redundant third message.
-            pendingShinyFields = {
-                {name = "Dex #", value = string.format("#%03d", species), inline = true},
-                {name = "DVs (Atk/Def/Spe/Spc)", value = string.format("%d/%d/%d/%d", atkDV, defDV, speDV, spcDV), inline = true},
-                {name = "Hidden Power", value = string.format("%s (%d)", hpType, hpPower), inline = true},
-                {name = "Location", value = current_location_name(), inline = true},
-                {name = "Held Item", value = itemName, inline = true},
-                divider_field(),
-                {name = "Encounters Since Last Shiny", value = tostring(encountersBeforeThisShiny), inline = true},
-                {name = "Encounters This Session", value = tostring(sessionEncounterCount), inline = true},
-                {name = "Encounters Of This Species", value = tostring(Stats.species_encounter_count(species)), inline = true},
-                {name = "Shinies Of This Species", value = tostring(Stats.species_shiny_count(species)), inline = true},
-                divider_field(),
-                {name = "Total Shinies", value = tostring(Stats.totalShinies), inline = true},
-                {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
-            }
-            pendingShinySpriteUrl = shiny_sprite_url(species)
         end
 
         local isPerfect = (atkDV == 15 and defDV == 15 and speDV == 15 and spcDV == 15)
@@ -2097,7 +2239,7 @@ function M.step()
                     -- encounter would get. No auto-catch notification
                     -- will follow, so send the detailed embed now.
                     print(string.format("Shiny %s found, but doesn't match the auto-catch filter - skipping, continuing the hunt.", shinySpeciesName))
-                    send_pending_shiny_embed(shinySpeciesName)
+                    send_pending_shiny_embed(shinySpeciesName, string.format("\xF0\x9F\x94\x81 Shiny %s encountered, resuming hunt - not a current target", shinySpeciesName))
                 end
                 end
             else
@@ -2120,7 +2262,23 @@ function M.step()
             -- above.
             local perfectLabel = isPerfectDVs and "Perfect DVs (15/15/15/15)" or "Perfect Negative DVs (0/0/0/0)"
             print(string.format("%s found with %s - auto-catching.", currentSpeciesName, perfectLabel))
-            return do_catch_sequence(false)
+            local stillHunting = do_catch_sequence(false)
+            if not stillHunting then
+                -- Same root cause/fix as wild.lua's identical branch (see
+                -- that comment for the full writeup): species_addr can
+                -- flicker non-zero for up to 90+ frames after a battle
+                -- ends, re-entering this dispatch before the next real
+                -- encounter's hook has repopulated atkdef/spespc -
+                -- leaving a stale Perfect-DV reading that can trigger an
+                -- auto-catch on the following, genuinely different
+                -- Pokemon. Clearing atkdef/spespc closes that window
+                -- exactly like the `if atkdef and spespc then` guard a
+                -- few lines up already relies on; a real new encounter
+                -- always repopulates both via its own hook.
+                atkdef = nil
+                spespc = nil
+            end
+            return stillHunting
         end
 
         -- (stopRequested, if set, already returned true right after its
@@ -2249,6 +2407,26 @@ function M.step()
                 if not fledSuccessfully and memory.readbyte(species_addr) ~= 0 then
                     print(string.format("WARNING: could not escape after %d attempts - continuing anyway", escapeAttempts))
                 end
+
+                -- Same fix as do_catch_sequence's post-catch reset above
+                -- (see that comment for the full root-cause writeup),
+                -- applied here for the exact same reason: species_addr is
+                -- already documented to flicker non-zero for up to 90+
+                -- frames after a battle genuinely ends - including after
+                -- a successful flee, not just a catch. Confirmed via a
+                -- real user report on wild.lua (identical architecture to
+                -- this file): a shiny that doesn't match the auto-catch
+                -- filter correctly flees here, but without this reset,
+                -- the next M.step() tick(s) can sample one of those stale
+                -- nonzero reads, re-enter the "in battle" shiny branch
+                -- with shinyvalue still 1 (nothing else clears it) and
+                -- dv_flag_addr still left at 0x01 from the battle that
+                -- just ended, and re-send the exact same "Shiny found"
+                -- Discord embed - observed as several duplicate
+                -- notifications for one shiny. A real new shiny always
+                -- re-sets shinyvalue via shiny() inside the ROM hook, so
+                -- clearing it here can never suppress a genuine one.
+                shinyvalue = 0
             end
         end
     end

@@ -1,0 +1,13 @@
+Attack DV coverage diagnostic - 60 total resets
+
+Shiny-eligible Attack DV values (2,3,6,7,10,11,14,15):
+  Attack= 2 :      2 hits  (expected if even: ~4)
+  Attack= 3 :      5 hits  (expected if even: ~4)
+  Attack= 6 :      7 hits  (expected if even: ~4)
+  Attack= 7 :      3 hits  (expected if even: ~4)
+  Attack=10 :      3 hits  (expected if even: ~4)
+  Attack=11 :      2 hits  (expected if even: ~4)
+  Attack=14 :      3 hits  (expected if even: ~4)
+  Attack=15 :      4 hits  (expected if even: ~4)
+
+Attack DVs outside the shiny-eligible set: 31

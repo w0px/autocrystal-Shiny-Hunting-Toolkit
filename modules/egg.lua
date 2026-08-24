@@ -34,6 +34,7 @@ Gui = require("gui_module")
 PokemonNames = require("data.pokemon_names")
 Stats = require("data.stats")
 RngEnabler = require("data.rng_enabler")
+SavestateBackup = require("data.savestate_backup")
 
 -- Full 388-entry (map group, map number) -> name table, shared with
 -- wild.lua/fishing.lua/headbutt.lua/friendship.lua/static.lua/
@@ -153,7 +154,12 @@ local function send_alert(title, color)
 end
 
 local EGG_PLACEHOLDER = 0xFD
-local SAVESTATE_SLOT = 4 -- separate from Starters' slot 3, avoids any cross-module confusion
+-- Value fixed once per run inside M.init() below, via the launcher's
+-- Savestate slot dropdown (falls back to 4, this module's historical
+-- default, separate from Starters' slot 3, if the dropdown can't be
+-- read) - no longer a hardcoded constant, see launcher.lua's
+-- AutocrystalGetSavestateSlot().
+local SAVESTATE_SLOT
 
 local party_base_addr
 local eggSlotIndex -- fixed once determined: the same slot every reset, since party size before receiving never changes
@@ -400,6 +406,10 @@ function M.init(sharedForm, yOffset, existingHud)
 
     Stats.load()
 
+    -- SAVESTATE_SLOT is deliberately NOT set here anymore - see
+    -- M.on_switch_to() below for why (M.init() only runs once per
+    -- BizHawk session, which silently ignored later dropdown changes).
+
     local version = memory.readbyte(0x141)
     local region = memory.readbyte(0x142)
 
@@ -441,6 +451,19 @@ function M.init(sharedForm, yOffset, existingHud)
 end
 
 function M.on_switch_to()
+    -- Re-read the launcher's Savestate slot dropdown every time this
+    -- module becomes active, NOT just here-and-in-M.init() - M.init()
+    -- only ever runs ONCE per BizHawk session (launcher.lua's
+    -- initializedModules[] cache skips it on every later Start click for
+    -- the same module), so a value captured only there would silently
+    -- ignore any dropdown change made after the very first run. This
+    -- function, unlike M.init(), genuinely runs every single time Start
+    -- is clicked - confirmed via a real user report on static.lua (see
+    -- that module's identical comment) that switching the dropdown to a
+    -- different slot and clicking Start again kept acting on the OLD
+    -- slot from the module's first run this session.
+    SAVESTATE_SLOT = AutocrystalGetSavestateSlot(4)
+
     Gui.reconfigure(hud, DISABLED_FIELDS)
     Gui.clear_last_encounter(hud)
 end
@@ -460,6 +483,7 @@ function M.on_resume()
     -- Start). This buffer gives that transition time to settle first.
     for i = 1, 10 do emu.frameadvance() end
 
+    SavestateBackup.backup_slot_before_first_write(SAVESTATE_SLOT, "Egg")
     savestate.saveslot(SAVESTATE_SLOT)
     partysizeBeforeReceiving = memory.readbyte(party_base_addr)
     eggSlotIndex = partysizeBeforeReceiving

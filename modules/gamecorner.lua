@@ -34,6 +34,7 @@ Gui = require("gui_module")
 PokemonNames = require("data.pokemon_names")
 Stats = require("data.stats")
 RngEnabler = require("data.rng_enabler")
+SavestateBackup = require("data.savestate_backup")
 
 -- Full 388-entry (map group, map number) -> name table, shared with
 -- every other module - see data/location_names.lua for where this
@@ -158,7 +159,12 @@ local function send_alert(title, color)
     send_discord_embed(title, nil, nil, color, nil)
 end
 
-local SAVESTATE_SLOT = 6 -- separate from Starters(3)/Egg(4)/Static(5)
+-- Value fixed once per run inside M.init() below, via the launcher's
+-- Savestate slot dropdown (falls back to 6, this module's historical
+-- default, separate from Starters(3)/Egg(4)/Static(5), if the dropdown
+-- can't be read) - no longer a hardcoded constant, see launcher.lua's
+-- AutocrystalGetSavestateSlot().
+local SAVESTATE_SLOT
 
 local party_base_addr
 local partysizeBeforeReceiving
@@ -207,6 +213,10 @@ function M.init(sharedForm, yOffset, existingHud)
 
     Stats.load()
 
+    -- SAVESTATE_SLOT is deliberately NOT set here anymore - see
+    -- M.on_switch_to() below for why (M.init() only runs once per
+    -- BizHawk session, which silently ignored later dropdown changes).
+
     local version = memory.readbyte(0x141)
     local region = memory.readbyte(0x142)
 
@@ -231,6 +241,19 @@ function M.init(sharedForm, yOffset, existingHud)
 end
 
 function M.on_switch_to()
+    -- Re-read the launcher's Savestate slot dropdown every time this
+    -- module becomes active, NOT just here-and-in-M.init() - M.init()
+    -- only ever runs ONCE per BizHawk session (launcher.lua's
+    -- initializedModules[] cache skips it on every later Start click for
+    -- the same module), so a value captured only there would silently
+    -- ignore any dropdown change made after the very first run. This
+    -- function, unlike M.init(), genuinely runs every single time Start
+    -- is clicked - confirmed via a real user report on static.lua (see
+    -- that module's identical comment) that switching the dropdown to a
+    -- different slot and clicking Start again kept acting on the OLD
+    -- slot from the module's first run this session.
+    SAVESTATE_SLOT = AutocrystalGetSavestateSlot(6)
+
     Gui.reconfigure(hud, DISABLED_FIELDS)
     Gui.clear_last_encounter(hud)
 end
@@ -238,6 +261,7 @@ end
 -- Called every time Start is clicked. Saves the current position -
 -- prize menu open, cursor on the desired Pokemon - as the reset target.
 function M.on_resume()
+    SavestateBackup.backup_slot_before_first_write(SAVESTATE_SLOT, "GameCorner")
     savestate.saveslot(SAVESTATE_SLOT)
     partysizeBeforeReceiving = memory.readbyte(party_base_addr)
     newSlotIndex = partysizeBeforeReceiving

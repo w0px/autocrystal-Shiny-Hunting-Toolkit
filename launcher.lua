@@ -106,7 +106,7 @@ local statusLabel = forms.label(shell, "Idle - pick a module and click Start.", 
 -- since the module dropdown starts on the placeholder text.
 local staticTargetLabel = forms.label(shell, "Static target:", 10, 112, 90, 16)
 forms.setproperty(staticTargetLabel, "Visible", false)
-StaticTargetDropdown = forms.dropdown(shell, {"Static (open world)", "Eevee", "Shuckle", "Spearow"}, 105, 110, 160, 20)
+StaticTargetDropdown = forms.dropdown(shell, {"Static (open world)", "Sudowoodo", "Eevee", "Shuckle", "Spearow", "Celebi", "Lapras", "Suicune"}, 105, 110, 160, 20)
 forms.setproperty(StaticTargetDropdown, "SelectedIndex", 0)
 forms.setproperty(StaticTargetDropdown, "Visible", false)
 
@@ -125,9 +125,57 @@ EggTargetDropdown = forms.dropdown(shell, {"Togepi", "Odd Egg"}, 105, 110, 160, 
 forms.setproperty(EggTargetDropdown, "SelectedIndex", 0)
 forms.setproperty(EggTargetDropdown, "Visible", false)
 
--- Bumped 130 -> 140 so the shared Gui content (TOTAL ENCOUNTERS, etc.)
--- doesn't crowd/overlap the Static target row right above it at y=110-130.
-local CONTENT_Y_OFFSET = 140
+-- Savestate slot picker - lets a tester/user choose which BizHawk
+-- savestate slot (1-10) a reset-based module loads/saves to, instead of
+-- the old hardcoded-per-module constant (Starters=3, Egg=4, Static=5,
+-- Game Corner=6 - see each module's own SAVESTATE_SLOT comment). Those
+-- numbers are now just DEFAULTS, kept here in one place instead of
+-- scattered across 4 files, and used to pre-select this dropdown the
+-- moment a relevant module is chosen. Built eagerly here, same reasoning
+-- as StaticTargetDropdown/EggTargetDropdown right above: it needs to
+-- exist and be readable before the first Start click, since each
+-- module's M.init() reads it once (via AutocrystalGetSavestateSlot()
+-- below) to fix the slot for that run.
+--
+-- Only Wild/Fishing/Headbutt/Friendship don't use a savestate slot at
+-- all (they don't reset from a savestate the same way), so this stays
+-- hidden for those - see MODULE_DEFAULT_SAVESTATE_SLOT below for exactly
+-- which modules it applies to.
+MODULE_DEFAULT_SAVESTATE_SLOT = {
+    ["Starters"] = 3,
+    ["Egg"] = 4,
+    ["Static"] = 5,
+    ["Game Corner"] = 6,
+}
+local savestateSlotLabel = forms.label(shell, "Savestate slot:", 10, 136, 90, 16)
+forms.setproperty(savestateSlotLabel, "Visible", false)
+local savestateSlotItems = {}
+for i = 1, 10 do
+    table.insert(savestateSlotItems, tostring(i))
+end
+SavestateSlotDropdown = forms.dropdown(shell, savestateSlotItems, 105, 134, 160, 20)
+forms.setproperty(SavestateSlotDropdown, "SelectedIndex", 0)
+forms.setproperty(SavestateSlotDropdown, "Visible", false)
+
+-- Global helper so any module's M.init() can read the chosen slot
+-- without needing to know about the dropdown's existence or guard
+-- against it being missing/blank. fallbackSlot is that module's own
+-- historical default (3/4/5/6) - used if the dropdown somehow can't be
+-- read, or (defensively) returns something outside 1-10.
+function AutocrystalGetSavestateSlot(fallbackSlot)
+    if SavestateSlotDropdown == nil then return fallbackSlot end
+    local ok, text = pcall(forms.gettext, SavestateSlotDropdown)
+    if not ok or text == nil then return fallbackSlot end
+    local n = tonumber(text)
+    if n == nil or n < 1 or n > 10 then return fallbackSlot end
+    return math.floor(n)
+end
+
+-- Bumped 140 -> 160 to make room for the Savestate slot row at
+-- y=134-154, right below the Static target/Egg source row at y=110-130 -
+-- otherwise the shared Gui content (TOTAL ENCOUNTERS, etc.) would
+-- overlap it.
+local CONTENT_Y_OFFSET = 160
 
 -- Artwork switching: rather than redrawing ONE picturebox with a new
 -- image each time the selection changes (repeated draws onto the same
@@ -184,7 +232,21 @@ end
 -- only species that need a distinct sprite get an entry here.
 local STATIC_TARGET_ART = {
     ["Shuckle"] = "launcher_art_shuckle.png",
+    -- "Static (open world)" keeps the Lugia art it's always had - it's
+    -- the generic click-to-encounter target (Lugia, Electrode's disguised
+    -- Voltorb room, and any future one like them, see static.lua's
+    -- BATTLE_TARGET_EXPECTED_SPECIES comment block for the reasoning),
+    -- and Lugia remains a reasonable representative icon for that mode.
     ["Static (open world)"] = "launcher_art_lugia.png",
+    -- "Sudowoodo" is the separate, explicitly-named target for the
+    -- Squirtbottle dialogue flow this module was originally tuned
+    -- around - split out from "Static (open world)" specifically so
+    -- that generic target could be freed up for true click-to-encounter
+    -- targets instead of being implicitly Sudowoodo-shaped.
+    ["Sudowoodo"] = "launcher_art_sudowoodo.png",
+    ["Celebi"] = "launcher_art_celebi.png",
+    ["Lapras"] = "launcher_art_lapras.png",
+    ["Suicune"] = "launcher_art_suicune.png",
     -- "Eevee" intentionally omitted - falls through to the Static module's
     -- own default art below (launcher_art3.png).
 }
@@ -245,6 +307,13 @@ local initializedModules = {} -- module name -> the required module table
 local loadedModule = nil
 local loadedModuleName = nil
 local btnStart, btnStop
+
+-- Tracks which module the savestate-slot dropdown last auto-defaulted
+-- for, so that default-setting only fires once on a fresh transition
+-- INTO a relevant module - not every single frame - otherwise a user's
+-- manual override would get stomped back to the default 60 times a
+-- second the instant they picked something else.
+local lastSavestateSlotModuleName = nil
 
 -- Flags set by button callbacks (safe: just a variable write), consumed
 -- by the main loop (safe: not a callback context).
@@ -314,6 +383,22 @@ while true do
         local eggSelected = (selectedText == "Egg")
         forms.setproperty(EggTargetDropdown, "Visible", eggSelected)
         forms.setproperty(eggTargetLabel, "Visible", eggSelected)
+
+        -- Savestate slot picker - shown only for modules that actually
+        -- use a savestate slot (see MODULE_DEFAULT_SAVESTATE_SLOT
+        -- above). Auto-selects that module's historical default the
+        -- instant the user switches INTO it (tracked via
+        -- lastSavestateSlotModuleName so it only happens once per
+        -- transition, not every frame - letting the user freely change
+        -- it afterwards without it snapping back).
+        local savestateSlotDefault = MODULE_DEFAULT_SAVESTATE_SLOT[selectedText]
+        local savestateSlotRelevant = savestateSlotDefault ~= nil
+        forms.setproperty(SavestateSlotDropdown, "Visible", savestateSlotRelevant)
+        forms.setproperty(savestateSlotLabel, "Visible", savestateSlotRelevant)
+        if savestateSlotRelevant and lastSavestateSlotModuleName ~= selectedText then
+            forms.setproperty(SavestateSlotDropdown, "SelectedIndex", savestateSlotDefault - 1)
+        end
+        lastSavestateSlotModuleName = selectedText
     end
 
     if startRequestedEntry ~= nil then
@@ -377,6 +462,17 @@ while true do
 
                 running = true
                 forms.setproperty(dropdown, "Enabled", false)
+                -- Lock the savestate slot picker for the duration of the
+                -- run too - added after a real user data-loss incident
+                -- where a slot got overwritten with the dropdown showing
+                -- an unexpected value. The auto-backup fix already
+                -- protects against that specific scenario, but locking
+                -- this out entirely while running removes the
+                -- possibility altogether: there's no legitimate reason to
+                -- change the target slot mid-hunt, and doing so while
+                -- SAVESTATE_SLOT is actively being read/written every
+                -- reset cycle could only cause confusion.
+                forms.setproperty(SavestateSlotDropdown, "Enabled", false)
                 forms.setproperty(btnStart, "Enabled", false)
                 forms.setproperty(btnStop, "Enabled", true)
                 forms.settext(statusLabel, "Running: " .. chosen.name)
@@ -389,6 +485,7 @@ while true do
         AutocrystalGlobalStopRequested = false
         running = false
         forms.setproperty(dropdown, "Enabled", true)
+        forms.setproperty(SavestateSlotDropdown, "Enabled", true)
         forms.setproperty(btnStart, "Enabled", true)
         forms.setproperty(btnStop, "Enabled", false)
         forms.settext(statusLabel, "Stopped. Pick a module and click Start.")
@@ -412,14 +509,15 @@ while true do
             end
 
             -- Static gets one extra bit of detail: which specific target
-            -- is selected (Shuckle/Eevee), so the presence line reads
-            -- "Static (Shuckle)" instead of just "Static" for those -
-            -- but "Static (open world)" (the literal dropdown text) is
-            -- deliberately NOT shown here, since that's redundant/awkward
-            -- next to the module name itself; plain "Static" covers it.
+            -- is selected (Shuckle/Eevee/Spearow/Celebi/Lapras/Suicune/
+            -- Sudowoodo), so the presence line reads "Static (Shuckle)"
+            -- instead of just "Static" for those - but "Static (open
+            -- world)" (the literal dropdown text) is deliberately NOT
+            -- shown here, since that's redundant/awkward next to the
+            -- module name itself; plain "Static" covers it.
             if loadedModuleName == "static" and StaticTargetDropdown then
                 local targetText = forms.gettext(StaticTargetDropdown)
-                if targetText == "Shuckle" or targetText == "Eevee" or targetText == "Spearow" then
+                if targetText == "Shuckle" or targetText == "Eevee" or targetText == "Spearow" or targetText == "Celebi" or targetText == "Lapras" or targetText == "Suicune" or targetText == "Sudowoodo" then
                     displayName = displayName .. " (" .. targetText .. ")"
                 end
             end
@@ -434,6 +532,7 @@ while true do
         if done then
             running = false
             forms.setproperty(dropdown, "Enabled", true)
+            forms.setproperty(SavestateSlotDropdown, "Enabled", true)
             forms.setproperty(btnStart, "Enabled", true)
             forms.setproperty(btnStop, "Enabled", false)
             forms.settext(statusLabel, "Finished. Pick a module and click Start.")

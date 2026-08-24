@@ -1048,7 +1048,9 @@ local function do_catch_sequence()
             -- this project (escapes, kills, etc).
             print("Caught! Declining nickname prompt and clearing follow-up messages...")
             Stats.record_catch(caughtSpeciesId)
-            send_discord_notification(string.format("Shiny %s caught successfully via auto-catch!", caughtSpeciesName))
+            local ballsUsed = throws + 1 -- throws only counts FAILED attempts; this successful one isn't in it yet
+            send_discord_notification(string.format("Shiny %s caught successfully via auto-catch! (used %d Ball%s)",
+                caughtSpeciesName, ballsUsed, ballsUsed == 1 and "" or "s"))
             for i = 1, 400 do
                 if stop_was_requested() then
                     print("Catch-mode: Stop requested - aborting.")
@@ -1065,11 +1067,41 @@ local function do_catch_sequence()
             -- but the "It broke free!" text still needs to visibly play
             -- out and the main battle menu needs to actually reload
             -- before navigating to Pack makes sense - wait for that here.
+            -- Budget raised from a flat 300 to 900, and a stop_was_requested()
+            -- check added (missing before, unlike every other wait loop in
+            -- this function): confirmed via a real user report (console log
+            -- showing "Ball thrown (1/20) - it broke free, trying again."
+            -- immediately followed by "Catch-mode: failed to navigate to
+            -- the ball") that the wild Pokemon getting its own turn here -
+            -- e.g. using Thunder Wave and paralyzing the player's Pokemon -
+            -- adds a SECOND message on top of "It broke free!", more
+            -- dialogue than 300 frames of A-mashing reliably clears. When
+            -- that happened, have_battle_controls was still false when this
+            -- loop gave up, and navigate_to_pack_and_select_ball() below -
+            -- whose own PACK-selection loop only runs `while have_battle_
+            -- controls`- silently skipped straight to scrolling a menu that
+            -- was never actually open, eventually failing with a confusing
+            -- "couldn't find the ball" instead of describing what actually
+            -- happened.
             have_battle_controls = false
             local recoverFrames = 0
-            while not have_battle_controls and recoverFrames < 300 do
+            while not have_battle_controls and recoverFrames < 900 do
+                if stop_was_requested() then
+                    print("Catch-mode: Stop requested - aborting.")
+                    return true
+                end
                 press_button("A")
                 recoverFrames = recoverFrames + 1
+            end
+            if not have_battle_controls then
+                -- Genuinely didn't recover in time - report this specific
+                -- failure instead of falling through into
+                -- navigate_to_pack_and_select_ball() with a false premise
+                -- (see comment above).
+                print("Catch-mode: battle menu didn't reload after the failed throw within the extended timeout - stopping so you can take over.")
+                send_catch_notification(string.format("%s%s could not be caught, bot stopped (battle menu didn't return after a failed throw).", label, caughtSpeciesName),
+                    COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
+                return true
             end
         else
             -- Neither hook fired within the timeout - genuinely stuck
@@ -1350,7 +1382,7 @@ function M.init(sharedForm, yOffset, existingHud)
     Gui.reconfigure(hud, {"chkTrueRandomness"}) -- wild uses every encounter-related field; True Randomness only applies to soft-reset modules
 
     if version == 0x54 then
-        if region == 0x44 or region == 0x46 or region == 0x49 or region == 0x53 then
+        if region == 0x44 or region == 0x46 or region == 0x53 then
             enemy_addr = 0xd20c
             LoadBattleMenuAddr = Mem.BankAddressToLinear(0x9, 0x4EF2)
             EnemyWildmonInitialized = Mem.BankAddressToLinear(0xF, 0x7648)
@@ -1359,6 +1391,30 @@ function M.init(sharedForm, yOffset, existingHud)
             -- and PokeBallEffect.shake_and_break_free, both bank $03.
             CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x69f5)
             CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6bdc)
+            Mem.SetRomBankAddress("Crystal")
+        elseif region == 0x49 then
+            -- Italian Crystal - split off from the merged EU branch above
+            -- after a real bug report (static encounters, e.g. Snorlax,
+            -- never detected) traced to EnemyWildmonInitialized firing at
+            -- the wrong address on this build. Found via byte-signature
+            -- scanning (diagnose_rom_addresses.lua) against a real Italian
+            -- ROM, not disassembly - LoadBattleMenuAddr happens to be
+            -- byte-identical to English (same address);
+            -- EnemyWildmonInitialized/CatchSuccessAddr/CatchFailAddr/
+            -- LearnMoveAddr are shifted by a couple bytes. enemy_addr
+            -- (0xD20C, same as English) is now CONFIRMED for this build
+            -- too - a real mid-battle WRAM dump (diagnose_wram_addresses.lua)
+            -- from dynux90 showed sensible, internally-consistent values
+            -- (matching species, full-HP enemy_hp==enemy_max_hp, correct
+            -- held item) reading from this address during an actual
+            -- Lugia static battle, confirming WRAM layout is unchanged
+            -- from English here.
+            enemy_addr = 0xd20c
+            LoadBattleMenuAddr = Mem.BankAddressToLinear(0x9, 0x4EF2)
+            EnemyWildmonInitialized = Mem.BankAddressToLinear(0xF, 0x7649)
+            LearnMoveAddr = Mem.BankAddressToLinear(0x10, 0x64c4)
+            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x69f7)
+            CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6bde)
             Mem.SetRomBankAddress("Crystal")
         elseif region == 0x45 then
             enemy_addr = 0xd20c

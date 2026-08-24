@@ -1,0 +1,38 @@
+=== AutoCrystal WRAM address dump ===
+Header version byte (0x141): 0x54
+Header region byte  (0x142): 0x45 (English)
+
+Remember: run this once on the overworld (standing still, no menus) and once
+mid-battle (battle menu open) so every address below gets checked in the state
+where it's actually meaningful. 'overworld'/'battle'/'either' below tells you
+which run a given line is relevant for - ignore values from the wrong run.
+
+[overworld] PLAYER_X_ADDR          0xDCB8 =    37 (0x25)   -- player's X map coordinate - should roughly match where you're standing
+[overworld] PLAYER_Y_ADDR          0xDCB7 =     9 (0x09)   -- player's Y map coordinate - should roughly match where you're standing
+[overworld] MOVEMENT_FLAG_ADDR     0xD4DD =   255 (0xFF)   -- 0xFF (255) when standing still/idle, something else while actually moving
+[overworld] wScriptRunningAddr     0xD438 =     0 (0x00)   -- 0 when idle (no dialogue/cutscene/script active)
+[either   ] party_base_addr        0xDCD7 =     6 (0x06)   -- first byte read AS your party count - should exactly equal how many Pokemon you actually have
+[battle   ] curPartyMonAddr        0xD0D4 =     1 (0x01)   -- index of your active battler within your party (0 = first slot)
+[battle   ] MENU_CURSOR_Y          0xCFA9 =     0 (0x00)   -- battle menu cursor row - changes as you move the cursor
+[battle   ] MENU_CURSOR_X          0xCFAA =     0 (0x00)   -- battle menu cursor column - changes as you move the cursor
+[battle   ] FIRST_MOVE_PP_ADDR     0xC634 =    46 (0x2E)   -- PP of your active Pokemon's first move - should be a small sane number, not 0/garbage
+[battle   ] OWN_HP_ADDR            0xC63C = 11823 (0x2E2F)   -- your active Pokemon's current HP - should match what's shown on its HP bar
+[battle   ] OWN_MAX_HP_ADDR        0xC63E = 11823 (0x2E2F)   -- your active Pokemon's max HP - should match its actual max HP
+[battle   ] enemy_addr (DVs)       0xD20C =   152 (0x98)   -- start of the enemy's DV bytes - the whole reason this bot exists, this one matters most
+[battle   ] species_addr           0xD22E =     0 (0x00)   -- enemy species ID - should match whatever Pokemon you're actually fighting (e.g. Snorlax = 143)
+[battle   ] item_addr              0xD207 =     0 (0x00)   -- enemy's held item ID - usually 0 (none) for most statics
+[battle   ] enemy_hp_addr          0xD216 =     0 (0x00)   -- enemy's current HP - should match its HP bar
+[battle   ] enemy_max_hp_addr      0xD218 =   130 (0x82)   -- enemy's max HP - should match its actual max HP
+[either   ] wCurItemAddr           0xD106 =    70 (0x46)   -- item currently selected in the pack, if a pack menu is open - 0/irrelevant otherwise
+[either   ] wItemsAddr             0xD893 =    41 (0x29)   -- start of your item pocket list - first byte should be a real, valid item ID if you carry any items
+[either   ] wNumItemsAddr          0xD892 =     7 (0x07)   -- how many distinct item slots are filled in your item pocket
+[either   ] wBallsAddr             0xD8D8 =     4 (0x04)   -- start of your Ball pocket list - first byte should be a real Ball item ID
+[either   ] wNumBallsAddr          0xD8D7 =     2 (0x02)   -- how many distinct Ball slots are filled in your Ball pocket
+
+If any value looks obviously wrong for what's actually on screen right now
+(garbage species ID, HP that doesn't match the HP bar, party count that's off,
+etc.), that address is a real suspect for this ROM/language and needs the same
+treatment as the ROM hook addresses - please include this whole output (both
+runs) in the bug report either way, correct-looking values are useful
+confirmation too.
+=== Dump complete ===
