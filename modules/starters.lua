@@ -48,6 +48,7 @@ end
 
 local hud
 local base_address, versionStr, partysize, dv_addr, species_list_addr
+local wScriptRunningAddr -- non-zero while any overworld script (dialogue/call/cutscene) is running; used by reroll_savestate_pool() to confirm the game is truly idle before trusting a save - see there
 local atkdef, spespc
 
 local DISCORD_RELAY_URL = "http://127.0.0.1:5000/"
@@ -272,6 +273,9 @@ function M.init(sharedForm, yOffset, existingHud)
         else
             base_address = 0xDCD7; versionStr = "Crystal EU"
         end
+        -- Verified against pokecrystal.sym: wScriptRunning ($D438). Same
+        -- address static.lua already relies on for this same purpose.
+        wScriptRunningAddr = 0xD438
     elseif version == 0x55 or version == 0x58 then -- Gold/Silver
         if region == 0x4A then
             base_address = 0xD9E8; versionStr = "G/S JP"
@@ -282,6 +286,9 @@ function M.init(sharedForm, yOffset, existingHud)
         else
             base_address = 0xDA22; versionStr = "G/S EU"
         end
+        -- Verified against pokegold1.sym: wScriptRunning ($D15F, plain
+        -- SVBK-switched WRAM view). Same address static.lua uses.
+        wScriptRunningAddr = 0xD15F
     else
         print("No valid ROM detected")
         return false
@@ -352,17 +359,88 @@ function M.on_resume()
     lastRerollTime = os.time()
 end
 
+local REROLL_SPLIT_COUNT = 6
+local REROLL_SCRIPT_CLEAR_TIMEOUT = 180 -- frames to wait for wScriptRunning to clear
+
+-- Presses B/A until wScriptRunningAddr reads 0 (or the bounded timeout is
+-- hit) - a real confirmation that no dialogue/call/cutscene is mid-flight,
+-- not a guess. No-op (returns immediately) if nothing is open, which is
+-- the common case on every call. Ported from static.lua's identical
+-- helper - see reroll_savestate_pool() below for the bug this fixes.
+local function wait_for_no_active_script(label)
+    if not wScriptRunningAddr then return true end
+    local waited = 0
+    while memory.readbyte(wScriptRunningAddr) ~= 0 and waited < REROLL_SCRIPT_CLEAR_TIMEOUT do
+        press_button(waited % 2 == 0 and "B" or "A")
+        waited = waited + 1
+    end
+    if waited > 0 then
+        print(string.format(
+            "reroll_savestate_pool(): wScriptRunning was active (%s) - %s after %d frame(s).",
+            label or "script/dialogue/call in progress",
+            (memory.readbyte(wScriptRunningAddr) == 0) and "cleared it" or "gave up waiting for it to clear",
+            waited))
+    end
+    return true
+end
+
 -- Re-baselines the savestate with a fresh, unpredictable starting point -
 -- see REROLL_INTERVAL_SECONDS above for why this matters. Only called
--- while still sitting at the starter-choice screen (nothing mid-flight),
--- same safety requirement as static.lua's version.
+-- while still sitting at the starter-choice screen, nothing mid-flight.
+--
+-- FIXED (confirmed via a tester log on egg.lua, which had the identical
+-- copy-pasted code - see that module for the full writeup): this used
+-- to do ONE single blocking RngEnabler.enable_randomness(FULL_COVERAGE_
+-- RANGE) wait - up to 70000 frames, ~9.7 minutes average, with ZERO
+-- button presses the entire time. That both (1) reliably exceeded
+-- STUCK_RESET_TIMEOUT (60s) with nothing here ever refreshing
+-- lastResetTime, guaranteeing check_stuck_and_force_reset() misfired
+-- right after every single reroll, and (2) risked silently saving a
+-- corrupted baseline if the game state drifted during that long idle
+-- window with zero verification - which, combined with BizHawk's
+-- perfect determinism, would produce identical DVs on every encounter
+-- from that point on. Same fix already proven in static.lua, ported
+-- here: split into several short chunks instead of one giant blind
+-- wait, checking wScriptRunning after every chunk, plus a stability
+-- check right before saving.
 local function reroll_savestate_pool()
     print(string.format(
-        "Re-rolling savestate pool after %d minutes - injecting fresh entropy and re-baselining to avoid getting permanently stuck if this pool excludes the shiny/perfect-DV states.",
-        math.floor(REROLL_INTERVAL_SECONDS / 60)))
-    RngEnabler.enable_randomness(RngEnabler.FULL_COVERAGE_RANGE)
+        "Re-rolling savestate pool after %d minutes - injecting fresh entropy across %d short split(s) and re-baselining to avoid getting permanently stuck if this pool excludes the shiny/perfect-DV states.",
+        math.floor(REROLL_INTERVAL_SECONDS / 60), REROLL_SPLIT_COUNT))
+
+    for i = 1, REROLL_SPLIT_COUNT do
+        RngEnabler.enable_randomness(RngEnabler.SPLIT_RANGE)
+        wait_for_no_active_script(string.format("split %d/%d", i, REROLL_SPLIT_COUNT))
+    end
+
+    -- Confirm we're still genuinely sitting at the starter-choice screen
+    -- (party size unchanged) before trusting this as the new baseline -
+    -- see the writeup above for exactly what goes wrong if we don't.
+    local partySizeAfterSplits = memory.readbyte(base_address)
+    if partySizeAfterSplits ~= partysize then
+        print(string.format(
+            "Re-roll aborted: party size changed during the entropy wait (now %d, expected %d) - saving this would have corrupted the pool. Reloading the last known-good baseline instead and will retry next interval.",
+            partySizeAfterSplits, partysize))
+        savestate.loadslot(SAVESTATE_SLOT)
+        mashSplitsFired = 0
+        splitAfterReceivedPending = false
+        splitAfterSettlePending = false
+        lastResetTime = os.time()
+        lastRerollTime = os.time()
+        return
+    end
+
+    -- Final check right before saving - covers the (rare) case something
+    -- started during the stability read just above.
+    wait_for_no_active_script("final pre-save check")
+
     savestate.saveslot(SAVESTATE_SLOT)
     lastRerollTime = os.time()
+    -- The splits above still take several real seconds - without this,
+    -- the very next stuck check could still misfire on a slow machine.
+    -- See the writeup above for the full "no reset for 60+ seconds"
+    -- symptom this caused every time.
+    lastResetTime = os.time()
 end
 
 -- If 60 seconds pass without reaching a shiny/not-shiny decision (e.g.

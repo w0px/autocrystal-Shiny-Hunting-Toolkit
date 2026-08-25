@@ -162,6 +162,7 @@ local EGG_PLACEHOLDER = 0xFD
 local SAVESTATE_SLOT
 
 local party_base_addr
+local wScriptRunningAddr -- non-zero while any overworld script (dialogue/call/cutscene) is running; used by reroll_savestate_pool() to confirm the game is truly idle before trusting a save - see there
 local eggSlotIndex -- fixed once determined: the same slot every reset, since party size before receiving never changes
 local eggDvAddr
 local eggSpeciesListAddr
@@ -417,11 +418,17 @@ function M.init(sharedForm, yOffset, existingHud)
         if region == 0x4A then party_base_addr = 0xDC9D
         elseif region == 0x45 then party_base_addr = 0xDCD7
         else party_base_addr = 0xDCD7 end
+        -- Verified against pokecrystal.sym: wScriptRunning ($D438). Same
+        -- address static.lua already relies on for this same purpose.
+        wScriptRunningAddr = 0xD438
     elseif version == 0x55 or version == 0x58 then
         if region == 0x4A then party_base_addr = 0xD9E8
         elseif region == 0x45 then party_base_addr = 0xDA22
         elseif region == 0x4B then party_base_addr = 0xDB1F
         else party_base_addr = 0xDA22 end
+        -- Verified against pokegold1.sym: wScriptRunning ($D15F, plain
+        -- SVBK-switched WRAM view). Same address static.lua uses.
+        wScriptRunningAddr = 0xD15F
     else
         print("No valid ROM detected")
         return false
@@ -504,18 +511,102 @@ function M.on_resume()
     lastRerollTime = os.time()
 end
 
+local REROLL_SPLIT_COUNT = 6
+local REROLL_SCRIPT_CLEAR_TIMEOUT = 180 -- frames to wait for wScriptRunning to clear
+
+-- Presses B/A until wScriptRunningAddr reads 0 (or the bounded timeout is
+-- hit) - a real confirmation that no dialogue/call/cutscene is mid-flight,
+-- not a guess. No-op (returns immediately) if nothing is open, which is
+-- the common case on every call. Ported from static.lua's identical
+-- helper - see reroll_savestate_pool() below for the bug this fixes.
+local function wait_for_no_active_script(label)
+    if not wScriptRunningAddr then return true end
+    local waited = 0
+    while memory.readbyte(wScriptRunningAddr) ~= 0 and waited < REROLL_SCRIPT_CLEAR_TIMEOUT do
+        press_button(waited % 2 == 0 and "B" or "A")
+        waited = waited + 1
+    end
+    if waited > 0 then
+        print(string.format(
+            "reroll_savestate_pool(): wScriptRunning was active (%s) - %s after %d frame(s).",
+            label or "script/dialogue/call in progress",
+            (memory.readbyte(wScriptRunningAddr) == 0) and "cleared it" or "gave up waiting for it to clear",
+            waited))
+    end
+    return true
+end
+
 -- Re-baselines the savestate with a fresh, unpredictable starting point -
 -- see REROLL_INTERVAL_SECONDS above for why this matters. Only called
--- while still waiting for the egg (nothing mid-flight), same safety
--- requirement as static.lua's version.
+-- while still waiting for the egg, nothing mid-flight.
+--
+-- FIXED (confirmed via a tester log): this used to do ONE single
+-- blocking RngEnabler.enable_randomness(FULL_COVERAGE_RANGE) wait - up
+-- to 70000 frames, ~9.7 minutes average, with ZERO button presses the
+-- entire time. Two things went wrong every single time this fired:
+--   1) That easily exceeds STUCK_RESET_TIMEOUT (60s), and nothing here
+--      ever refreshed lastResetTime during/after it - so the very next
+--      check_stuck_and_force_reset() call ALWAYS treated this deliberate
+--      delay as "stuck" and forced an extra reload, unconditionally,
+--      every single reroll. The tester's log showed exactly this: "no
+--      reset for 60+ seconds" printed immediately after every single
+--      "Re-rolling savestate pool" message.
+--   2) Worse: sitting fully idle for that long with no input at all is
+--      exactly the kind of window a Pokegear call, sign, or any other
+--      unrelated overworld script can silently open in - and the old
+--      code saved whatever state existed right after the wait with no
+--      check at all. If the game had drifted out of "still waiting for
+--      the egg" during that window, the corrupted state got saved as
+--      the new pool baseline - and since every future reload/mash cycle
+--      starts from that same corrupted state and BizHawk is perfectly
+--      deterministic, every encounter after that point comes out
+--      identical, forever. This is exactly what the tester's log showed:
+--      identical raw atkdef/spespc on every single encounter starting
+--      right after a reroll.
+-- Same underlying bug already found and fixed in static.lua (see that
+-- module's reroll_savestate_pool() for the original writeup) - ported
+-- here now: split into several short chunks instead of one giant blind
+-- wait, checking wScriptRunning after every chunk, plus a stability
+-- check right before saving.
 local function reroll_savestate_pool()
     rerollWindow = rerollWindow + 1
     print(string.format(
-        "Re-rolling savestate pool after %d minutes (entering window %d) - injecting fresh entropy and re-baselining to avoid getting permanently stuck if this pool excludes the shiny states.",
-        math.floor(REROLL_INTERVAL_SECONDS / 60), rerollWindow))
-    RngEnabler.enable_randomness(RngEnabler.FULL_COVERAGE_RANGE)
+        "Re-rolling savestate pool after %d minutes (entering window %d) - injecting fresh entropy across %d short split(s) and re-baselining to avoid getting permanently stuck if this pool excludes the shiny states.",
+        math.floor(REROLL_INTERVAL_SECONDS / 60), rerollWindow, REROLL_SPLIT_COUNT))
+
+    for i = 1, REROLL_SPLIT_COUNT do
+        RngEnabler.enable_randomness(RngEnabler.SPLIT_RANGE)
+        wait_for_no_active_script(string.format("split %d/%d", i, REROLL_SPLIT_COUNT))
+    end
+
+    -- Confirm we're still genuinely waiting for the egg (party size
+    -- unchanged) before trusting this as the new baseline - see the
+    -- writeup above for exactly what goes wrong if we don't.
+    local partySizeAfterSplits = memory.readbyte(party_base_addr)
+    if partySizeAfterSplits ~= partysizeBeforeReceiving then
+        print(string.format(
+            "Re-roll aborted: party size changed during the entropy wait (now %d, expected %d) - saving this would have corrupted the pool. Reloading the last known-good baseline instead and will retry next interval.",
+            partySizeAfterSplits, partysizeBeforeReceiving))
+        savestate.loadslot(SAVESTATE_SLOT)
+        mashSplitsFired = 0
+        splitAfterReceivedPending = false
+        splitAfterSettlePending = false
+        lastResetTime = os.time()
+        lastRerollTime = os.time()
+        return
+    end
+
+    -- Final check right before saving - covers the (rare) case something
+    -- started during the stability read just above.
+    wait_for_no_active_script("final pre-save check")
+
     savestate.saveslot(SAVESTATE_SLOT)
     lastRerollTime = os.time()
+    -- The splits above still take several real seconds - without this,
+    -- the very next stuck check could still misfire on a slow machine.
+    -- See the writeup above for the full "no reset for 60+ seconds"
+    -- symptom this caused every time.
+    lastResetTime = os.time()
 end
 
 -- If 60 seconds pass without reaching a shiny/not-shiny decision (e.g.
