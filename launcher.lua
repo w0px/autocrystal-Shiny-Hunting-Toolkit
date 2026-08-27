@@ -106,7 +106,7 @@ local statusLabel = forms.label(shell, "Idle - pick a module and click Start.", 
 -- since the module dropdown starts on the placeholder text.
 local staticTargetLabel = forms.label(shell, "Static target:", 10, 112, 90, 16)
 forms.setproperty(staticTargetLabel, "Visible", false)
-StaticTargetDropdown = forms.dropdown(shell, {"Static (open world)", "Sudowoodo", "Eevee", "Shuckle", "Spearow", "Celebi", "Lapras", "Suicune"}, 105, 110, 160, 20)
+StaticTargetDropdown = forms.dropdown(shell, {"Static (open world)", "Sudowoodo", "Eevee", "Shuckle", "Spearow", "Celebi", "Lapras", "Suicune", "Snorlax"}, 105, 110, 160, 20)
 forms.setproperty(StaticTargetDropdown, "SelectedIndex", 0)
 forms.setproperty(StaticTargetDropdown, "Visible", false)
 
@@ -247,8 +247,15 @@ local STATIC_TARGET_ART = {
     ["Celebi"] = "launcher_art_celebi.png",
     ["Lapras"] = "launcher_art_lapras.png",
     ["Suicune"] = "launcher_art_suicune.png",
-    -- "Eevee" intentionally omitted - falls through to the Static module's
-    -- own default art below (launcher_art3.png).
+    -- Shiny Crystal sprite, per explicit request (matches the shiny-
+    -- hunting theme of the app itself). Falls back gracefully to the
+    -- Static module's default art (launcher_art3.png) via
+    -- art_file_exists() below if this file isn't present yet - the code
+    -- wiring here doesn't depend on the asset actually existing on disk.
+    ["Snorlax"] = "launcher_art_snorlax.png",
+    -- "Eevee" intentionally omitted - no dedicated sprite asset, falls
+    -- through to the Static module's own default art below
+    -- (launcher_art3.png).
 }
 
 -- Cache of filename -> whether data/<filename> exists on disk, so this
@@ -510,14 +517,14 @@ while true do
 
             -- Static gets one extra bit of detail: which specific target
             -- is selected (Shuckle/Eevee/Spearow/Celebi/Lapras/Suicune/
-            -- Sudowoodo), so the presence line reads "Static (Shuckle)"
-            -- instead of just "Static" for those - but "Static (open
-            -- world)" (the literal dropdown text) is deliberately NOT
-            -- shown here, since that's redundant/awkward next to the
+            -- Sudowoodo/Snorlax), so the presence line reads "Static
+            -- (Shuckle)" instead of just "Static" for those - but "Static
+            -- (open world)" (the literal dropdown text) is deliberately
+            -- NOT shown here, since that's redundant/awkward next to the
             -- module name itself; plain "Static" covers it.
             if loadedModuleName == "static" and StaticTargetDropdown then
                 local targetText = forms.gettext(StaticTargetDropdown)
-                if targetText == "Shuckle" or targetText == "Eevee" or targetText == "Spearow" or targetText == "Celebi" or targetText == "Lapras" or targetText == "Suicune" or targetText == "Sudowoodo" then
+                if targetText == "Shuckle" or targetText == "Eevee" or targetText == "Spearow" or targetText == "Celebi" or targetText == "Lapras" or targetText == "Suicune" or targetText == "Sudowoodo" or targetText == "Snorlax" then
                     displayName = displayName .. " (" .. targetText .. ")"
                 end
             end
