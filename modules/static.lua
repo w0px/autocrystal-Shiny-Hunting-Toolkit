@@ -360,6 +360,63 @@ local SPEAROW_HOLD_FRAMES = 16
 -- stall or produce nothing.
 local CELEBI_HOLD_FRAMES = 12
 
+-- Snorlax (Route 11, blocking the road - the sleeping Snorlax that needs
+-- the Poke Flute played on it first before it can be battled at all).
+-- Added after a real user report: "Static (open world)" was being used
+-- for it (no dedicated entry existed), which only ever credits ONE real
+-- button-advance point - the exact same wrong assumption "Static (open
+-- world)" made about Sudowoodo before that got its own branch below. User
+-- confirmed report matches that signature exactly: "just wants to talk to
+-- it even with mashing" (splits exhausted against a textbox that wasn't
+-- going anywhere, then the isDribbleTarget no-op branch let a still-
+-- pending script sit forever) and "needs a lot of A mashes" (i.e. it DOES
+-- eventually resolve with enough real presses - this is a step-count
+-- problem, not a story-flag/Poke-Flute gate, so the Flute has already
+-- been used). Untuned first guess for both the hold length and the step
+-- count below - no disassembly on hand to verify Snorlax's exact script
+-- shape the way Sudowoodo's SquirtbottleScript was confirmed, so this
+-- starts from Shuckle/Celebi's hold baseline and Sudowoodo's step count
+-- as the closest known comparable (another battle-style target reached
+-- via more than one real text box) - report back if it still stalls or
+-- still produces nothing and both need adjusting further.
+local SNORLAX_HOLD_FRAMES = 12
+-- Both Snorlax and Sudowoodo went through a round of guessing a fixed
+-- numSteps (how many real A-presses to spend before going quiet) that
+-- kept turning out wrong in practice - Snorlax needed way more than the
+-- first guess of 3, and even after bumping it to 10 and separately
+-- giving Sudowoodo (below) its own hold length, a real user report
+-- showed Sudowoodo STILL stalling on the very first textbox with a fixed
+-- count of 5. Rather than guess yet another number, both targets now
+-- just mash every single dribble_entropy_until_hook() iteration (see
+-- DIALOGUE_MASH_CAP below) instead of stopping after some fixed count -
+-- dribble_entropy_until_hook already checks pendingEncounterUpdate
+-- before AND after each step and bails out the instant the real
+-- battle-start hook fires, so there was never any actual need to cap the
+-- press count below the iteration cap itself; doing so only ever
+-- recreated this exact "not enough presses" stall whenever a target's
+-- real script needed more advances than whatever number was guessed.
+-- Mashing every iteration means the bot naturally keeps pressing through
+-- however many textboxes/prompts the target's real script has, and
+-- naturally stops the moment the encounter actually starts - no more
+-- guessing, no more per-target step-count tuning.
+local DIALOGUE_MASH_CAP = 40
+
+-- Sudowoodo hold length - added after a real user report of a stall on
+-- the VERY FIRST textbox ("The weird tree doesn't like the...", i.e. the
+-- "Use SQUIRTBOTTLE?" yesorno prompt) despite numSteps=3 already being
+-- disassembly-correct for the step COUNT at the time. Sudowoodo was,
+-- until now, the only multi-step dialogue-driven target in this file
+-- with no dedicated current_hold_frames() entry - it fell through to the
+-- bare 4-frame default, which is the exact same "produces no output"
+-- signature that originally justified SHUCKLE_HOLD_FRAMES/
+-- SPEAROW_HOLD_FRAMES existing at all (a too-short hold not reliably
+-- registering as a real button press). Starts at the same 12-frame
+-- baseline as Shuckle/Celebi/Snorlax rather than a fresh guess - report
+-- back if it still stalls and this needs its own separate value. (The
+-- separate numSteps guessing problem is now handled by DIALOGUE_MASH_CAP
+-- above instead of a per-target step count.)
+local SUDOWOODO_HOLD_FRAMES = 12
+
 -- Lapras (Union Cave B2F, Friday-only Surf encounter): confirmed against
 -- the actual pokecrystal disassembly (maps/UnionCaveB2F.asm) that its
 -- script is faceplayer -> cry -> loadwildmon -> startbattle, with NO
@@ -419,10 +476,10 @@ local BATTLE_TARGET_EXPECTED_SPECIES = {
 -- all the way to startbattle.
 --
 -- So Suicune needs a real one-time WALK from the savestate's outside
--- position through the door (SUICUNE_WALK_IN_STEPS, held-Up tile-steps -
--- see its declaration above for the "untuned first guess" caveat), then
--- just waiting out the automatic cutscene - see the dedicated "Suicune"
--- branch in the mash-loop below instead of the default press-A path.
+-- position through the door (held-Up tile-steps, mashed via
+-- DIALOGUE_MASH_CAP - see its declaration above), then just waiting out
+-- the automatic cutscene - see the dedicated "Suicune" branch in the
+-- mash-loop below instead of the default press-A path.
 -- Joins OPEN_WORLD_STYLE_TARGETS (see above) for the same reason
 -- "Static (open world)" needed it: no fixed expected species to guard
 -- with BATTLE_TARGET_EXPECTED_SPECIES, so it needs the full
@@ -600,8 +657,8 @@ end
 -- Suicune joined this list once real testing showed its trigger runs
 -- through the exact same EnemyWildmonInitialized hook with nothing to
 -- hang a species-name guard off of either - see the big Suicune comment
--- block below for why (and for SUICUNE_WALK_IN_STEPS, its other special
--- case).
+-- block below for why (and for its walk-in-then-mash handling, its other
+-- special case).
 --
 -- "Sudowoodo" joins here too on an audit pass, not a specific bug report:
 -- the top-of-file comment already classified it as a "battle-style
@@ -620,20 +677,34 @@ local OPEN_WORLD_STYLE_TARGETS = {
     ["Static (open world)"] = true,
     ["Suicune"] = true,
     ["Sudowoodo"] = true,
+    -- Snorlax joins on the same reasoning as Sudowoodo right above: it's
+    -- a genuine wild-style battle via EnemyWildmonInitialized once
+    -- triggered (catchable/fleeable, not a party-size gift), reached via
+    -- a person-event interaction with no ambient wild encounters nearby
+    -- to worry about - same shape as Sudowoodo, just with its own
+    -- dedicated step count below instead of reusing "Static (open
+    -- world)"'s single-press assumption.
+    ["Snorlax"] = true,
 }
 local function is_open_world_style_target(name)
     return OPEN_WORLD_STYLE_TARGETS[name] == true
 end
 
--- UNTUNED FIRST GUESS (same "adjust if it doesn't work" spirit as
--- SHUCKLE_HOLD_FRAMES/SPEAROW_HOLD_FRAMES/CELEBI_HOLD_FRAMES above) for
--- how many held-Up tile-steps it takes to walk the savestate's starting
--- position - just outside Tin Tower, confirmed via a screenshot of the
--- player standing below the tower's door - through the door and onto the
+-- Used to be a fixed "UNTUNED FIRST GUESS" step count (8) for how many
+-- held-Up tile-steps it takes to walk the savestate's starting position -
+-- just outside Tin Tower, confirmed via a screenshot of the player
+-- standing below the tower's door - through the door and onto the
 -- TinTower1F map, where TinTower1FSuicuneBattleScript's scene_script can
--- actually trigger. Report back if the character doesn't make it in (or
--- overshoots into something else) and this gets tuned from there.
-local SUICUNE_WALK_IN_STEPS = 8
+-- actually trigger. That's exactly the same class of guess that caused
+-- the real Sudowoodo/Snorlax stalls (see DIALOGUE_MASH_CAP above) - if 8
+-- steps ever undershot the door, the walk-in stepFn would stop pressing
+-- Up while isDribbleTarget's no-op branch let a still-short-of-the-door
+-- character sit there forever. Pre-emptively switched to the same
+-- DIALOGUE_MASH_CAP mash-every-iteration approach below (walking a few
+-- extra tile-steps into an already-automatic cutscene is harmless the
+-- same way a few extra A-presses are) rather than waiting for a real
+-- stuck report to prove this constant was wrong too - no fixed step
+-- count needed anymore, so there's no local declaration left here.
 -- Frames to hold Up per simulated tile-step - 16 is standard Gen II
 -- overworld walking speed (one full tile per 16 frames at normal, non-
 -- bike pace); using press_button()'s hold-then-release shape so each
@@ -686,6 +757,10 @@ local function current_hold_frames()
             return SPEAROW_HOLD_FRAMES
         elseif target == "Celebi" then
             return CELEBI_HOLD_FRAMES
+        elseif target == "Snorlax" then
+            return SNORLAX_HOLD_FRAMES
+        elseif target == "Sudowoodo" then
+            return SUDOWOODO_HOLD_FRAMES
         end
     end
     return 4
@@ -2733,7 +2808,24 @@ function M.step()
         -- own 3 real button-advance points above already give it more
         -- entropy runway than "Static (open world)" gets, so it doesn't
         -- need the wider range too.
-        dribble_entropy_until_hook(40, 3, function() press_button("A", current_hold_frames()) end)
+        --
+        -- UPDATE - real user report of a stall on the very first textbox
+        -- even with the numSteps=3 fix above and a dedicated hold length
+        -- (SUDOWOODO_HOLD_FRAMES): fixed step counts kept needing bumps
+        -- that then turned out wrong again. Switched to mashing every
+        -- iteration (DIALOGUE_MASH_CAP - see its declaration above) so
+        -- there's no step count left to guess at all - the loop still
+        -- bails out immediately the instant pendingEncounterUpdate fires,
+        -- same as before.
+        dribble_entropy_until_hook(DIALOGUE_MASH_CAP, DIALOGUE_MASH_CAP, function() press_button("A", current_hold_frames()) end)
+        firstPressPending = false
+        return false
+    elseif StaticTargetDropdown and forms.gettext(StaticTargetDropdown) == "Snorlax" then
+        -- Same DIALOGUE_MASH_CAP approach as Sudowoodo above - mashes
+        -- every iteration instead of a guessed, repeatedly-wrong fixed
+        -- step count. See DIALOGUE_MASH_CAP's declaration for the full
+        -- reasoning.
+        dribble_entropy_until_hook(DIALOGUE_MASH_CAP, DIALOGUE_MASH_CAP, function() press_button("A", current_hold_frames()) end)
         firstPressPending = false
         return false
     elseif StaticTargetDropdown and forms.gettext(StaticTargetDropdown) == "Suicune" then
@@ -2744,8 +2836,10 @@ function M.step()
         -- no dialogue - the player has to actually WALK through the door
         -- and onto TinTower1F before TinTower1FSuicuneBattleScript's
         -- scene_script can trigger at all, hence the dedicated walk-in
-        -- stepFn instead of a single A-press.
-        dribble_entropy_until_hook(40, SUICUNE_WALK_IN_STEPS, function() press_button("Up", SUICUNE_WALK_HOLD_FRAMES) end)
+        -- stepFn instead of a single A-press. Mashes every iteration
+        -- (DIALOGUE_MASH_CAP) instead of a fixed guessed step count -
+        -- see the walk-in comment block above for why.
+        dribble_entropy_until_hook(DIALOGUE_MASH_CAP, DIALOGUE_MASH_CAP, function() press_button("Up", SUICUNE_WALK_HOLD_FRAMES) end)
         firstPressPending = false
         return false
     elseif StaticTargetDropdown and BATTLE_TARGET_EXPECTED_SPECIES[forms.gettext(StaticTargetDropdown)] then
