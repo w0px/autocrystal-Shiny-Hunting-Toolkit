@@ -432,6 +432,29 @@ while true do
                     -- just Wild - and stays correct automatically if
                     -- that layout changes again later.
                     forms.setsize(shell, 460, sharedHud.bottomY + 30)
+                    -- A real user report: on their display, only the
+                    -- first few checkboxes (up through "Kill non-shiny")
+                    -- were visible at all - everything below that (the
+                    -- kill filter box, the Auto-Catch/Discord/Advanced
+                    -- Settings buttons) was simply cut off, with no way to
+                    -- reach it. bottomY above is computed correctly from
+                    -- every widget gui_module.lua actually adds, so the
+                    -- window is being asked for the right height - but
+                    -- Windows can still render less than that (DPI
+                    -- scaling inflating each control's effective size
+                    -- beyond what these raw pixel coordinates assume, or
+                    -- just a short screen the window doesn't fully fit
+                    -- on), and a plain forms.newform has no scrollbar of
+                    -- its own to fall back on when that happens. AutoScroll
+                    -- fixes this generically, for any user's display,
+                    -- without needing to know or guess which of those
+                    -- causes applies: whenever the rendered client area
+                    -- ends up smaller than the content, Windows adds a
+                    -- scrollbar automatically so nothing is ever
+                    -- permanently unreachable. Does nothing (no visible
+                    -- scrollbar) on a display where everything already
+                    -- fits, so this is safe to always enable.
+                    forms.setproperty(shell, "AutoScroll", true)
                 end
 
                 local ok = mod.init(shell, CONTENT_Y_OFFSET, sharedHud)
