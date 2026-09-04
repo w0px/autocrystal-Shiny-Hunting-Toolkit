@@ -191,6 +191,11 @@ function M.open_advanced_settings(w)
         w.chkVerbose = nil
         w.chkTrueRandomness = nil
     end)
+    -- Same fix as the main shell window - see its own comment for the
+    -- full reasoning (a real user report of controls being cut off with
+    -- no way to reach them). Safe to always enable: does nothing when
+    -- everything already fits.
+    forms.setproperty(advForm, "AutoScroll", true)
     local y = 10
 
     w.chkStopItem = forms.checkbox(advForm, "Stop on held item:", 10, y)
@@ -273,6 +278,11 @@ function M.open_autocatch_settings(w)
         w.chkCatchOnPerfectNegative = nil
         w.chkDontWeaken = nil
     end)
+    -- Same fix as the main shell window - see its own comment for the
+    -- full reasoning (a real user report of controls being cut off with
+    -- no way to reach them). Safe to always enable: does nothing when
+    -- everything already fits.
+    forms.setproperty(acForm, "AutoScroll", true)
     local y = 10
 
     w.chkAutoCatch = forms.checkbox(acForm, "Auto-catch on shiny", 10, y)
@@ -371,6 +381,11 @@ function M.open_discord_settings(w)
         w.chkPingUser = nil
         w.txtPingId = nil
     end)
+    -- Same fix as the main shell window - see its own comment for the
+    -- full reasoning (a real user report of controls being cut off with
+    -- no way to reach them). Safe to always enable: does nothing when
+    -- everything already fits.
+    forms.setproperty(discForm, "AutoScroll", true)
     local y = 10
 
     w.chkDiscord = forms.checkbox(discForm, "Send Discord notification (shiny/stop)", 10, y)

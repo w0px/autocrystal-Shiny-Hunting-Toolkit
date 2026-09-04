@@ -369,6 +369,28 @@ local spespc
 local species
 local item = 0
 local shinyvalue = 0
+-- Containment fix for a confirmed, still-not-fully-root-caused bug: a
+-- real verbose log (a shiny Raticate, "Stats: shiny recorded" printed
+-- correctly, encounters-since-shiny genuinely reset 2237->0) proved that
+-- by the time the in-battle decision block's own "Decision check"
+-- diagnostic ran - just 1-2 M.step() ticks later, same battle, same
+-- atkdef/spespc still reading the correct shiny values - shinyvalue had
+-- already reverted to 0, and the bot went on to actually flee the real
+-- shiny (not just a bad fallback notification). Every explicit
+-- `shinyvalue = 0` assignment in this file was checked against that log
+-- (shiny() itself, M.on_resume(), the two post-catch/post-flee cleanup
+-- resets) and NONE of them could have fired for this encounter - no
+-- second hook firing occurred either (would have unconditionally printed
+-- a second "combat started", which the log doesn't show). The exact
+-- mechanism is still unidentified. Rather than keep guessing at wild.lua
+-- while a real shiny gets lost, this latches the hook's own verdict into
+-- a SEPARATE variable that nothing else in this file writes to, and the
+-- real catch/flee decision below reads THIS instead of the raw
+-- shinyvalue - so whatever is clobbering shinyvalue (if anything still
+-- is) can no longer flip a real shiny into a flee. Decision check now
+-- prints both so a future recurrence will show directly whether they
+-- ever diverge.
+local shinyLatchedThisBattle = false
 -- Rich embed fields/sprite for the CURRENT encounter, if it's shiny -
 -- computed once in M.step()'s pendingEncounterUpdate handling and
 -- consumed exactly once, either by the auto-catch "found! attempting to
@@ -400,6 +422,36 @@ local stopReason = ""
 -- where no real battle ever started at all.
 local realEncounterConfirmed = false
 local pendingEncounterUpdate = false
+-- Set true (alongside pendingEncounterUpdate) the instant the ROM hook
+-- confirms a NEW encounter is shiny - cleared the moment the in-battle
+-- shiny-decision block (the "if shinyvalue == 1 then" branch further
+-- down M.step(), which unconditionally calls send_pending_shiny_embed()
+-- in every one of its sub-branches) actually starts handling it. A real,
+-- confirmed bug (see the fallback check where overworld_loaded flips
+-- back true below) showed that block can, for reasons not yet fully
+-- pinned down, sometimes never run for a battle at all even though the
+-- ROM hook fired and Stats correctly recorded the shiny - meaning the
+-- console's "Stats: shiny X recorded" print appeared with ZERO further
+-- output (no "Shiny found!!", no catch attempt, no Discord message)
+-- before the very next encounter started, as if that battle was never
+-- actually processed. This flag is the safety net: if it's STILL true
+-- once we're confirmed back in the overworld, the shiny was provably
+-- never handled, so a fallback notification fires right there instead
+-- of the user finding out only from "since last shiny" quietly dropping
+-- with no explanation.
+local shinyNotificationPending = false
+-- Diagnostic companion to shinyNotificationPending, armed/reset
+-- alongside it. Set true by the LoadBattleMenuAddr ROM hook (a real,
+-- confirmed hook - see its own comment - that fires exactly when the
+-- game loads the player-visible FIGHT/PKMN/ITEM/RUN menu, not a guess)
+-- if that menu is ever actually reached while a shiny notification is
+-- still pending. Lets the fallback warning below say, with real
+-- evidence instead of a guess, whether the bot ever got a turn at all
+-- for that encounter - a user correctly pointed out that "it likely
+-- got away" was an unverified assumption baked into the original
+-- fallback message, since a normal wild Pokemon doesn't flee before
+-- the player gets to act.
+local shinyNotificationBattleMenuSeen = false
 -- Snapshot of Stats.encountersSinceShiny taken in the ROM hook, BEFORE
 -- Stats.record_encounter/record_shiny run there - see the hook itself
 -- for why stats bookkeeping moved out of M.step(). M.step() reads this
@@ -564,6 +616,18 @@ local function attempt_step(direction)
     local startX, startY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
 
     for i = 1, 4 do
+        -- Check BEFORE forcing input on this frame, not just after the
+        -- full 4-frame hold completes - see try_unstuck()'s matching
+        -- comment for why. EnemyWildmonInitialized can fire mid-hold,
+        -- and continuing to hold a direction through frames the game
+        -- never expected input on during a real encounter's own startup
+        -- transition is exactly the kind of window that produced a
+        -- confirmed encounter (Stats/DV print correct, M.step() in-battle
+        -- branch never ran) elsewhere in this same failure class.
+        if memory.readbyte(species_addr) ~= 0 then
+            joypad.set({[direction] = false})
+            return true
+        end
         joypad.set({[direction] = true})
         emu.frameadvance()
     end
@@ -673,14 +737,74 @@ local UNSTUCK_THRESHOLD = 30
 -- whatever's blocking us generically.
 local function try_unstuck()
     print(string.format("No real movement for %d cycles - possibly a phone call/sign/text box blocking input. Trying to clear it.", consecutive_movement_failures))
+
+    -- Idle grace period - NO input at all - before this function ever
+    -- presses a button. Added after a live miss recurred even with the
+    -- per-frame check below already in place: this watchdog message
+    -- fires far too often (roughly 1 in every 25 encounters in a real
+    -- log) to be mostly rare phone calls/signs. The much more likely
+    -- explanation is that a real wild encounter's own screen-freeze,
+    -- during the handful of frames between the triggering step and
+    -- species_addr becoming readable as nonzero, LOOKS IDENTICAL to
+    -- "stuck" from this watchdog's point of view - so a meaningful
+    -- fraction of the time this fires, an encounter is already quietly
+    -- in progress, not actually stuck at all. The per-frame check further
+    -- down can still leave exactly one B-press asserted on the very
+    -- frame the encounter's ROM hook fires (we can't know a frame is the
+    -- critical one until after we've already committed input for it) -
+    -- that's the gap this grace period closes: wait quietly first and
+    -- let anything already in flight fully reveal itself BEFORE ever
+    -- risking a button press into it. Only once nothing shows up here do
+    -- we treat this as a genuine stuck-textbox and start mashing B.
+    local GRACE_FRAMES = 60
+    for i = 1, GRACE_FRAMES do
+        emu.frameadvance()
+        if memory.readbyte(species_addr) ~= 0 then
+            vprint("A real encounter revealed itself during the unstuck grace period - not actually stuck, leaving it alone.")
+            consecutive_movement_failures = 0
+            return
+        end
+    end
+
     -- B, never A: some phone calls (rematch challenges) end in a
     -- "battle now? Yes/No" prompt, and mashing A could accidentally
     -- CONFIRM a trainer battle - something this bot has zero ability to
     -- handle (completely different menus/addresses than wild encounters).
     -- B is the safe cancel/decline button used everywhere else in this
     -- script for exactly this reason.
+    --
+    -- Deliberately NOT using the shared press_button() helper here.
+    -- press_button() holds its button for 4 straight frames via
+    -- joypad.set before ever checking species_addr again, and this loop
+    -- calls it up to 80 times back-to-back with no gap - up to ~400
+    -- frames where B can be getting forced down every single frame.
+    -- EnemyWildmonInitialized (the wild-encounter ROM hook) fires the
+    -- instant its ROM address executes, during ANY emu.frameadvance()
+    -- call, including ones buried inside an in-flight press_button()
+    -- hold - so the old "check once per full press" loop could keep
+    -- forcing B for up to 3 more frames AFTER a real encounter had
+    -- already started initializing. Confirmed via log correlation: in a
+    -- real user log, every single missed-shiny encounter (3/3, where
+    -- Stats/the DV print fired correctly straight from the hook but
+    -- M.step()'s in-battle branch never ran at all for that battle) was
+    -- immediately preceded by this exact "No real movement" message -
+    -- this is the only place in the overworld dispatch that holds a
+    -- button for this many consecutive frames unbroken. Checking
+    -- species_addr before EVERY frame of the hold (not just after each
+    -- full press) closes that window down to zero extra frames.
     for i = 1, 80 do
-        press_button("B")
+        local encounterStarted = false
+        for f = 1, 4 do
+            if memory.readbyte(species_addr) ~= 0 then
+                encounterStarted = true
+                break
+            end
+            joypad.set({B = true})
+            emu.frameadvance()
+        end
+        joypad.set({B = false})
+        if encounterStarted then break end
+        emu.frameadvance() -- frame buffer, matches press_button()'s own spacing
         if memory.readbyte(species_addr) ~= 0 then break end
     end
     safe_pair = nil -- re-verify from scratch, position/context may have shifted
@@ -2006,7 +2130,20 @@ end
 
 local overworld_loaded = false
 local overworld_settle_frames = 0
-local REQUIRED_SETTLE_FRAMES = 10 -- consecutive frames of species_addr==0 before we trust we're truly back
+-- Was 10. A real verbose log (the shiny Raticate investigated alongside
+-- shinyLatchedThisBattle above) directly proved species_addr can read 0
+-- for 10+ CONSECUTIVE frames purely as part of a battle's own intro
+-- transition - i.e. genuinely reaching this exact old threshold - which
+-- fired "Overworld loaded" (and, when a shiny was pending, the fallback-
+-- notification/battle-state-cleanup block below) while the same battle
+-- was still very much in progress; that same log showed it happen 4
+-- separate times in a row for one encounter before the real battle menu
+-- ever loaded. Elsewhere in this file, species_addr is independently
+-- documented (do_catch_sequence's own settling-wait comments) to flicker
+-- for "up to 90+ frames" around a real battle boundary - raised to match
+-- that same, already-evidenced worst case instead of the old, now-proven-
+-- too-short 10.
+local REQUIRED_SETTLE_FRAMES = 90 -- consecutive frames of species_addr==0 before we trust we're truly back
 
 -- Top-level watchdog: tracks real-world time since the player's tile
 -- position last actually changed, completely independent of which
@@ -2086,6 +2223,9 @@ local function register_hooks()
     Mem.RegisterROMHook(LoadBattleMenuAddr, function()
         if ActiveModuleName ~= "wild" then return end
         have_battle_controls = true
+        if shinyNotificationPending then
+            shinyNotificationBattleMenuSeen = true
+        end
         vprint(string.format("Battle menu loaded | Cursor Y=%d X=%d",
             memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)))
     end, "Detect Battle Menu")
@@ -2125,6 +2265,11 @@ local function register_hooks()
         highestSpeSpc = math.max(highestSpeSpc, spespc)
         species = memory.readbyte(species_addr)
         shiny(atkdef, spespc) -- sets shinyvalue as a side effect if applicable
+        -- Latched here, synchronously, in the same trusted atomic context
+        -- as Stats.record_shiny below - see shinyLatchedThisBattle's own
+        -- declaration near the top of the file for why the real catch/
+        -- flee decision trusts this instead of the raw shinyvalue.
+        shinyLatchedThisBattle = (shinyvalue == 1)
 
         local speciesName = get_pokemon_name(species)
         local itemName = get_item_name(item)
@@ -2201,6 +2346,17 @@ local function register_hooks()
                 {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
             }
             pendingShinySpriteUrl = shiny_sprite_url(species)
+            -- Armed here, synchronously with everything else above -
+            -- see this flag's declaration near the top of the file for
+            -- the full reasoning (the fallback notification this enables
+            -- further down in M.step()).
+            shinyNotificationPending = true
+            -- Reset alongside it - see this flag's own declaration for
+            -- why. Tells the fallback below whether the player-visible
+            -- FIGHT/PKMN/ITEM/RUN menu (LoadBattleMenuAddr, a real
+            -- confirmed ROM hook, not a guess) ever actually appeared for
+            -- THIS encounter before it resolved.
+            shinyNotificationBattleMenuSeen = false
         end
 
         -- IMPORTANT: this hook fires as a ROM-hook callback, and we've
@@ -2525,6 +2681,7 @@ function M.on_resume()
     stopRequested = false
     stopReason = ""
     shinyvalue = 0
+    shinyLatchedThisBattle = false
     learnMovePromptDetected = false
 end
 
@@ -2580,7 +2737,14 @@ function M.step()
         local defDV = atkdef % 16
         local speDV = math.floor(spespc / 16)
         local spcDV = spespc % 16
-        local isShinyEncounter = (shinyvalue == 1)
+        -- Reads the latch, not the raw shinyvalue - see
+        -- shinyLatchedThisBattle's declaration for why: this runs one
+        -- tick after the hook, which is exactly the same window a real
+        -- shiny was confirmed lost in (shinyvalue read back 0 by the time
+        -- code just a tick or two later checked it). Keeps the GUI/
+        -- Recent Encounters display consistent with the actual catch/flee
+        -- decision below, which already uses this same latch.
+        local isShinyEncounter = shinyLatchedThisBattle
         -- Stats.record_encounter/record_shiny already ran synchronously
         -- inside the ROM hook above (see the comment there) - NOT
         -- repeated here, to avoid double-counting every encounter.
@@ -2683,6 +2847,43 @@ function M.step()
         if overworld_settle_frames >= REQUIRED_SETTLE_FRAMES then
             if not overworld_loaded then
                 vprint("Overworld loaded - movement enabled")
+
+                -- Fallback safety net - see shinyNotificationPending's
+                -- declaration near the top of the file for the full
+                -- writeup. If this is still armed right as we confirm
+                -- we're back in the overworld, the in-battle shiny-
+                -- decision block provably never ran for that encounter,
+                -- without the bot ever attempting to catch/stop/notify
+                -- for a shiny it had already correctly detected and
+                -- recorded in Stats. Fire the notification here instead
+                -- of leaving it silently dropped, and flag it loudly in
+                -- the console so a recurrence is easy to spot/correlate.
+                --
+                -- IMPORTANT: earlier wording here asserted "it likely got
+                -- away," implying the wild Pokemon fled on its own before
+                -- any input was possible - a user correctly pointed out
+                -- that doesn't match how Gen 2 wild battles work (the
+                -- player always gets to act first; a Pokemon doesn't just
+                -- vanish pre-emptively). That was an unverified guess,
+                -- not a confirmed mechanism, so it's been replaced with
+                -- shinyNotificationBattleMenuSeen - a real signal off the
+                -- LoadBattleMenuAddr ROM hook - so this message reports
+                -- actual evidence about what happened instead of asserting
+                -- an unconfirmed cause.
+                if shinyNotificationPending then
+                    shinyNotificationPending = false
+                    local missedName = get_pokemon_name(species)
+                    local menuState = shinyNotificationBattleMenuSeen
+                        and "the battle menu DID load (so the bot had controls at some point) but never acted before the battle ended"
+                        or "the battle menu never loaded at all before the battle ended - the bot never had a chance to act"
+                    print(string.format(
+                        "WARNING: shiny %s was detected and recorded, but the battle ended before the bot ever got to act on it (no catch attempt, no stop) - %s - sending a fallback notification now.",
+                        missedName, menuState))
+                    send_pending_shiny_embed(missedName, string.format(
+                        "\xE2\x9A\xA0\xEF\xB8\x8F Shiny %s detected but the battle resolved before auto-catch/kill handling ran (%s). Outcome not confirmed - check in-game. Fallback notification.",
+                        missedName, shinyNotificationBattleMenuSeen and "battle menu loaded, no action taken" or "battle menu never loaded"))
+                end
+
                 -- Force a fresh safe-pair verification for wherever we
                 -- actually are now - handles being manually moved to a
                 -- different spot/map while the bot was stopped, and any
@@ -2834,9 +3035,49 @@ function M.step()
             and ((isPerfectDVs and Gui.catch_on_perfect(hud))
                 or (isPerfectNegativeDVs and Gui.catch_on_perfect_negative(hud)))
 
-        if shinyvalue == 1 then
+        -- Temporary diagnostic (verbose-only). A real user log showed a
+        -- confirmed shiny (Stats recorded it, the hook's own DV print was
+        -- correct) fall all the way through to the plain kill/flee code
+        -- below with NONE of the shinyvalue==1 branch's own prints ever
+        -- firing - meaning shinyvalue must not have read as 1 at the
+        -- moment this decision actually ran, despite no known code path
+        -- resetting it between the hook and here. The same log also
+        -- proved (for the first time, directly, not inferred) that
+        -- species_addr can flicker to 0 for 10+ consecutive frames
+        -- SEVERAL TIMES in a row during one battle's own intro transition
+        -- - each flip re-enters this whole per-tick block from scratch.
+        -- This line exists to catch the exact state at the moment of
+        -- that fall-through, the next time it happens, instead of
+        -- guessing further.
+        vprint(string.format(
+            "Decision check: shinyvalue=%s shinyLatchedThisBattle=%s currentSpecies=%d(%s) atkdef=%s spespc=%s catchAllowedByItem=%s catchAllowedByPerfect=%s auto_catch_enabled=%s",
+            tostring(shinyvalue), tostring(shinyLatchedThisBattle), currentSpecies, currentSpeciesName, tostring(atkdef), tostring(spespc),
+            tostring(catchAllowedByItem), tostring(catchAllowedByPerfect), tostring(Gui.auto_catch_enabled(hud))))
+
+        -- Reads the latch, NOT the raw shinyvalue - see
+        -- shinyLatchedThisBattle's declaration near the top of the file
+        -- for why (a real shiny was confirmed lost to shinyvalue reading
+        -- back 0 here despite no known code path resetting it).
+        if shinyLatchedThisBattle then
+            -- Disarm the fallback notification below - we made it here,
+            -- so one of this block's own branches is about to send (or
+            -- has already decided not to need) the real notification.
+            shinyNotificationPending = false
             local shinySpecies = currentSpecies
             local shinySpeciesName = currentSpeciesName
+
+            -- DEBUG MODE: when true, every filter/exception/living-dex
+            -- check below is bypassed entirely - ANY detected shiny gets
+            -- an immediate catch attempt as long as the master Auto-Catch
+            -- toggle is on, full stop. This exists purely to isolate
+            -- whether the species-filter/exception/living-dex logic is
+            -- involved in the confirmed "shiny detected, Stats recorded,
+            -- but never caught" bug, or whether the real cause is earlier
+            -- (shinyvalue not reading 1 at decision time at all - see the
+            -- "Decision check" vprint just above). If shinies STILL don't
+            -- get caught with this on, that conclusively rules out every
+            -- filter as the cause. Set back to false once root-caused.
+            local DEBUG_CATCH_ANY_SHINY = true
 
             if Gui.stop_on_shiny(hud) then
                 -- Plain, filter-less blanket stop - manual mode,
@@ -2850,7 +3091,7 @@ function M.step()
 
             if Gui.auto_catch_enabled(hud) then
                 local exceptionEnabled, exceptionFilterTokens = Gui.auto_catch_stop_exception(hud)
-                if exceptionEnabled and species_matches_filter(exceptionFilterTokens, shinySpecies, shinySpeciesName) then
+                if not DEBUG_CATCH_ANY_SHINY and exceptionEnabled and species_matches_filter(exceptionFilterTokens, shinySpecies, shinySpeciesName) then
                     -- This species is on the "don't auto-catch, stop
                     -- instead" exception list - e.g. reserving a
                     -- specific rare/valuable species for manual
@@ -2862,7 +3103,7 @@ function M.step()
                     return true
                 end
 
-                if Gui.skip_already_caught_enabled(hud) and Stats.is_already_caught(shinySpecies) then
+                if not DEBUG_CATCH_ANY_SHINY and Gui.skip_already_caught_enabled(hud) and Stats.is_already_caught(shinySpecies) then
                     -- Living dex mode - this species has already been
                     -- caught before (tracked persistently across
                     -- sessions), so skip auto-catching another one and
@@ -2874,7 +3115,7 @@ function M.step()
                 else
 
                 local catchFilterTokens = Gui.catch_species_filter(hud)
-                local catchAllowedBySpecies = species_matches_filter(catchFilterTokens, shinySpecies, shinySpeciesName)
+                local catchAllowedBySpecies = DEBUG_CATCH_ANY_SHINY or species_matches_filter(catchFilterTokens, shinySpecies, shinySpeciesName)
 
                 if catchAllowedBySpecies or catchAllowedByItem then
                     -- do_catch_sequence merges pendingShinyFields into
@@ -2909,6 +3150,7 @@ function M.step()
                         -- shinyvalue via shiny() inside the ROM hook, so
                         -- this can never suppress a genuine one.
                         shinyvalue = 0
+                        shinyLatchedThisBattle = false
                     end
                     return stillHunting
                 else
@@ -3134,6 +3376,7 @@ function M.step()
                 -- re-sets shinyvalue via shiny() inside the ROM hook, so
                 -- clearing it here can never suppress a genuine one.
                 shinyvalue = 0
+                shinyLatchedThisBattle = false
             end
         end
     end
