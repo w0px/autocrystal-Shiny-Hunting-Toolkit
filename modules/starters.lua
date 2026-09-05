@@ -33,6 +33,7 @@ Stats = require("data.stats")
 PokemonNames = require("data.pokemon_names")
 RngEnabler = require("data.rng_enabler")
 SavestateBackup = require("data.savestate_backup")
+ConsoleLog = require("data.console_log")
 
 -- Full 388-entry (map group, map number) -> name table, shared with
 -- wild.lua/fishing.lua/headbutt.lua/friendship.lua/static.lua - see
@@ -580,8 +581,19 @@ function M.step()
     local isShiny = shiny(atkdef, spespc)
 
     sessionResetCount = sessionResetCount + 1
-    print(string.format("#%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s",
-        sessionResetCount, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or ""))
+    local encounterLine = string.format("#%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s",
+        sessionResetCount, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or "")
+    print(encounterLine)
+
+    -- See data/console_log.lua for the full rationale: BizHawk's own
+    -- Lua console has no cap on accumulated output and gets slower to
+    -- append to as its backlog grows, so we clear it ourselves
+    -- periodically instead of making users do it manually. The same
+    -- line is also written to a rotating on-disk log so clearing the
+    -- console never actually loses anything.
+    ConsoleLog.maybe_clear_console(sessionResetCount)
+    ConsoleLog.log_encounter("starters", encounterLine)
+
     Stats.record_encounter(species)
     Gui.update_last_encounter(hud, sessionResetCount, species, speciesName, atkv, defv, spdv, spcv, isShiny, nil)
 

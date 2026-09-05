@@ -44,6 +44,7 @@ SavestateBackup = require("data.savestate_backup")
 -- encounters live at different locations, so this feeds the Rich
 -- Presence location the same as those modules.
 local LocationNames = require("data.location_names")
+local ConsoleLog = require("data.console_log")
 
 local function get_pokemon_name(id)
     return PokemonNames[id] or ("Unknown #" .. tostring(id))
@@ -318,6 +319,13 @@ local mashSplitsFired = 0
 -- they still read and honor the shared checkbox normally.
 local lastResetTime = nil
 local consecutiveStuckReloads = 0
+-- Companion to consecutiveStuckReloads, but counting instead of timing -
+-- see record_bogus_retry()'s declaration below (near
+-- check_stuck_and_force_reset()) for the full reasoning: a fast,
+-- deterministically-repeating "bogus reading" loop can refresh
+-- lastResetTime every fraction of a second forever, which makes it
+-- structurally invisible to the time-based watchdog alone.
+local consecutiveBogusRetries = 0
 
 -- Which static target this run is for - controls ONLY how long each A
 -- press is held (see press_button() above). "Eevee" and "Static (open
@@ -1812,6 +1820,7 @@ function M.on_resume()
     partysizeBeforeReceiving = baseline
     lastResetTime = os.time()
     consecutiveStuckReloads = 0
+    consecutiveBogusRetries = 0
     -- Fresh clock for the periodic pool re-roll - the savestate just
     -- taken above already got its own "free" reroll (whatever RNG state
     -- existed at the moment Start was clicked), so the next automatic
@@ -1983,6 +1992,7 @@ local function check_stuck_and_force_reset()
         -- Deliberately NOT re-reading partysizeBeforeReceiving here - see
         -- the other two loadslot() sites below for why.
         lastResetTime = os.time()
+        consecutiveBogusRetries = 0
 
         -- Backstop for the exact failure mode a real Suicune report
         -- showed (18 consecutive stuck-checks in a row): because BizHawk
@@ -2002,6 +2012,68 @@ local function check_stuck_and_force_reset()
             consecutiveStuckReloads = 0
         end
     end
+end
+
+-- Companion to check_stuck_and_force_reset() above, but counting instead
+-- of timing. That watchdog only escalates after STUCK_RESET_TIMEOUT(60)
+-- seconds pass with zero reloads at all - but every "bogus reading,
+-- reloading and retrying" branch below (species didn't settle to the
+-- expected match, a battle-hook fired but the menu never loaded, an
+-- open-world reading came back 0/255/HP-less/leaked-party-data) already
+-- calls lastResetTime = os.time() itself right before returning, because
+-- from the watchdog's point of view a fresh reload IS activity, full
+-- stop - it has no way to tell a genuinely-completed cycle apart from a
+-- discarded bogus one. At normal/fast-forward emulation speeds a single
+-- bogus-retry cycle (reload -> replay the NPC dialogue/trigger -> hit
+-- the exact same bad read again) can complete in well under a second, so
+-- a long, unbroken STREAK of them can run for minutes - hundreds of
+-- resets - without the clock-based watchdog ever accumulating 60 seconds
+-- of "silence" to notice. That's exactly the "hangs after ~270 resets,
+-- rapid savestate-reload spam" symptom reported for Shuckle: not frozen,
+-- just never making progress, which the time-based watchdog was never
+-- built to catch.
+--
+-- Because BizHawk is perfectly deterministic (see reroll_savestate_pool()'s
+-- own comment block above, written for the analogous "18 consecutive
+-- stuck-checks in a row" Suicune bug), a bogus reading that recurs many
+-- times in a row against the SAME saved baseline isn't bad luck
+-- repeating each time - it's the same broken baseline replaying the same
+-- broken outcome every time, which only a fresh reroll (not another
+-- reload of that same baseline) can ever actually escape. Shuckle's much
+-- longer per-attempt dialogue (SHUCKLE_HOLD_FRAMES=12 plus more
+-- DIALOGUE_MASH_CAP mash iterations) gives it far more exposure per
+-- attempt to whatever transient WRAM-read race triggers these bogus
+-- readings in the first place (see the comment above
+-- SHUCKLE_HOLD_FRAMES/the settle-frame fix), which is why this shows up
+-- as a Shuckle problem even though Eevee runs the exact same retry code -
+-- Eevee just rarely strings together enough consecutive bogus hits for
+-- it to matter.
+--
+-- This gives every "bogus reading" site its own count-based trip-wire,
+-- independent of how fast each individual retry completes.
+local BOGUS_RETRY_STREAK_THRESHOLD = 10
+local function record_bogus_retry(reason)
+    consecutiveBogusRetries = consecutiveBogusRetries + 1
+    if consecutiveBogusRetries >= BOGUS_RETRY_STREAK_THRESHOLD then
+        print(string.format(
+            "record_bogus_retry(): %d consecutive bogus readings in a row (%s) - too fast for the time-based watchdog to ever catch, but the same signature as a deterministically-broken baseline. Forcing a fresh reroll instead of reloading it again.",
+            consecutiveBogusRetries, reason))
+        send_alert(string.format(
+            "\xE2\x9A\xA0\xEF\xB8\x8F Likely stuck: %d consecutive bogus readings in a row (%s), reloading too fast for the time-based watchdog to notice. Forcing a fresh reroll.",
+            consecutiveBogusRetries, reason), COLOR_RED)
+        reroll_savestate_pool()
+        consecutiveBogusRetries = 0
+        consecutiveStuckReloads = 0
+    end
+end
+
+-- Called from every genuine "a real reading was obtained and a real
+-- decision was made" reset site (not shiny/caught/skipped-but-confirmed-
+-- real) - proves the current baseline CAN produce real data, so any
+-- bogus-reading streak counted so far is stale and shouldn't carry
+-- forward into unrelated future attempts.
+local function record_genuine_cycle()
+    consecutiveBogusRetries = 0
 end
 
 -- Shared entropy design for every "instant/no-dialogue trigger" battle-
@@ -2193,6 +2265,7 @@ function M.step()
             firstPressPending = true
             lastResetTime = os.time()
             consecutiveStuckReloads = 0
+            record_bogus_retry(string.format("gift-receive species mismatch, got %s expected %s", speciesName, expectedName))
             return false
         end
 
@@ -2210,7 +2283,17 @@ function M.step()
         -- RNG-enabler injections fired before this DV roll happened -
         -- needed to tell whether split COUNT or split RANGE is the real
         -- lever, instead of guessing.
-        print(string.format("%s (#%d) | Atk: %d Def: %d Spe: %d Spc: %d | Splits: %d", speciesName, newSpecies, atkv, defv, spdv, spcv, mashSplitsFired))
+        local encounterLine = string.format("%s (#%d) | Atk: %d Def: %d Spe: %d Spc: %d | Splits: %d", speciesName, newSpecies, atkv, defv, spdv, spcv, mashSplitsFired)
+        print(encounterLine)
+
+        -- See data/console_log.lua for the full rationale: BizHawk's own
+        -- Lua console has no cap on accumulated output and gets slower
+        -- to append to as its backlog grows, so we clear it ourselves
+        -- periodically instead of making users do it manually. The same
+        -- line is also written to a rotating on-disk log so clearing the
+        -- console never actually loses anything.
+        ConsoleLog.maybe_clear_console(resetCount)
+        ConsoleLog.log_encounter("static", encounterLine)
 
         Stats.record_encounter(newSpecies)
         Gui.update_last_encounter(hud, resetCount, newSpecies, speciesName, atkv, defv, spdv, spcv, isShiny, "(no item)")
@@ -2275,6 +2358,7 @@ function M.step()
             -- actually talking to the NPC).
             lastResetTime = os.time()
             consecutiveStuckReloads = 0
+            record_genuine_cycle()
             return false
         end
     end
@@ -2338,6 +2422,7 @@ function M.step()
                 firstPressPending = true
                 lastResetTime = os.time()
                 consecutiveStuckReloads = 0
+                record_bogus_retry(string.format("open-world battle menu never loaded for %s", get_pokemon_name(species)))
                 return false
             end
 
@@ -2511,6 +2596,7 @@ function M.step()
                 firstPressPending = true
                 lastResetTime = os.time()
                 consecutiveStuckReloads = 0
+                record_bogus_retry(string.format("open-world bogus battle reading (%s)", get_pokemon_name(species)))
                 return false
             end
         end
@@ -2524,6 +2610,12 @@ function M.step()
         local spdv = math.floor(spespc / 16)
         local spcv = spespc % 16
         local isShiny = (shinyvalue == 1)
+
+        -- See data/console_log.lua - shared resetCount, same periodic
+        -- clear as the gift-Pokemon reset path above. This path doesn't
+        -- print an unconditional per-reset line the way that one does,
+        -- so there's nothing to mirror into the rotating log here.
+        ConsoleLog.maybe_clear_console(resetCount)
 
         Stats.record_encounter(species)
         Gui.update_last_encounter(hud, resetCount, species, speciesName, atkv, defv, spdv, spcv, isShiny, itemName)
@@ -2563,6 +2655,7 @@ function M.step()
                 firstPressPending = true
                 lastResetTime = os.time()
                 consecutiveStuckReloads = 0
+                record_genuine_cycle()
             end
 
             if Gui.auto_catch_enabled(hud) then
@@ -2660,6 +2753,7 @@ function M.step()
                     firstPressPending = true
                     lastResetTime = os.time()
                     consecutiveStuckReloads = 0
+                    record_genuine_cycle()
                     return false
                 else -- "stop"
                     Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
@@ -2677,6 +2771,7 @@ function M.step()
             firstPressPending = true
             lastResetTime = os.time()
             consecutiveStuckReloads = 0
+            record_genuine_cycle()
             return false
         end
     end

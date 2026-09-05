@@ -35,6 +35,7 @@ PokemonNames = require("data.pokemon_names")
 Stats = require("data.stats")
 RngEnabler = require("data.rng_enabler")
 SavestateBackup = require("data.savestate_backup")
+ConsoleLog = require("data.console_log")
 
 -- Full 388-entry (map group, map number) -> name table, shared with
 -- every other module - see data/location_names.lua for where this
@@ -167,11 +168,30 @@ end
 local SAVESTATE_SLOT
 
 local party_base_addr
+local wScriptRunningAddr -- non-zero while any overworld script (dialogue/call/fade/cutscene) is running - see the root-cause comment in M.step() for why this module needs it too
 local partysizeBeforeReceiving
 local newSlotIndex
 local newDvAddr, newSpeciesAddr
 
 local resetCount = 0
+
+-- Locked in from the FIRST valid-looking read of a run and never
+-- changed again after that - see the big root-cause comment in M.step()
+-- for why this exists. The prize species can never actually change
+-- mid-run (it was fixed the moment the savestate was taken at the prize
+-- menu), so once we know it, any later read that disagrees is
+-- definitely a corrupted/mid-animation read, not a real different
+-- Pokemon - same "expected species" sanity-check pattern static.lua
+-- already uses (BATTLE_TARGET_EXPECTED_SPECIES) for this exact class of
+-- garbage-read problem. Reset to nil on every fresh Start click.
+local expectedSpecies = nil
+
+-- Gen II's internal species index range - anything outside this is
+-- never a real Pokemon (0 = empty slot placeholder, 255/0xFF = the
+-- "Unknown #255" garbage byte this whole fix exists because of).
+local function is_plausible_species(s)
+    return s >= 1 and s <= 251
+end
 
 -- Every split point happens during the mash-A phase - there's no
 -- separate "received but not yet read" window like egg.lua has, since
@@ -201,6 +221,47 @@ local function press_button(btn)
     emu.frameadvance()
 end
 
+-- Bounded generous timeout (frames) for wait_for_no_active_script() below
+-- - matches the other modules' REROLL_SCRIPT_CLEAR_TIMEOUT ballpark. The
+-- Pokedex-registration fade this exists to wait out (see M.step()'s
+-- read-logic comment) is a real multi-stage animation, comfortably
+-- longer than the old flat 30-frame settle cap this replaces.
+local SCRIPT_CLEAR_TIMEOUT = 300
+
+-- Presses ONLY B and waits until wScriptRunningAddr reads 0 (or the
+-- bounded timeout is hit) - a real confirmation that no dialogue/fade/
+-- cutscene is still mid-flight, not a guess. No-op if nothing is open
+-- (the common case for every prize EXCEPT a not-yet-Pokedex'd one - see
+-- M.step()).
+--
+-- UPDATE - originally alternated B/A like the identical helper in
+-- static.lua/egg.lua/starters.lua's reroll_savestate_pool() paths, on the
+-- theory that some prompts need a real A. That fixed the nickname prompt
+-- for ordinary resets, but a real user report showed a SHINY catch still
+-- got named "AAAAAAAAAAAA" - the "Would you like to give a nickname?"
+-- yesorno prompt lands on whichever frame it lands on, and alternating
+-- B/A means whether that happens to be a B (declines - correct) or an A
+-- (confirms YES, then starts filling the name grid with A's) depends
+-- purely on parity/timing that can differ run to run - it isn't actually
+-- watching for the prompt, just guessing blind. B alone sidesteps that
+-- entirely: B answers any yesorno with No, and B also clears a plain
+-- waitbutton textbox just fine in Gen II (doesn't need to be A) - so
+-- there's no upside to ever risking an A here, only downside.
+local function wait_for_no_active_script()
+    if not wScriptRunningAddr then return end
+    local waited = 0
+    while memory.readbyte(wScriptRunningAddr) ~= 0 and waited < SCRIPT_CLEAR_TIMEOUT do
+        press_button("B")
+        waited = waited + 1
+    end
+    if waited > 0 then
+        vprint(string.format(
+            "Game Corner: wScriptRunning was active after the party-size increase (Pokedex-registration fade for a first-time prize, most likely) - %s after %d frame(s).",
+            (memory.readbyte(wScriptRunningAddr) == 0) and "cleared it" or "gave up waiting for it to clear",
+            waited))
+    end
+end
+
 -- ===== M.init: runs ONCE =====
 local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
@@ -223,10 +284,19 @@ function M.init(sharedForm, yOffset, existingHud)
     if version == 0x54 then
         if region == 0x4A then party_base_addr = 0xDC9D
         else party_base_addr = 0xDCD7 end
+        -- Verified against pokecrystal.sym: wScriptRunning ($D438). Same
+        -- address static.lua/egg.lua/starters.lua already rely on for
+        -- this same "is any overworld script/dialogue/fade still in
+        -- progress" purpose - see wait_for_no_active_script() below for
+        -- why this module needs it too now.
+        wScriptRunningAddr = 0xD438
     elseif version == 0x55 or version == 0x58 then
         if region == 0x4A then party_base_addr = 0xD9E8
         elseif region == 0x4B then party_base_addr = 0xDB1F
         else party_base_addr = 0xDA22 end
+        -- Verified against pokegold1.sym: wScriptRunning ($D15F, plain
+        -- SVBK-switched WRAM view). Same address static.lua uses.
+        wScriptRunningAddr = 0xD15F
     else
         print("No valid ROM detected")
         return false
@@ -270,6 +340,7 @@ function M.on_resume()
     mashSplitsFired = 0
     lastResetTime = os.time()
     consecutiveStuckReloads = 0
+    expectedSpecies = nil
 end
 
 -- If 60 seconds pass without reaching a shiny/not-shiny decision (e.g.
@@ -342,30 +413,70 @@ function M.step()
     -- Party size increased - the Pokemon is in, read its DVs directly.
     resetCount = resetCount + 1
 
-    -- Same settle-frame race already found and fixed for the other
-    -- gift-receive paths (see rng_mechanics.md's "Reload-spam bug,
-    -- actual root cause found" - Static, and Egg after a confirmed user
-    -- report): the game writes a template/placeholder value to the new
-    -- slot first, before a later step overwrites it with the real
-    -- species/DVs. This file didn't even have a fixed settle wait before
-    -- reading, let alone a stability check - reading the SAME tick the
-    -- party-size increase is first observed is the most exposed version
-    -- of this race in the whole project. Wait for species+DVs to read
-    -- identically on two consecutive frames before trusting any of it,
-    -- same fix as Static/Starters/Egg.
+    -- REAL ROOT CAUSE of the "works fine at Goldenrod, gives garbage
+    -- species/false shinies at Celadon (Kanto)" reports - confirmed
+    -- against the actual pokecrystal disassembly, NOT a Johto/Kanto
+    -- address difference (wPartyMon1 lives in a WRAM bank that's fixed
+    -- for the whole ROM - SVBK bank 1 - identical in both cities, so no
+    -- per-region profile/dropdown is needed here):
+    --
+    -- maps/CeladonGameCornerPrizeRoom.asm's prize vendor calls the same
+    -- shared std script as Goldenrod's (checkcoins -> yesorno -> special
+    -- GameCornerPrizeMonCheckDex -> givepoke -> takecoins) - but
+    -- GameCornerPrizeMonCheckDex (engine/events/specials.asm) only
+    -- `ret nz`s immediately if the species is ALREADY registered in your
+    -- Pokedex. If it isn't, it runs a real FadeToMenu + farcall
+    -- NewPokedexEntry + ExitAllMenus sequence - a genuine screen-fade/
+    -- Pokedex-registration animation - BEFORE givepoke ever places the
+    -- Pokemon in the party. Since this savestate reloads to a point
+    -- BEFORE that registration, every single reset re-triggers the full
+    -- animation for a not-yet-caught species. Goldenrod's classic prize
+    -- mons are almost always already dex'd long before anyone resets for
+    -- them, so this path silently never fired there - it took a
+    -- genuinely first-time Kanto Pikachu to expose it. That fade can
+    -- easily outlast the old flat 30-frame settle cap below, so species/
+    -- DV bytes were being trusted mid-animation - explains both the
+    -- bogus "Unknown #255" reads and the false shinies (a mid-fade byte
+    -- can coincidentally match the shiny bit pattern). Once this exact
+    -- Pikachu (or whatever species) has actually been caught once for
+    -- real, its dex entry sticks in your SAVE file going forward and this
+    -- extra animation stops firing entirely - same as it already doesn't
+    -- for Goldenrod's prizes.
+    --
+    -- Fix: wait for wScriptRunningAddr to genuinely clear (mashing A to
+    -- help it along) before trusting anything, same pattern already
+    -- proven for reroll safety elsewhere in this project - a real
+    -- "is the game actually done" check instead of a guessed frame count.
+    wait_for_no_active_script()
+
+    -- Belt-and-suspenders on top of the above: still confirm species+DVs
+    -- read identically on two consecutive frames before trusting any of
+    -- it (the original fix for the separate, smaller template/placeholder
+    -- settle race already found and fixed for the other gift-receive
+    -- paths - Static/Starters/Egg). Also now treats an IMPLAUSIBLE
+    -- species (0, 255, anything outside Gen II's real 1-251 range) or a
+    -- mismatch against expectedSpecies as "not stable yet" too, not just
+    -- "changed since last frame" - wScriptRunningAddr can apparently
+    -- still read 0 for a stray frame or two mid-animation (multi-stage
+    -- sequences like this fade sometimes do), so wait_for_no_active_
+    -- script() alone wasn't airtight against every timing case reported.
+    -- Bumped the cap from 30 to 120 frames to match.
     local species = memory.readbyte(newSpeciesAddr)
     local atkdef = memory.readbyte(newDvAddr)
     local spespc = memory.readbyte(newDvAddr + 1)
+    local SETTLE_TIMEOUT = 120
     do
         local stableFrames = 0
         local waited = 0
-        while stableFrames < 2 and waited < 30 do
+        while stableFrames < 2 and waited < SETTLE_TIMEOUT do
             emu.frameadvance()
             waited = waited + 1
             local curSpecies = memory.readbyte(newSpeciesAddr)
             local curAtkdef = memory.readbyte(newDvAddr)
             local curSpespc = memory.readbyte(newDvAddr + 1)
-            if curSpecies == species and curAtkdef == atkdef and curSpespc == spespc then
+            local curPlausible = is_plausible_species(curSpecies) and
+                (expectedSpecies == nil or curSpecies == expectedSpecies)
+            if curSpecies == species and curAtkdef == atkdef and curSpespc == spespc and curPlausible then
                 stableFrames = stableFrames + 1
             else
                 species = curSpecies
@@ -378,6 +489,31 @@ function M.step()
             print(string.format("Game Corner slot data wasn't immediately stable, waited %d frames before trusting it (species settled on #%d) - if a bogus instant-shiny recurs, this was it.", waited, species))
         end
     end
+
+    -- Final gate: never report/record a read that's still implausible or
+    -- disagrees with the species this run already locked in - the prize
+    -- species physically cannot change mid-run (fixed the moment the
+    -- savestate was taken), so a mismatch here is provably a corrupted
+    -- mid-animation read, not a real different Pokemon. Silently discard
+    -- this cycle (no Stats.record_encounter, no shiny report, no GUI
+    -- update) and reload, same as check_stuck_and_force_reset() does for
+    -- a genuinely stuck cycle - this is the actual backstop against
+    -- false shinies, not just a nicer wait.
+    if not is_plausible_species(species) or (expectedSpecies ~= nil and species ~= expectedSpecies) then
+        print(string.format(
+            "Game Corner: discarding a bad read (species #%d, expected %s) after %d settle frames - reloading without recording it.",
+            species, expectedSpecies and ("#" .. expectedSpecies) or "unknown yet", SETTLE_TIMEOUT))
+        resetCount = resetCount - 1
+        savestate.loadslot(SAVESTATE_SLOT)
+        mashSplitsFired = 0
+        lastResetTime = os.time()
+        consecutiveStuckReloads = 0
+        return false
+    end
+    if expectedSpecies == nil then
+        expectedSpecies = species
+    end
+
     local speciesName = get_pokemon_name(species)
     local atkv = math.floor(atkdef / 16)
     local defv = atkdef % 16
@@ -385,7 +521,17 @@ function M.step()
     local spcv = spespc % 16
     local isShiny = shiny(atkdef, spespc)
 
-    print(string.format("%s (#%d) | Atk: %d Def: %d Spe: %d Spc: %d", speciesName, species, atkv, defv, spdv, spcv))
+    local encounterLine = string.format("%s (#%d) | Atk: %d Def: %d Spe: %d Spc: %d", speciesName, species, atkv, defv, spdv, spcv)
+    print(encounterLine)
+
+    -- See data/console_log.lua for the full rationale: BizHawk's own
+    -- Lua console has no cap on accumulated output and gets slower to
+    -- append to as its backlog grows, so we clear it ourselves
+    -- periodically instead of making users do it manually. The same
+    -- line is also written to a rotating on-disk log so clearing the
+    -- console never actually loses anything.
+    ConsoleLog.maybe_clear_console(resetCount)
+    ConsoleLog.log_encounter("gamecorner", encounterLine)
 
     Stats.record_encounter(species)
     Gui.update_last_encounter(hud, resetCount, species, speciesName, atkv, defv, spdv, spcv, isShiny, "(no item)")

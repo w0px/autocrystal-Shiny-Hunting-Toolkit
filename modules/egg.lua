@@ -35,6 +35,7 @@ PokemonNames = require("data.pokemon_names")
 Stats = require("data.stats")
 RngEnabler = require("data.rng_enabler")
 SavestateBackup = require("data.savestate_backup")
+ConsoleLog = require("data.console_log")
 
 -- Full 388-entry (map group, map number) -> name table, shared with
 -- wild.lua/fishing.lua/headbutt.lua/friendship.lua/static.lua/
@@ -803,6 +804,7 @@ function M.step()
 
         resetCount = resetCount + 1
 
+        local encounterLine
         if eggSource == "Odd Egg" then
             -- Diagnostic fields on top of the normal line while chasing a
             -- confirmed bogus-shiny report - species is supposed to be a
@@ -811,14 +813,25 @@ function M.step()
             -- a real, freshly-written party slot at all, which would
             -- point at a wrong address/timing bug well upstream of the
             -- settle-frame check above rather than a race within it.
-            print(string.format("#%d | win:%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s | species=$%02X(expect $FD) partySize=%d(was %d) slot=%d dvAddr=$%04X",
+            encounterLine = string.format("#%d | win:%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s | species=$%02X(expect $FD) partySize=%d(was %d) slot=%d dvAddr=$%04X",
                 resetCount, rerollWindow, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or "",
-                species, currentPartySize, partysizeBeforeReceiving, eggSlotIndex, eggDvAddr))
+                species, currentPartySize, partysizeBeforeReceiving, eggSlotIndex, eggDvAddr)
         else
             -- Original Togepi print line, unchanged.
-            print(string.format("#%d | win:%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s",
-                resetCount, rerollWindow, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or ""))
+            encounterLine = string.format("#%d | win:%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s",
+                resetCount, rerollWindow, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or "")
         end
+        print(encounterLine)
+
+        -- See data/console_log.lua for the full rationale: BizHawk's own
+        -- Lua console has no cap on accumulated output and gets slower
+        -- to append to as its backlog grows, so we clear it ourselves
+        -- periodically instead of making users do it manually. The same
+        -- line is also written to a rotating on-disk log so clearing the
+        -- console never actually loses anything.
+        ConsoleLog.maybe_clear_console(resetCount)
+        ConsoleLog.log_encounter("egg", encounterLine)
+
         Stats.record_encounter()
         Gui.update_last_encounter(hud, resetCount, species, "Egg", atkv, defv, spdv, spcv, isShiny, nil)
 

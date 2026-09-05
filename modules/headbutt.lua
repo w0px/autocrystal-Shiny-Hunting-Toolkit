@@ -31,6 +31,7 @@ ItemNames = require("data.item_names")
 Stats = require("data.stats")
 LevelUpMoves = require("data.level_up_moves")
 RngEnabler = require("data.rng_enabler")
+ConsoleLog = require("data.console_log")
 
 local hud
 
@@ -1643,10 +1644,20 @@ local function register_hooks()
 
         local speciesName = get_pokemon_name(species)
         local itemName = get_item_name(item)
-        print(string.format("%s (#%d) | Atk: %d Def: %d Spe: %d Spc: %d | Item: %s",
-            speciesName, species, math.floor(atkdef/16), atkdef%16, math.floor(spespc/16), spespc%16, itemName))
+        local encounterLine = string.format("%s (#%d) | Atk: %d Def: %d Spe: %d Spc: %d | Item: %s",
+            speciesName, species, math.floor(atkdef/16), atkdef%16, math.floor(spespc/16), spespc%16, itemName)
+        print(encounterLine)
 
         sessionEncounterCount = sessionEncounterCount + 1
+
+        -- See data/console_log.lua for the full rationale: BizHawk's own
+        -- Lua console has no cap on accumulated output and gets slower
+        -- to append to as its backlog grows, so we clear it ourselves
+        -- periodically instead of making users do it manually. The same
+        -- line is also written to a rotating on-disk log so clearing the
+        -- console never actually loses anything.
+        ConsoleLog.maybe_clear_console(sessionEncounterCount)
+        ConsoleLog.log_encounter("headbutt", encounterLine)
 
         -- Stats bookkeeping (record_encounter / record_shiny) happens
         -- HERE, synchronously, instead of being deferred to M.step() via
