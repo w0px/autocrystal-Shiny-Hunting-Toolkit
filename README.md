@@ -166,6 +166,15 @@ Automatically Handles Phone Calls and Other Interruptions (e.g. Egg Hatching)
 
 <img width="800" height="506" alt="fd2bc9aa5d130eeae9db2edcb0025bf5-ezgif com-video-to-gif-converter" src="https://github.com/user-attachments/assets/7eb87d91-bb47-4782-bc4b-83257861b5a7" />
 
+### Thief Mode
+
+- the bot will utilize the attack "Thief" to steal held items from wild Pokemon.
+- primarily used for Money farming
+- Thief Pokemon needs to be in Slot 1, no held item and Thief needs to be attack slot 1
+
+<img width="366" height="156" alt="image" src="https://github.com/user-attachments/assets/e94c344e-872e-4ac9-a077-059be19f11e2" />
+
+
 ### Verbose Logging
 
 Displays every action performed by the bot in the console. Primarily intended for debugging and troubleshooting.
