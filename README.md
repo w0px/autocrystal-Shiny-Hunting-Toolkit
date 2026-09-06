@@ -153,12 +153,14 @@ Automatically Handles Phone Calls and Other Interruptions (e.g. Egg Hatching)
 - **Held Item (Any or Specific)** – Stops when a Pokémon holding any or a specified item is encountered, if a specific item is in the Allowlist the bot will only stop if that item is encountered
 - **Shiny Pokémon** – Always stops upon encountering a shiny Pokémon
 
-### Kill Mode
+### Kill Mode (experimental)
 
-- Automatically battles non-shiny Pokémon using the first move
+- Automatically battles non-shiny Pokémon using the attack slot 1 move
+- once the first move is depleted the bot will use the move in attack slot 2
 - Species Allowlist to avoid unfavorable matchups, the bot will only battle the Pokemon in the Allowlist (ID or Name)
-- Automatically flees when all PP for the selected move is depleted or active Pokémon HP is < 20%
+- Automatically flees when all PP for the selected moves is depleted or active Pokémon HP is < 20%
 - Pauses Auto-leveling when a Pokémon attempts to learn a new move (unless an empty move slot is available)
+- Status conditions or move-learn hiccups can occasionally cause an existing move to get overwritten unexpectedly. To guard against this, Kill mode saves a safety savestate (kill_mode_safety.State) to the modules/data folder the moment it's checked, and refreshes a rolling backup (kill_mode_autosave.State) in the same folder every 5 minutes while it stays on — so    you can always load one back to a recent, safe point if something goes wrong.
 
 <img width="800" height="486" alt="2cd5b3901b2209c85db0407c3c6df5ae-ezgif com-video-to-gif-converter" src="https://github.com/user-attachments/assets/138b7d12-612b-4572-a941-e44c0ccc7467" />
 
