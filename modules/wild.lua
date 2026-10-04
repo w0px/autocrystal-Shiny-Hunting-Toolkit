@@ -258,6 +258,10 @@ end
 local COLOR_GOLD = 16766720
 local COLOR_GREEN = 3066993
 local COLOR_RED = 15158332
+-- Neutral "heads up, nothing's wrong" tone - used only for the one-time
+-- Thief-PP-depleted notice below, so it doesn't read as an error (RED)
+-- or get visually confused with a shiny-related notice (GOLD).
+local COLOR_BLUE = 3447003
 
 -- Same idea as shiny_sprite_url, but the regular (non-shiny) sprite -
 -- used for auto-catch notifications about a held-item match that isn't
@@ -414,6 +418,107 @@ local pendingShinySpriteUrl = nil
 -- it to settle ONCE, on the actual first turn, not on every turn of an
 -- ongoing multi-turn battle (where PP is already accurate from the start).
 local pendingBattleSettle = false
+-- Thief mode (see chkThiefMode/txtThiefFilter in gui_module.lua, wild.lua
+-- only): only ever attempt one Thief steal per battle, then always fall
+-- through to the normal flee behavior regardless of the outcome. Without
+-- this latch, the per-tick decision block below (which re-runs every
+-- M.step() call for as long as the battle is still going) would try to
+-- use Thief again on every subsequent turn instead of just fleeing after
+-- the first attempt - the same "once per battle, not once per tick"
+-- problem pendingBattleSettle above already had to solve. Reset to false
+-- alongside pendingBattleSettle in the EnemyWildmonInitialized hook,
+-- since both are scoped to exactly one battle.
+local thiefUsedThisBattle = false
+-- Session-scoped and NEVER reset once set - fires the "Thief is out of
+-- PP" notice the first time PP hits 0 and never again for the rest of
+-- the session, even if PP is later restored (Elixir/PP Up/etc) and then
+-- depletes a second time.
+--
+-- A real per-refill re-arm was attempted here twice (clearing this back
+-- to false once a later battle's PP read looked nonzero again, with a
+-- debounce first 60 frames, then a second debounce on the re-arm read
+-- itself) - both attempts still caused this same notice to spam
+-- repeatedly, minutes apart, all session, with PP never actually having
+-- been restored. That means FIRST_MOVE_PP_ADDR can apparently read
+-- nonzero for well over 60 straight frames without PP really being
+-- refilled, at least in whatever state this was - not just the
+-- single-frame flicker every other debounce in this file was sized for.
+-- Reverted back to the simple one-time-ever version (the last
+-- known-stable behavior) rather than guess at a third, longer debounce
+-- with no real diagnostic data to size it against.
+local thiefPpDepletedNotified = false
+-- Reset per-battle (alongside thiefUsedThisBattle, same hook) so the PP
+-- check below runs exactly ONCE per genuine new battle. Without this,
+-- the notification check re-ran on every M.step() tick for as long as
+-- species_addr stayed nonzero - including the well-documented tail
+-- window where species_addr flickers nonzero for up to 90+ frames AFTER
+-- a battle has actually ended (see the shinyvalue/atkdef/spespc reset
+-- comments further down). During that trailing window the battle-mon
+-- WRAM struct FIRST_MOVE_PP_ADDR lives in is no longer valid battle
+-- data, so thiefHasPP read as false on essentially every single battle's
+-- tail end regardless of the real, current PP - this is the root cause
+-- of the "out of PP" notice firing every battle even with full PP.
+-- Latching the check to the battle's own properly-settled first tick
+-- (right alongside pendingBattleSettle) avoids ever evaluating it during
+-- that stale tail window.
+local thiefPpCheckedThisBattle = false
+-- Session-scoped and NEVER reset once set - same one-time-ever pattern
+-- as thiefPpDepletedNotified above, per user request ("send a
+-- notification once"). Fires the "Thief mode: HP too low" notice the
+-- first time Thief would otherwise have a real steal available but HP
+-- is below THIEF_LOW_HP_THRESHOLD, and never again for the rest of the
+-- session even if HP recovers and later dips again.
+local thiefLowHpNotified = false
+-- Reset per-battle (alongside thiefUsedThisBattle/thiefPpCheckedThisBattle,
+-- same hook) so this evaluates at most ONCE per genuine new battle - same
+-- reasoning as thiefPpCheckedThisBattle's own comment above (avoids ever
+-- evaluating during the stale post-battle tail window).
+local thiefLowHpCheckedThisBattle = false
+
+-- ===== Kill mode safety savestates =====
+-- User-requested after a real report that Kill mode can occasionally hit
+-- a "hiccup" around a level-up/move-learn prompt and end up overwriting
+-- an existing move unexpectedly - these give the user somewhere safe to
+-- reload back to if that ever happens, without having to lose the whole
+-- session's progress.
+--
+-- Written as NAMED FILES via savestate.save(path, true) - the same
+-- mechanism SavestateBackup (data/savestate_backup.lua) already uses for
+-- Static/Starters/Egg/Game Corner's own backup files - rather than
+-- numbered savestate.saveslot() slots. A user report pointed out slots
+-- require knowing/selecting a specific slot number through BizHawk's own
+-- Save/Load State UI, which is far less discoverable than a plainly-
+-- named file sitting right in the same modules/data folder the other
+-- backups already land in - the user can just browse there and load it.
+-- This also sidesteps any slot-collision risk entirely (no shared
+-- numbered slot to clobber someone's own manual save), so unlike the
+-- Static/Starters/Egg/Game Corner reset-target slot, this doesn't need
+-- to go through SavestateBackup's backup-the-prior-contents dance at
+-- all - the filenames below are exclusively ours.
+--
+-- Both are FIXED filenames, overwritten every time (not timestamped per
+-- occurrence) - deliberately, so there's always exactly one obvious file
+-- to reload for each ("the safety save" / "the latest autosave") instead
+-- of an ever-growing pile the user has to sort through by date.
+--
+-- Gated on Kill mode specifically being checked (Gui.kill_non_shiny) -
+-- NOT on this module simply being active/running - per explicit
+-- request: switching to wild.lua at all should never trigger this on
+-- its own, only actually turning Kill mode on should.
+local KILL_MODE_SAFETY_SAVE_PATH = script_dir .. "data/kill_mode_safety.State"
+local KILL_MODE_AUTOSAVE_PATH = script_dir .. "data/kill_mode_autosave.State"
+local KILL_MODE_AUTOSAVE_INTERVAL_SECONDS = 5 * 60
+-- Reset to false in M.on_resume() (every Start click) - not just once
+-- ever - so a fresh "right before this run" safety savestate gets taken
+-- every time Kill mode is (re)started, whether the checkbox was just
+-- ticked or was already checked from an earlier run this session. Also
+-- doubles as the actual OFF->ON edge detector for mid-run checkbox
+-- toggles, since Gui.kill_non_shiny() itself has no such tracking.
+local killModeWasEnabled = false
+-- Wall-clock deadline (os.time()) for the next periodic autosave - nil
+-- while Kill mode is off (no autosave should be running at all then).
+local killModeAutosaveNextTime = nil
+
 local stopRequested = false
 local stopReason = ""
 -- Set true only by the ROM hook (a real, one-time confirmation that an
@@ -563,6 +668,16 @@ local OWN_MAX_HP_ADDR
 -- a safety margin above the game's own "red bar" threshold, so there's
 -- room to actually flee before a possible next hit could faint us.
 local LOW_HP_FLEE_THRESHOLD = 0.25
+-- User-requested, Thief-specific HP floor - deliberately separate from
+-- (and lower than) LOW_HP_FLEE_THRESHOLD above. Thief only ever risks
+-- ONE attack before fleeing regardless of outcome (steal or miss) - it
+-- never sustains multi-turn attacking the way Kill mode does - so it can
+-- safely tolerate a slightly thinner margin than Kill mode's own 25%
+-- without meaningfully increasing faint risk. Below this, Thief is
+-- skipped entirely for the battle (falls straight through to a normal
+-- flee) and the user gets a one-time notice - see thiefLowHpNotified's
+-- own comment.
+local THIEF_LOW_HP_THRESHOLD = 0.20
 
 local dv_flag_addr, species_addr, item_addr, enemy_hp_addr, enemy_max_hp_addr
 
@@ -587,6 +702,16 @@ local function has_safe_hp()
     local maxHP = memory.read_u16_be(OWN_MAX_HP_ADDR)
     if maxHP == 0 then return true end -- avoid divide-by-zero if read too early
     return (currentHP / maxHP) > LOW_HP_FLEE_THRESHOLD
+end
+
+-- Same read, different (lower) threshold - see THIEF_LOW_HP_THRESHOLD's
+-- own comment for why Thief gets its own, separate HP floor instead of
+-- reusing has_safe_hp()/LOW_HP_FLEE_THRESHOLD directly.
+local function thief_has_safe_hp()
+    local currentHP = memory.read_u16_be(OWN_HP_ADDR)
+    local maxHP = memory.read_u16_be(OWN_MAX_HP_ADDR)
+    if maxHP == 0 then return true end
+    return (currentHP / maxHP) > THIEF_LOW_HP_THRESHOLD
 end
 
 local function press_button(btn)
@@ -990,6 +1115,20 @@ local PACK_CURSOR = {y = 2, x = 1}
 -- is a single-column list of 4 moves (unlike the 2x2 top-level menu),
 -- so the second move is one row DOWN, not one column to the right.
 local MOVE2_CURSOR = {y = 2, x = 1}
+-- First move slot on the move-select submenu (same numeric coordinate as
+-- FIGHT_CURSOR, but a completely different screen - the submenu is its
+-- own single-column list, unrelated to the top-level menu's 2x2 grid).
+-- Added because do_thief_turn used to ASSUME move 1 was always already
+-- highlighted when this submenu opens and skip navigating entirely -
+-- confirmed via a real user report that this assumption doesn't always
+-- hold (the submenu's cursor doesn't necessarily reset to move 1 between
+-- turns/battles the way a fresh top-level battle menu resets to FIGHT),
+-- so Thief could silently end up confirming whatever move was left
+-- highlighted from an earlier turn instead of Thief itself - explaining
+-- both "Thief never seems to actually fire" and "the item is never
+-- stolen" at once, with no error, since a genuine non-Thief move was
+-- still being used successfully every time.
+local MOVE1_CURSOR = {y = 1, x = 1}
 
 -- Tracks consecutive failures to confirm the cursor reached
 -- MOVE2_CURSOR (shared across do_catch_attack_turn/do_kill_turn, since
@@ -1033,6 +1172,36 @@ local function get_active_mon_move_count()
         end
     end
     return count
+end
+
+-- Held item byte for the LEAD Pokemon specifically (party slot 1) - NOT
+-- to be confused with get_active_mon_*() above, which always track
+-- whichever party slot is CURRENTLY BATTLING (via curPartyMonAddr). The
+-- startup held-item check below always means "party slot 1" regardless
+-- of battle state, so this hardcodes slot index 0 rather than reading
+-- curPartyMonAddr.
+--
+-- Offset derivation: there's no ROM hook/symbol lookup available for
+-- this at hunt-start (we're not in battle), so this is cross-checked
+-- against two offsets this file ALREADY trusts and uses in production,
+-- both independently confirmed above against pokecrystal.sym/
+-- pokegold.sym:
+--   - get_active_mon_move_count() reads Moves at party_base_addr +
+--     0x0A + slotIndex*0x30 (verified via wPartyMon1Moves).
+--   - get_active_mon_level() reads Level at party_base_addr + 0x27 +
+--     slotIndex*0x30.
+-- The standard Gen 1/2 party mon struct (confirmed via pokecrystal's
+-- own constants/pokemon_data_constants.asm) orders fields as:
+-- Species(+0), Item(+1), Moves(+2..+5), ..., Level(+31 = 0x1F). So each
+-- mon's struct must start at party_base_addr + 0x08 - that's the only
+-- value consistent with BOTH already-trusted offsets at once (0x08 + 2
+-- = 0x0A matches Moves; 0x08 + 0x1F = 0x27 matches Level). Item is
+-- struct offset +1, so for the lead (slot index 0):
+--   party_base_addr + 0x08 + 1 = party_base_addr + 0x09
+local LEAD_HELD_ITEM_ADDR_OFFSET = 0x09
+
+local function get_lead_held_item()
+    return memory.readbyte(party_base_addr + LEAD_HELD_ITEM_ADDR_OFFSET)
 end
 
 -- Checks whether the species learns a move at ANY level in
@@ -1463,6 +1632,891 @@ local function do_catch_attack_turn()
     return "ok"
 end
 
+-- ===== Thief mode =====
+-- Uses whatever's in move slot 1 exactly once (see chkThiefMode in
+-- gui_module.lua) - the caller below already confirmed
+-- FIRST_MOVE_PP_ADDR > 0 before calling this, and that move is assumed
+-- to be Thief, per the whole premise of this feature: the user's lead
+-- Pokemon has Thief taught in slot 1 themselves. This does NOT verify
+-- the move actually IS Thief - there's no reliable memory address for
+-- "move ID in slot 1" worth adding just to double-check something the
+-- user already set up, and using whatever's genuinely there behaves
+-- correctly either way (steals successfully if it's Thief, just acts as
+-- a normal attack + a wasted PP if it isn't).
+--
+-- Deliberately does NOT fall back to move 2 the way do_catch_attack_turn/
+-- do_kill_turn do when move 1 is out of PP - a random second move
+-- stealing nothing defeats the entire point of "steal held items", so
+-- running out of Thief PP should mean "don't attack at all this battle"
+-- (handled by the caller checking PP before ever calling this), not
+-- "attack with whatever's left instead."
+--
+-- Same known limitation as do_catch_attack_turn (see its own comment):
+-- neither species_addr nor enemy_hp_addr is trustworthy enough right
+-- after an attack to positively detect a faint, so this doesn't try to.
+-- Thief is weak enough that fainting the wild Pokemon outright is rare,
+-- but not impossible against a very low-level/low-HP encounter - if it
+-- happens, the battle ends and have_battle_controls never returns true,
+-- which reads identically to "stuck" below and stops the bot for you to
+-- clear manually, exactly like do_catch_attack_turn's own unhandled-
+-- faint case already does. Not treated as a bug to fix here - it's the
+-- same accepted tradeoff already shipped for that function.
+--
+-- Returns "ok" (attack went through - caller checks the enemy's item
+-- afterward to see if the steal actually landed) or "stuck" (navigation
+-- failed, or the post-attack wait timed out).
+local function do_thief_turn()
+    -- CONFIRMED via a real user report + the diagnostic below: Thief can
+    -- be the very FIRST attack attempted in a battle (unlike kill mode,
+    -- which only ever runs after the caller's own earlier wait already
+    -- succeeded in a previously-observed-working case) - and the
+    -- caller's own "wait for the battle menu to load" loop (300 frames /
+    -- 5 seconds, mashing B) is not always long enough before we get
+    -- here, confirmed specifically on a fishing encounter (the rod-cast
+    -- / "Oh! A bite!" intro runs longer than a standard grass encounter
+    -- does). When that happens, have_battle_controls is STILL false the
+    -- instant this function starts - and the `while have_battle_controls
+    -- do` navigation loop further below is a Lua while-loop, which checks
+    -- its condition BEFORE the first iteration: if it's already false,
+    -- the loop body never runs even once, so it never reaches the
+    -- FIGHT_CURSOR match OR the 12-attempt "stuck" cap - it just silently
+    -- falls through to the move-select wait and a blind "confirm"
+    -- button-press further down, having never actually opened FIGHT or
+    -- selected anything, then still reports back "ok". That's exactly
+    -- what a real user's log showed: "have_battle_controls=false, cursor
+    -- Y=0 X=0" and "FIGHT navigation loop exited after 0 attempt(s)",
+    -- with the real "Battle menu loaded" hook only firing AFTER this
+    -- function had already returned.
+    --
+    -- Fix: actively wait for have_battle_controls to become true here,
+    -- the same way the caller's own initial wait loop does, instead of
+    -- assuming it already is. This makes Thief self-sufficient
+    -- regardless of how long any particular encounter's intro runs, and
+    -- doesn't touch/risk do_kill_turn's or do_catch_attack_turn's own
+    -- already-battle-tested logic.
+    if not have_battle_controls then
+        -- Deliberately NOT gated on species_addr ~= 0 the way the
+        -- caller's own initial wait loop is (and the way this loop's
+        -- first draft also was). CONFIRMED via a real user report on a
+        -- second fishing encounter: species_addr can itself read 0 for
+        -- an instant during this exact window - "waited 0 frame(s)"
+        -- logged immediately, meaning the loop's condition was already
+        -- false on its very first check, which given have_battle_controls
+        -- was confirmed false means memory.readbyte(species_addr) ~= 0
+        -- must have been false too, i.e. species_addr read 0 despite a
+        -- battle genuinely being in progress (the encounter had already
+        -- printed correctly a moment earlier this same tick). This is
+        -- the same flicker already documented elsewhere in this file
+        -- (species_addr staying nonzero too long after a battle ends) -
+        -- here it's the opposite direction, reading 0 too early/briefly
+        -- during a real, ongoing battle. Relying on it to decide "give
+        -- up early" made the wait bail out instantly instead of actually
+        -- waiting. have_battle_controls plus a hard frame cap (below) is
+        -- sufficient on its own to bound this loop safely.
+        local preWaitFrames = 0
+        while not have_battle_controls and preWaitFrames < 600 do
+            if stop_was_requested() then
+                print("Thief mode: Stop requested - aborting.")
+                return "stuck"
+            end
+            emu.frameadvance()
+            press_button("B")
+            preWaitFrames = preWaitFrames + 1
+        end
+        vprint(string.format("Thief mode: waited %d frame(s) for the battle menu to load - have_battle_controls=%s",
+            preWaitFrames, tostring(have_battle_controls)))
+        if not have_battle_controls then
+            -- Deliberately "skipped", not "stuck" - the caller treats
+            -- "stuck" as "something needs your manual input, stop the
+            -- bot and alert" (a move-learn prompt, a possible faint).
+            -- This isn't that - the battle itself is presumably fine,
+            -- its menu is just still loading. Skipping this one Thief
+            -- attempt and falling straight through to the normal flee
+            -- is the same "go back to usual behavior" fallback already
+            -- used when Thief PP is depleted, not a real error.
+            print("Thief mode: battle menu never became interactive in time - skipping Thief this battle, falling back to normal behavior")
+            return "skipped"
+        end
+    end
+    local nav_attempts = 0
+    while have_battle_controls do
+        if stop_was_requested() then
+            print("Thief mode: Stop requested - aborting.")
+            return "stuck"
+        end
+        local cy = memory.readbyte(MENU_CURSOR_Y)
+        local cx = memory.readbyte(MENU_CURSOR_X)
+        if cy == FIGHT_CURSOR.y and cx == FIGHT_CURSOR.x then
+            moveSelectScreenOpen = false
+            press_button("A")
+            break
+        else
+            nav_attempts = nav_attempts + 1
+            if nav_attempts > 12 then
+                print("Thief mode: navigation to FIGHT stuck after 12 attempts")
+                return "stuck"
+            end
+            local next_input = navigate_to_menu_option(FIGHT_CURSOR)
+            press_and_wait_for_cursor_change(next_input, 30)
+        end
+    end
+    vprint(string.format("Thief mode: FIGHT navigation loop exited after %d attempt(s) - have_battle_controls=%s, cursor Y=%d X=%d",
+        nav_attempts, tostring(have_battle_controls), memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)))
+
+    -- Same settle wait as do_catch_attack_turn above - see its own
+    -- comment for the full rationale (hook-confirmed when
+    -- MoveSelectionAddr is available for this game version/region,
+    -- fixed-frame fallback otherwise).
+    if MoveSelectionAddr then
+        local moveSelectWaitFrames = 0
+        while not moveSelectScreenOpen and moveSelectWaitFrames < 90
+          and memory.readbyte(species_addr) ~= 0 do
+            emu.frameadvance()
+            moveSelectWaitFrames = moveSelectWaitFrames + 1
+        end
+        for i = 1, 15 do
+            emu.frameadvance()
+        end
+    else
+        for i = 1, 60 do
+            emu.frameadvance()
+        end
+    end
+
+    -- Explicitly confirm (and if needed, navigate to) move slot 1
+    -- instead of assuming it's already highlighted - see MOVE1_CURSOR's
+    -- own comment above for why the old blind "just press A" assumption
+    -- was the real bug: it could silently confirm whatever move was
+    -- already highlighted from an earlier turn, using a real move that
+    -- just isn't Thief, with no error and no visible sign anything was
+    -- wrong other than the item never actually getting stolen.
+    local move1_attempts = 0
+    while true do
+        if stop_was_requested() then
+            print("Thief mode: Stop requested - aborting.")
+            return "stuck"
+        end
+        local my = memory.readbyte(MENU_CURSOR_Y)
+        local mx = memory.readbyte(MENU_CURSOR_X)
+        if my == MOVE1_CURSOR.y and mx == MOVE1_CURSOR.x then
+            -- Defensive re-check, right before actually committing to
+            -- the attack (real user report): the caller decides whether
+            -- to use Thief at all this battle from a single PP read
+            -- taken once, at battle start - and that PP-depletion notice
+            -- block only ever double-checks/waits when that read looked
+            -- like 0 (to avoid a false "depleted" notification), never
+            -- when it looked nonzero. So a stale/misread "PP available"
+            -- at that one moment can still get all the way here even
+            -- though PP is actually already sitting at 0 - confirmed via
+            -- a real screenshot showing the in-game "There's no PP left
+            -- for this move!" refusal right after this exact press. That
+            -- refusal bounces back to this same move-select screen
+            -- (not the top-level battle menu), so the post-attack wait
+            -- loop below would just mash A into the same refusal forever
+            -- and time out as "stuck" - stopping the whole bot over
+            -- something that should have just skipped Thief and kept
+            -- hunting normally. Checking PP fresh right here, immediately
+            -- before pressing A, catches this regardless of why the
+            -- earlier read was wrong.
+            if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 then
+                print("Thief mode: move slot 1 is actually out of PP right now (caught right before attacking) - backing out without attacking so hunting can continue normally.")
+                -- Piggyback on the same one-time-ever notification the
+                -- earlier per-battle check normally sends - this path
+                -- only gets hit when THAT check was fooled by a stale
+                -- read, so without this, a session could hit real PP
+                -- depletion and never actually get told about it.
+                if not thiefPpDepletedNotified then
+                    thiefPpDepletedNotified = true
+                    send_alert("Thief mode: move slot 1 is out of PP - pausing Thief steals until you restore it (Elixir/PP Up/etc). Continuing to hunt normally in the meantime.", COLOR_BLUE)
+                end
+                press_button("B")
+                return "skipped"
+            end
+            vprint(string.format("Thief mode: confirmed cursor on move slot 1 after %d correction(s) - pressing A", move1_attempts))
+            -- Clear the ROM-hook-driven move-select-screen flag right
+            -- before committing to the attack, so the post-attack wait
+            -- loop below can tell the difference between "still waiting
+            -- for the attack to resolve" and "got bounced straight back
+            -- to this same move-select screen" - the hook
+            -- (MoveSelectionAddr, see its registration further down)
+            -- fires every single time the game's move-select routine is
+            -- entered, including every time a move gets REJECTED (e.g.
+            -- "There's no PP left for this move!") and control bounces
+            -- back here. That makes it a hard, unambiguous signal for a
+            -- stuck refusal - unlike polling FIRST_MOVE_PP_ADDR/cursor
+            -- position, which real logs have shown can be misread or
+            -- miss the exact refusal state. If it fires again after this
+            -- point, we know for certain the attack never actually went
+            -- through.
+            moveSelectScreenOpen = false
+            press_button("A")
+            break
+        else
+            move1_attempts = move1_attempts + 1
+            if move1_attempts > 6 then
+                -- Same reasoning as do_catch_attack_turn's own
+                -- MOVE2_CURSOR handling: a status condition (confusion/
+                -- sleep/etc.) can also skip the move-select screen for a
+                -- turn, which looks identical to a stuck cursor. Back out
+                -- with B rather than risk confirming the wrong move, and
+                -- let the caller's flee_battle() run as usual afterward.
+                print(string.format("Thief mode: couldn't confirm the cursor on move slot 1 after %d attempt(s) (stuck at Y=%d X=%d) - backing out without attacking",
+                    move1_attempts, my, mx))
+                press_button("B")
+                return "skipped"
+            end
+            press_and_wait_for_cursor_change(navigate_to_menu_option(MOVE1_CURSOR), 30)
+        end
+    end
+
+    -- FIX (real user report): this loop used to just be
+    -- `while not have_battle_controls do ... end`, with no exit
+    -- condition for the battle ending entirely. A Thief attack that
+    -- also happens to knock the wild Pokemon out ends the battle with
+    -- no menu left to reload - have_battle_controls then never becomes
+    -- true again, so the old loop mashed A for the full timeout and
+    -- reported "stuck", stopping the whole bot even though nothing was
+    -- actually wrong (the steal itself may well have already
+    -- succeeded). Mirrors do_kill_turn's own already-battle-tested
+    -- post-attack loop below: exit early on species_addr == 0 (battle
+    -- over, nothing to wait for), and guard against a move-learn
+    -- prompt exactly the same way - previously this function had ZERO
+    -- protection against that, unlike do_kill_turn, so a Thief-induced
+    -- level-up with a move-learn prompt could have been blindly
+    -- confirmed by the A-mash below (potentially overwriting an
+    -- existing move, possibly Thief itself).
+    -- CORRECTION to the fix above (real user report, round 2): the first
+    -- version of this made the loop's own CONDITION exit the instant
+    -- memory.readbyte(species_addr) read 0 even ONCE - but this exact
+    -- function already documents, in its own pre-wait loop's comment
+    -- above, that species_addr can read 0 for a single-frame flicker
+    -- DURING A REAL, ONGOING BATTLE, not just once it's truly over. That
+    -- flicker made this loop exit early mid-turn (before the attack had
+    -- actually resolved), and since have_battle_controls was still
+    -- false and a SECOND species_addr read moments later could easily
+    -- have already bounced back nonzero, execution fell through to a
+    -- bare "return "ok"" while the real battle was still in progress -
+    -- confirmed via a real user report as the cause of two new
+    -- symptoms: the held item no longer being taken after a real steal,
+    -- and no Discord notification being sent, because the caller's own
+    -- item/species reads immediately afterward were sampled mid-
+    -- animation instead of after the turn genuinely finished.
+    --
+    -- Fix: never let a single frame decide this. Keep the loop running
+    -- (pressing A every frame, exactly like before) purely on
+    -- `not have_battle_controls`, and separately require
+    -- BATTLE_END_CONFIRM_FRAMES CONSECUTIVE frames of species_addr == 0
+    -- before trusting that the battle has actually, genuinely ended -
+    -- the same "don't trust a single read" principle already proven
+    -- elsewhere in this file (REQUIRED_SETTLE_FRAMES, and this
+    -- function's own take_item_from_lead()). A real flicker only ever
+    -- lasts an instant, so it can never accumulate anywhere near this
+    -- many consecutive zero-reads - only a genuine battle end can.
+    -- CORRECTION, round 4 (real user report): reading enemy_hp_addr
+    -- exactly once, on the very same frame the attack button was
+    -- pressed, is too early to trust - a real log showed a genuinely
+    -- lethal Thief hit (the wild Grimer really did faint, confirmed by
+    -- the user) still getting the full 600-frame non-fainted timeout,
+    -- meaning enemyFainted read false at that instant even though the
+    -- hit was about to be fatal. The HP value evidently doesn't update
+    -- synchronously with the button press - it lands sometime during
+    -- the attack's own animation/text sequence, a few frames later.
+    -- Gating the whole "fainted" detection on that one early snapshot
+    -- (as the previous fix did) meant a real KO could permanently fail
+    -- to ever be recognized, right back to the original "stuck" false
+    -- stop this was all meant to solve.
+    --
+    -- Fix: don't snapshot it once - keep sampling it every single frame
+    -- of this same wait loop and latch it permanently true the moment
+    -- it's ever actually seen at 0 (HP only decreases within a turn, so
+    -- this can't un-latch, and this loop never spans past one attack).
+    -- By the time species_addr's own consecutive-zero debounce below
+    -- could possibly confirm a real battle end, the HP write is
+    -- guaranteed to have long since landed - so this sticky flag ends
+    -- up just as reliable as the species check for a genuine KO, while
+    -- still staying false the entire time for a Muk-style non-fainting
+    -- hit (its HP genuinely never reaches 0), which is exactly what
+    -- keeps the round-3 fix's protection intact.
+    have_battle_controls = false
+    local postAttackWait = 0
+    local postAttackTimeout = 600
+    local enemyFainted = memory.read_u16_be(enemy_hp_addr) == 0
+    if battleLevelBaseline == nil then
+        battleLevelBaseline = get_active_mon_level()
+        battleLevelBaselineSpecies = get_active_mon_species()
+        battleLevelBaselineMoveCount = get_active_mon_move_count()
+    end
+    local levelBeforeAttack = battleLevelBaseline
+    local activeSpecies = battleLevelBaselineSpecies
+    local confirmedHigherLevelFrames = 0
+    local lastSeenLevel = get_active_mon_level()
+    local ownFaintConfirmedFrames = 0
+    local BATTLE_END_CONFIRM_FRAMES = 30
+    local battleEndConfirmedFrames = 0
+    -- CORRECTION, round 5 (real user report): confirming the battle
+    -- ended isn't the same as confirming there's nothing left on screen.
+    -- A real KO is very often followed by "gained N EXP!"/"grew to
+    -- level X!" text, which this loop DOES press A through while it's
+    -- still running - but the moment battleEndConfirmedFrames hits its
+    -- threshold, this used to return "fainted" immediately, potentially
+    -- mid-EXP-bar-fill or with that text still up. The very next thing
+    -- that happens is take_item_from_lead()'s own settle-wait, which
+    -- deliberately does NOT press any buttons at all (so it can't fire
+    -- off an unwanted NPC/sign interaction when the SAME function is
+    -- used by the startup held-item check on a player standing in the
+    -- overworld) - so any leftover EXP/level text just sits there
+    -- un-dismissed for that entire wait, and the Start-menu button
+    -- sequence that follows gets silently swallowed/misapplied by that
+    -- stuck screen. That's exactly why the steal was registering (this
+    -- function's own read of the lead's item happens fine beforehand)
+    -- but the item never actually left the Pokemon - only the next
+    -- Start press's fresh startup check caught it, because that one
+    -- runs from a screen that's had plenty of time to fully settle.
+    --
+    -- Fix: once the battle-end is confirmed, don't hand off yet - keep
+    -- doing exactly what this loop was already doing (mashing A,
+    -- watching for a move-learn prompt/own-faint) for a further fixed
+    -- stretch, specifically to flush out any leftover EXP-gain/level-up
+    -- text before returning. A real move-learn prompt occurring during
+    -- this window is still caught correctly by the checks below, same
+    -- as before.
+    local POST_FAINT_TEXT_FLUSH_FRAMES = 90
+    local battleEndConfirmed = false
+    local postFaintFlushFrames = 0
+    local PP_STUCK_CONFIRM_FRAMES = 20
+    local ppStuckConfirmFrames = 0
+    while not have_battle_controls do
+        if stop_was_requested() then
+            print("Thief mode: Stop requested - aborting.")
+            return "stuck"
+        end
+
+        -- CORRECTION, round 8 (real user report, with full verbose log
+        -- proof this time): round 7's PP-value debounce below STILL
+        -- never fired on a real "no PP left" refusal - the user's raw
+        -- console log showed "MoveSelectionScreen entered - move-select
+        -- submenu confirmed open" (the ROM hook further down in this
+        -- file, MoveSelectionAddr) printing roughly 50 times in a row
+        -- right after "Thief mode: confirmed cursor on move slot 1 ...
+        -- pressing A", all the way to the generic 600-frame timeout -
+        -- proving the game really was bouncing the refusal back to this
+        -- same move-select screen the entire time, yet round 7's own
+        -- 0-PP debounce never caught it. That hook fires unconditionally
+        -- every single time the game's move-select routine is entered,
+        -- including every rejection bounce-back, regardless of whatever
+        -- FIRST_MOVE_PP_ADDR or the cursor happens to read at that
+        -- instant - so unlike polling those addresses (which multiple
+        -- rounds of real-world evidence have now shown can be misread or
+        -- miss the exact refusal window), it can't be fooled the same
+        -- way. moveSelectScreenOpen was explicitly cleared to false
+        -- right before this turn's "A" press (see move1_attempts above);
+        -- if it has flipped back to true by the time we get here, the
+        -- move never actually went through - control bounced straight
+        -- back to move-select, which for Thief (no fallback second move)
+        -- can only mean this same "no PP left" refusal (or something
+        -- equally un-attackable). Treat that as decisive on its own,
+        -- with no PP-value or enemyFainted gating needed - the game
+        -- physically cannot re-enter MoveSelectionScreen after a real
+        -- faint, so there's no legitimate case this could collide with.
+        if moveSelectScreenOpen then
+            print("Thief mode: caught stuck - bounced back to the move-select screen right after pressing A (almost always a 'no PP left' refusal) - backing out without attacking so hunting can continue normally.")
+            if not thiefPpDepletedNotified then
+                thiefPpDepletedNotified = true
+                send_alert("Thief mode: move slot 1 is out of PP - pausing Thief steals until you restore it (Elixir/PP Up/etc). Continuing to hunt normally in the meantime.", COLOR_BLUE)
+            end
+            press_button("B")
+            return "skipped"
+        end
+
+        -- CORRECTION, round 7 (real user report + screenshots, the
+        -- round-6 fix STILL wasn't catching this): round 6 required the
+        -- cursor to read back exactly at MOVE1_CURSOR before trusting a
+        -- 0-PP reading, on the assumption the "There's no PP left for
+        -- this move!" refusal leaves the cursor sitting there untouched
+        -- - but if that assumption about the cursor's exact behavior
+        -- during the refusal is wrong, that extra condition could keep
+        -- this from ever firing, which matches the repeated reports of
+        -- this exact screenshot recurring unchanged. Dropping the
+        -- cursor requirement entirely removes that whole point of
+        -- doubt: this now only needs PP to genuinely read 0, debounced
+        -- across PP_STUCK_CONFIRM_FRAMES consecutive frames (so a
+        -- single bad read can't trigger it), while the enemy is NOT
+        -- confirmed fainted (enemyFainted is the same sticky flag used
+        -- below - a legitimate last-PP-point KO also shows PP at 0, but
+        -- that case is already correctly handled by the fainted-
+        -- detection logic further down, so this must never compete with
+        -- it). A real, ordinary turn has no reason to sit at 0 PP AND
+        -- no battle controls AND no faint for 20 straight frames - only
+        -- this exact stuck refusal does.
+        if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 and not enemyFainted then
+            ppStuckConfirmFrames = ppStuckConfirmFrames + 1
+        else
+            ppStuckConfirmFrames = 0
+        end
+        if ppStuckConfirmFrames >= PP_STUCK_CONFIRM_FRAMES then
+            print("Thief mode: caught stuck on a 'no PP left' refusal for move slot 1 - backing out without attacking so hunting can continue normally.")
+            if not thiefPpDepletedNotified then
+                thiefPpDepletedNotified = true
+                send_alert("Thief mode: move slot 1 is out of PP - pausing Thief steals until you restore it (Elixir/PP Up/etc). Continuing to hunt normally in the meantime.", COLOR_BLUE)
+            end
+            press_button("B")
+            return "skipped"
+        end
+
+        -- CORRECTION, round 3 (real user report): species_addr reading
+        -- 0 is NOT on its own reliable proof the battle ended, even
+        -- across many consecutive frames - a real log showed it holding
+        -- at 0 for well over the 30-frame debounce this used to rely on
+        -- alone, WHILE the wild Pokemon (Muk) was still fully alive and
+        -- the battle carried on right after (a fresh "Battle menu
+        -- loaded" a moment later, then a normal flee). That false
+        -- "fainted" conclusion made this return early mid-turn, before
+        -- the steal's own held-item write had actually landed yet -
+        -- exactly matching the report: item not taken, no Discord
+        -- notification, because the caller checked the lead's held item
+        -- far too early.
+        --
+        -- Fix: only let species_addr==0 count toward "the battle ended"
+        -- when we ALREADY independently know from the enemy's own HP
+        -- that this attack genuinely fainted it. If the enemy's HP has
+        -- never once read 0 (see the sticky-latch comment above), no
+        -- amount of species_addr misreads should ever be trusted as a
+        -- battle end - so this simply never counts toward the debounce,
+        -- and the loop just keeps waiting for have_battle_controls
+        -- exactly like it always did for an ordinary non-fainting turn.
+        if memory.read_u16_be(enemy_hp_addr) == 0 then
+            enemyFainted = true
+        end
+        if enemyFainted and memory.readbyte(species_addr) == 0 then
+            battleEndConfirmedFrames = battleEndConfirmedFrames + 1
+        else
+            battleEndConfirmedFrames = 0
+        end
+        if not battleEndConfirmed and battleEndConfirmedFrames >= BATTLE_END_CONFIRM_FRAMES then
+            battleEndConfirmed = true
+            vprint("Thief mode: battle end confirmed - mashing through any leftover EXP/level-up text for a bit before handing off.")
+        end
+        if battleEndConfirmed then
+            postFaintFlushFrames = postFaintFlushFrames + 1
+            if postFaintFlushFrames >= POST_FAINT_TEXT_FLUSH_FRAMES then
+                -- The battle ended right when/after we attacked (most
+                -- likely the wild Pokemon fainted from the hit) - this
+                -- is a normal, harmless battle end, not a stuck bot,
+                -- and by now any leftover EXP/level-up text has had a
+                -- solid stretch of real A presses to clear. The caller
+                -- checks the lead's actual held item directly to see
+                -- whether the steal landed before this KO, rather than
+                -- trusting any battle-address reads here (those go
+                -- stale the instant the battle state clears).
+                vprint("Thief mode: battle ended right after the attack (likely the wild Pokemon fainted from it) - treating this as a clean battle end, not stuck.")
+                return "fainted"
+            end
+        end
+
+        -- Same reasoning as do_kill_turn's own copy of this check: our
+        -- own Pokemon fainting mid-turn (confusion self-hit, recoil,
+        -- etc.) opens a "send out next Pokemon"/whiteout prompt that
+        -- blind A-mashing can't safely resolve.
+        local ownHP = memory.read_u16_be(OWN_HP_ADDR)
+        if ownHP == 0 then
+            ownFaintConfirmedFrames = ownFaintConfirmedFrames + 1
+        else
+            ownFaintConfirmedFrames = 0
+        end
+        if ownFaintConfirmedFrames >= 3 then
+            print("Thief mode: your own Pokemon appears to have fainted mid-turn (confusion self-hit, recoil, etc.) - stopping so you can send out a replacement manually.")
+            return "stuck"
+        end
+
+        -- Same move-learn-prompt guard as do_kill_turn - see its own
+        -- comment above for the full rationale. Shares that function's
+        -- battleLevelBaseline/learnMovePromptDetected state (captured
+        -- once at battle start in M.step(), not per-attack), so it
+        -- stays correct across Thief's own multi-attempt retry loop
+        -- within the same battle.
+        if learnMovePromptDetected then
+            if battleLevelBaselineMoveCount ~= nil and battleLevelBaselineMoveCount < 4 then
+                vprint("Thief mode: move-learn prompt detected, but a free move slot was available at battle start - auto-fills with no risk, continuing.")
+                learnMovePromptDetected = false
+            else
+                print("Thief mode: move-learn prompt detected - stopping immediately so you can decide (this Pokemon likely also just leveled up).")
+                return "stuck"
+            end
+        end
+        local currentLevel = get_active_mon_level()
+        -- Also reject anything above the real maximum level (100) -
+        -- confirmed via a real user report: a Thief attack that
+        -- one-shots the wild Pokemon (fainting it) can read
+        -- get_active_mon_level() as 255 during that same battle-end
+        -- teardown window - the same kind of transient WRAM corruption
+        -- already documented above for the impossible 25->20 case, just
+        -- in the other direction. Left unguarded, that fake level "255"
+        -- reads as higher than levelBeforeAttack, stays consistent for
+        -- 3 frames (it's a stable garbage value, not noise), and then
+        -- makes learns_move_in_range() check almost the whole rest of
+        -- the level table (levelBeforeAttack..255) - which is
+        -- essentially guaranteed to match something, falsely declaring
+        -- a move-learn prompt and stopping the bot when it actually
+        -- just needed a few more A presses to finish leaving battle.
+        if currentLevel > levelBeforeAttack and currentLevel <= 100 and currentLevel == lastSeenLevel then
+            confirmedHigherLevelFrames = confirmedHigherLevelFrames + 1
+        else
+            confirmedHigherLevelFrames = (currentLevel > levelBeforeAttack and currentLevel <= 100) and 1 or 0
+        end
+        lastSeenLevel = currentLevel
+        if confirmedHigherLevelFrames >= 3 and learns_move_in_range(activeSpecies, levelBeforeAttack, currentLevel) then
+            if battleLevelBaselineMoveCount ~= nil and battleLevelBaselineMoveCount < 4 then
+                vprint(string.format("Thief mode: level increase to %d with a move-learn possible, but a free move slot was available at battle start - auto-fills with no risk, continuing.", currentLevel))
+            else
+                print(string.format("Thief mode: level increase to %d - this species learns a move somewhere in that range, a learn-prompt is likely showing. Stopping so you can decide.", currentLevel))
+                return "stuck"
+            end
+        end
+
+        emu.frameadvance()
+        press_button("A")
+        postAttackWait = postAttackWait + 1
+        if postAttackWait > postAttackTimeout then
+            if enemyFainted then
+                print(string.format("Thief mode: enemy fainted but the battle still hasn't ended after %d+ frames - likely a move-learn or evolution prompt. Stopping so you can decide.", postAttackTimeout))
+            else
+                print(string.format("Thief mode: stuck after attacking for %d+ frames (likely a move-learn or evolution prompt) - stopping so you can handle it manually", postAttackTimeout))
+            end
+            return "stuck"
+        end
+    end
+
+    return "ok"
+end
+
+-- Extracted from what used to be the inline "else" branch of the kill-
+-- vs-flee decision in M.step(), so Thief mode (below) can flee via the
+-- exact same, already-battle-tested escape logic afterward instead of a
+-- second copy that could drift out of sync - Thief mode still flees
+-- afterward exactly like it always did before Thief mode existed.
+local function flee_battle()
+    Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Fleeing battle...")
+
+    -- Running from a wild battle in Gen 2 isn't guaranteed to
+    -- succeed - there's a chance-based escape formula, and a
+    -- failed attempt shows "Can't escape!" while the battle
+    -- continues (the enemy gets a turn). Selecting RUN and
+    -- pressing A only confirms we ATTEMPTED to flee, not that
+    -- it worked - so retry the whole sequence if the first
+    -- attempt's exit-wait times out, rather than assuming
+    -- success and getting stuck.
+    local escapeAttempts = 0
+    local fledSuccessfully = false
+    while not fledSuccessfully and escapeAttempts < 5 and memory.readbyte(species_addr) ~= 0 do
+        escapeAttempts = escapeAttempts + 1
+
+        -- Don't rely on have_battle_controls (hook-driven)
+        -- for retries - the hook watches for the menu
+        -- LOADING, and after "Can't escape!" the game may
+        -- return to the same already-open menu without a
+        -- full reload event, meaning the hook might never
+        -- re-fire and have_battle_controls could stay false
+        -- forever. Check the cursor position directly
+        -- instead, which doesn't depend on any hook at all.
+        local waitForControlsFrames = 0
+        while memory.readbyte(species_addr) ~= 0 and waitForControlsFrames < 300 do
+            local cy0 = memory.readbyte(MENU_CURSOR_Y)
+            local cx0 = memory.readbyte(MENU_CURSOR_X)
+            if (cy0 == FIGHT_CURSOR.y or cy0 == RUN_CURSOR.y) and (cx0 == FIGHT_CURSOR.x or cx0 == RUN_CURSOR.x) then
+                have_battle_controls = true
+                break
+            end
+            emu.frameadvance()
+            press_button("B")
+            waitForControlsFrames = waitForControlsFrames + 1
+        end
+
+        local nav_attempts = 0
+        local ran_away = false
+        while have_battle_controls and memory.readbyte(species_addr) ~= 0 do
+            local cy = memory.readbyte(MENU_CURSOR_Y)
+            local cx = memory.readbyte(MENU_CURSOR_X)
+
+            if cy == RUN_CURSOR.y and cx == RUN_CURSOR.x then
+                vprint(string.format("Pressing A to select RUN (Y=%d X=%d)", cy, cx))
+                press_button("A")
+                ran_away = true
+                break
+            else
+                nav_attempts = nav_attempts + 1
+                if nav_attempts > 12 then
+                    vprint("Navigation stuck after 12 attempts - backing out with B and stopping this attempt")
+                    press_button("B")
+                    break
+                end
+                local next_input = navigate_to_menu_option(RUN_CURSOR)
+                vprint(string.format("Y=%d X=%d -> pressing %s", cy, cx, next_input))
+                press_and_wait_for_cursor_change(next_input, 30)
+                local ny, nx = memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)
+                if ny == cy and nx == cx then
+                    vprint(string.format("  no change after %s (still Y=%d X=%d) - possible timeout", next_input, ny, nx))
+                end
+            end
+        end
+
+        if ran_away then
+            vprint(string.format("Ran away (attempt %d) - clearing exit text until battle actually ends", escapeAttempts))
+            local exitWaitFrames = 0
+            while memory.readbyte(species_addr) ~= 0 and exitWaitFrames < 180 do
+                emu.frameadvance()
+                press_button("B")
+                exitWaitFrames = exitWaitFrames + 1
+            end
+            if memory.readbyte(species_addr) == 0 then
+                fledSuccessfully = true
+                Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Escaped, wrapping up...")
+            else
+                vprint(string.format("Escape attempt %d timed out (Can't escape!, most likely) - retrying", escapeAttempts))
+            end
+            have_battle_controls = false
+        end
+    end
+
+    if not fledSuccessfully and memory.readbyte(species_addr) ~= 0 then
+        print(string.format("WARNING: could not escape after %d attempts - continuing anyway", escapeAttempts))
+    end
+
+    -- Same fix as do_catch_sequence's post-catch reset above
+    -- (see that comment for the full root-cause writeup),
+    -- applied here for the exact same reason: species_addr is
+    -- already documented to flicker non-zero for up to 90+
+    -- frames after a battle genuinely ends - including after
+    -- a successful flee, not just a catch. Confirmed via a
+    -- real user report: a shiny that doesn't match the
+    -- auto-catch filter correctly flees here, but without
+    -- this reset, the next M.step() tick(s) can sample one of
+    -- those stale nonzero reads, re-enter the "in battle"
+    -- shiny branch with shinyvalue still 1 (nothing else
+    -- clears it) and dv_flag_addr still left at 0x01 from the
+    -- battle that just ended, and re-send the exact same
+    -- "Shiny found" Discord embed - observed as ~5 duplicate
+    -- notifications for one shiny. A real new shiny always
+    -- re-sets shinyvalue via shiny() inside the ROM hook, so
+    -- clearing it here can never suppress a genuine one.
+    shinyvalue = 0
+    shinyLatchedThisBattle = false
+end
+
+-- ===== Auto-unequip Thief's stolen item =====
+-- Gen 2's Thief mechanic (see the "must not already hold an item"
+-- comment on the Thief decision block below) hands a successfully
+-- stolen item to the THIEF USER itself, not directly to the Bag - so
+-- until that item is cleared off, Thief can never steal again (every
+-- following encounter gets blocked by the same "already holding an
+-- item" condition, confirmed via a real user report of exactly this).
+-- This automates the manual fix: Start -> POKEMON -> (lead, party slot
+-- 1) -> ITEM -> TAKE.
+--
+-- Every button-press COUNT below is USER-CONFIRMED against their own
+-- real game (counted by physically opening each menu) - NOT guessed:
+--   - The Start menu opens with POKEDEX highlighted; POKEMON is
+--     confirmed to be exactly 1 Down-press away.
+--   - The per-Pokemon action menu (STATS/SWITCH/MOVE/ITEM/CANCEL, for a
+--     mon with no field moves) needs exactly 3 Downs from open to reach
+--     ITEM - CONFIRMED SPECIFIC TO A THIEF USER THAT KNOWS NO FIELD
+--     MOVES (Cut/Fly/Surf/Strength/Whirlpool/Headbutt/Rock Smash/Sweet
+--     Scent/Softboiled/Milk Drink). Each of those inserts an extra
+--     entry ABOVE ITEM in that menu and would shift this count. If the
+--     Thief user ever learns one of those moves, THIEF_ITEM_MENU_DOWN_
+--     PRESSES below needs updating to match - otherwise this function
+--     risks landing on the wrong option, most dangerously SWITCH (which
+--     silently reorders the party and breaks the "lead = Thief user"
+--     premise this whole feature depends on).
+--   - The Item submenu is always exactly GIVE (top, default-highlighted)
+--     then TAKE (one Down below it) whenever a mon already holds an
+--     item - taken directly from the pokecrystal disassembly
+--     (GiveTakeItemMenuData), not user-counted, but this one has no
+--     conditional variability to begin with so it's low-risk regardless.
+--   - The party list defaulting to the lead (slot 1) highlighted when
+--     freshly opened is standard, ordinary Game Boy menu behavior (no
+--     known quirk like the move-select screen's stale-cursor issue) but
+--     genuinely UNVERIFIED for this specific build. If it's ever wrong,
+--     the worst case is unequipping the wrong party member's item
+--     (annoying, not destructive) rather than anything worse.
+--
+-- UNVERIFIED WARNING: MENU_CURSOR_Y/MENU_CURSOR_X are only confirmed
+-- for the BATTLE menu (per this file's version-detection code). Reusing
+-- them here for diagnostics rests on the reasonable-but-not-WRAM-
+-- diffed assumption that Crystal's engine shares one cursor variable
+-- across every menu. Because of that, this function does NOT gate any
+-- decision on those reads - it only logs them for future debugging -
+-- and paces every step with generous fixed frame waits instead (the
+-- same fallback strategy this file already uses elsewhere for game
+-- versions without a confirmed ROM hook), so the actual button
+-- presses (which are real inputs regardless of what any memory read
+-- says) still work correctly even if that address assumption is wrong.
+local ITEM_MENU_DOWN_PRESSES = 3
+
+-- Same threshold M.step()'s own overworld_loaded detector already
+-- proved necessary (see REQUIRED_SETTLE_FRAMES's declaration/history
+-- further down this file, raised from 10 to 90 after real evidence that
+-- species_addr can read 0 for 10+ CONSECUTIVE frames purely as part of
+-- a battle's own transition, well before the battle has actually
+-- ended). A real user report proved the exact same failure mode here:
+-- after a Thief steal, Start was pressed too early (species_addr had
+-- read 0, but the screen was still fading back to the overworld) - the
+-- Start press was silently swallowed mid-fade, and the very next
+-- scripted "Down" (meant to move the Start menu's highlight onto
+-- POKEMON) was instead read as ordinary overworld movement, walking
+-- the character off their tile instead of navigating any menu.
+-- Requiring this many CONSECUTIVE zero-reads (not just one single read
+-- plus a flat buffer, which is what this used before) is the same fix
+-- already proven for the exact same underlying problem elsewhere in
+-- this file - duplicated here as its own local constant (rather than
+-- referencing REQUIRED_SETTLE_FRAMES directly) since that one is
+-- declared later in the file, out of scope for this function.
+local THIEF_LEAD_ITEM_SETTLE_FRAMES = 90
+
+-- Shared menu-driving sequence behind both auto_unequip_thief_item()
+-- (mid-hunt, right after a successful Thief steal) and the one-time
+-- startup lead-held-item check (see check_and_clear_lead_item_on_startup
+-- below) - both ultimately need the exact same Start -> POKEMON ->
+-- (lead) -> ITEM -> TAKE flow against the exact same party slot (the
+-- lead), so the mechanics live here once and each caller only supplies
+-- a short label used to prefix this function's own print/vprint lines
+-- (so console output still makes it obvious which feature triggered it).
+local function take_item_from_lead(contextLabel)
+    -- Only run once genuinely back in the overworld - see
+    -- THIEF_LEAD_ITEM_SETTLE_FRAMES's comment above for why this
+    -- requires that many CONSECUTIVE zero-reads, not just one.
+    local consecutiveZeroFrames = 0
+    local totalWaitFrames = 0
+    while consecutiveZeroFrames < THIEF_LEAD_ITEM_SETTLE_FRAMES and totalWaitFrames < 600 do
+        if memory.readbyte(species_addr) == 0 then
+            consecutiveZeroFrames = consecutiveZeroFrames + 1
+        else
+            consecutiveZeroFrames = 0
+        end
+        emu.frameadvance()
+        totalWaitFrames = totalWaitFrames + 1
+    end
+    if consecutiveZeroFrames < THIEF_LEAD_ITEM_SETTLE_FRAMES then
+        print(string.format("%s: couldn't confirm a clean return to the overworld before clearing the held item - skipping this time.", contextLabel))
+        return
+    end
+
+    vprint(string.format("%s: auto-unequip starting - cursor Y=%d X=%d (diagnostic only, not gated on)",
+        contextLabel, memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)))
+
+    -- DIAGNOSTIC: a real user report showed the bot pressing Down right
+    -- after Start with no menu ever visibly opening - i.e. Start looks
+    -- like a silent no-op, exactly what happens if "Start" isn't
+    -- actually a recognized joypad key name for this core (joypad.set
+    -- ignores unknown keys rather than erroring, unlike A/B/Up/Down/
+    -- Left/Right which are already proven elsewhere in this file).
+    -- Reading straight back with joypad.get() right after setting it
+    -- uses the exact same key-naming convention as joypad.set itself
+    -- (unlike joypad.getavailablebuttons, which can use a differently-
+    -- prefixed naming scheme) - settling this definitively instead of
+    -- guessing at a different name blind.
+    do
+        joypad.set({Start = true})
+        local okGet, joypadState = pcall(joypad.get)
+        if okGet and joypadState then
+            local pressed = {}
+            for k, v in pairs(joypadState) do
+                if v then table.insert(pressed, tostring(k)) end
+            end
+            print(string.format("%s: right after setting Start=true, joypad.get() shows pressed: %s",
+                contextLabel, (next(pressed) and table.concat(pressed, ", ") or "NOTHING - 'Start' is likely not the right key name for this core")))
+        else
+            print(string.format("%s: joypad.get() unavailable - can't verify the button name this way.", contextLabel))
+        end
+    end
+    for i = 1, 3 do
+        joypad.set({Start = true})
+        emu.frameadvance()
+    end
+    emu.frameadvance()
+    for i = 1, 60 do emu.frameadvance() end
+    press_button("Down") -- POKEDEX -> POKEMON (user-confirmed: 1 press)
+    for i = 1, 15 do emu.frameadvance() end
+    press_button("A") -- open the party list
+    -- Raised from 45 - a real user report showed the very next A press
+    -- (meant to select the lead and open its action menu) having no
+    -- visible effect at all: the bot went straight from the party list
+    -- to pressing Down 3 times inside THAT list (moving between party
+    -- slots) instead of opening the action menu first. The party list
+    -- draws in party-member icons/HP bars for every mon (slower than a
+    -- simple text menu like the Start menu), so 45 frames likely wasn't
+    -- long enough for it to finish loading/become interactive yet,
+    -- causing that A press to be silently swallowed mid-transition -
+    -- same category of issue as species_addr's well-documented
+    -- transition flicker elsewhere in this file, just for a different
+    -- screen. This is a one-time (or post-battle) action, not
+    -- performance-sensitive, so it can afford to wait generously.
+    for i = 1, 100 do emu.frameadvance() end
+    vprint(string.format("%s: about to press A to select the lead - cursor Y=%d X=%d (diagnostic only, not gated on)",
+        contextLabel, memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)))
+    press_button("A") -- select the lead (party slot 1, default-highlighted)
+    for i = 1, 45 do emu.frameadvance() end
+    vprint(string.format("%s: after pressing A on the lead - cursor Y=%d X=%d (diagnostic only, not gated on)",
+        contextLabel, memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)))
+
+    for i = 1, ITEM_MENU_DOWN_PRESSES do
+        press_button("Down")
+        for j = 1, 15 do emu.frameadvance() end
+    end
+    press_button("A") -- select ITEM
+    for i = 1, 30 do emu.frameadvance() end
+    press_button("Down") -- GIVE -> TAKE
+    for i = 1, 15 do emu.frameadvance() end
+    press_button("A") -- confirm TAKE
+    for i = 1, 45 do emu.frameadvance() end
+
+    -- Clear the "X took the Y back!" message and back out of every menu
+    -- we opened (action menu, party list, Start menu) with B, rather
+    -- than assuming an exact number of screens - B only ever
+    -- cancels/closes here, it never confirms anything, so extra presses
+    -- once already back in the overworld are harmless no-ops. Raised
+    -- from 4 to 8 - a real user report confirmed the flow otherwise
+    -- works, but 4 B presses weren't quite enough to fully back out of
+    -- every menu layer every time.
+    for i = 1, 8 do
+        press_button("B")
+        for j = 1, 20 do emu.frameadvance() end
+    end
+
+    vprint(string.format("%s: auto-unequip finished - cursor Y=%d X=%d (diagnostic only)",
+        contextLabel, memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)))
+    print(string.format("%s: cleared the held item off your lead Pokemon. (If your Bag's pocket was full, this may not have actually worked - check in-game if it's still holding it.)", contextLabel))
+end
+
+-- Thin wrapper kept so the existing Thief-mode caller site (M.step's
+-- Thief decision block) doesn't need to change at all - just labels the
+-- shared sequence above for its own console output.
+local function auto_unequip_thief_item()
+    take_item_from_lead("Thief mode")
+end
+
+-- ===== Startup check: clear any pre-existing held item off the lead =====
+-- User-requested: some hunts get started with the lead Pokemon already
+-- holding an item (left over from manual play, a previous session, etc).
+-- Thief mode specifically NEEDS an empty-handed lead to be able to steal
+-- at all (see the Gen 2 mechanic comment on the Thief decision block
+-- below), so this runs once, right when the bot first settles into the
+-- overworld after Start is pressed (see startupItemCheckPending's
+-- declaration/reset near overworld_loaded and M.on_resume), and clears
+-- whatever the lead is holding via the exact same menu flow as
+-- auto_unequip_thief_item() above. Deliberately unconditional (not
+-- gated on Thief mode being enabled) since the user asked for this as a
+-- general startup step, not a Thief-only one.
+local function check_and_clear_lead_item_on_startup()
+    local leadItem = get_lead_held_item()
+    if leadItem == 0 then
+        vprint("Startup check: lead Pokemon isn't holding anything - nothing to clear.")
+        return
+    end
+    local leadItemName = get_item_name(leadItem)
+    print(string.format("Startup check: your lead Pokemon is already holding %s - clearing it before hunting begins.", leadItemName))
+    take_item_from_lead("Startup check")
+end
+
 local CATCH_HP_TARGET_PERCENT = 0.40
 
 -- shinyEmbedFields/shinySpriteUrl (optional): the detailed fields built
@@ -1781,12 +2835,51 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl)
                 recoverFrames = recoverFrames + 1
             end
             if not have_battle_controls then
-                -- Genuinely didn't recover in time - report this specific
-                -- failure instead of falling through into
-                -- navigate_to_pack_and_select_ball() with a false premise
-                -- (see comment above).
+                -- CORRECTION (real user report, shiny Delibird - a
+                -- species with a notably high wild flee rate): before
+                -- concluding this needs manual intervention, check
+                -- whether the battle has actually already ENDED -
+                -- species_addr reading 0 means there's no wild Pokemon
+                -- left to have a battle menu for at all, which this
+                -- recovery loop could never succeed at by definition. The
+                -- most likely real cause: the wild Pokemon used its own
+                -- turn (after the failed throw) to flee instead of
+                -- attacking, which genuinely ends the battle outright -
+                -- exactly like any other mid-battle flee elsewhere in
+                -- this project. That's a normal, harmless outcome, not an
+                -- error - the message calling it a bare "battle menu
+                -- timeout" was misleading (a real user report pointed
+                -- this out directly), and stopping the whole bot over it
+                -- was unnecessary, same principle behind every other
+                -- "don't stop for a harmless outcome" fix in this
+                -- codebase (Thief's PP-stuck/fainted handling, etc).
+                if memory.readbyte(species_addr) == 0 then
+                    -- Still need to rule out the OTHER thing that ends a
+                    -- battle outright: our own Pokemon fainting (recoil,
+                    -- confusion self-hit, a status condition, etc, on the
+                    -- wild Pokemon's turn). Same OWN_HP_ADDR check
+                    -- do_kill_turn/do_thief_turn already use for exactly
+                    -- this - that genuinely does need a replacement sent
+                    -- out manually, so it still stops.
+                    if memory.read_u16_be(OWN_HP_ADDR) == 0 then
+                        print("Catch-mode: your own Pokemon appears to have fainted during the wild Pokemon's turn (after the failed throw) - stopping so you can send out a replacement manually.")
+                        send_catch_notification(string.format("%s%s could not be caught - your Pokemon fainted before the next throw. Bot stopped, send out a replacement.", label, caughtSpeciesName),
+                            COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
+                        return true
+                    end
+                    print("Catch-mode: the wild Pokemon appears to have fled during its own turn after the failed throw - resuming the hunt normally.")
+                    send_catch_notification(string.format("%s%s got away (likely fled) before it could be caught - continuing the hunt.", label, caughtSpeciesName),
+                        COLOR_BLUE, caughtSpeciesId, isShiny, caughtItemName)
+                    return false
+                end
+                -- species_addr is still nonzero - still nominally the
+                -- same battle, so this ISN'T a flee/faint ending things
+                -- early. The menu genuinely never came back for some
+                -- other reason (an unresolved dialog/prompt this recovery
+                -- loop's A-mashing couldn't clear) - that IS a real stuck
+                -- state worth stopping for.
                 print("Catch-mode: battle menu didn't reload after the failed throw within the extended timeout - stopping so you can take over.")
-                send_catch_notification(string.format("%s%s could not be caught, bot stopped (battle menu didn't return after a failed throw).", label, caughtSpeciesName),
+                send_catch_notification(string.format("%s%s could not be caught, bot stopped (battle menu didn't return after a failed throw - possibly stuck on an unexpected prompt).", label, caughtSpeciesName),
                     COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
                 return true
             end
@@ -2101,10 +3194,24 @@ local function do_kill_turn()
         -- corrupted during the EXP-gain/level-up animation window
         -- (confirmed: observed a read of 25->20, which is impossible
         -- during a real battle, since level can only ever go up).
-        if currentLevel > levelBeforeAttack and currentLevel == lastSeenLevel then
+        -- Also reject anything above the real maximum level (100) -
+        -- confirmed via a real user report: a Thief attack that
+        -- one-shots the wild Pokemon (fainting it) can read
+        -- get_active_mon_level() as 255 during that same battle-end
+        -- teardown window - the same kind of transient WRAM corruption
+        -- already documented above for the impossible 25->20 case, just
+        -- in the other direction. Left unguarded, that fake level "255"
+        -- reads as higher than levelBeforeAttack, stays consistent for
+        -- 3 frames (it's a stable garbage value, not noise), and then
+        -- makes learns_move_in_range() check almost the whole rest of
+        -- the level table (levelBeforeAttack..255) - which is
+        -- essentially guaranteed to match something, falsely declaring
+        -- a move-learn prompt and stopping the bot when it actually
+        -- just needed a few more A presses to finish leaving battle.
+        if currentLevel > levelBeforeAttack and currentLevel <= 100 and currentLevel == lastSeenLevel then
             confirmedHigherLevelFrames = confirmedHigherLevelFrames + 1
         else
-            confirmedHigherLevelFrames = (currentLevel > levelBeforeAttack) and 1 or 0
+            confirmedHigherLevelFrames = (currentLevel > levelBeforeAttack and currentLevel <= 100) and 1 or 0
         end
         lastSeenLevel = currentLevel
         if confirmedHigherLevelFrames >= 3 and learns_move_in_range(activeSpecies, levelBeforeAttack, currentLevel) then
@@ -2131,6 +3238,13 @@ end
 
 local overworld_loaded = false
 local overworld_settle_frames = 0
+-- Set true in M.on_resume() (once per Start press) and consumed exactly
+-- once - the first time overworld_loaded is true afterward - by
+-- check_and_clear_lead_item_on_startup() below. Deliberately NOT tied to
+-- overworld_loaded's own per-battle true/false toggling (that flips
+-- after every single encounter, not just at hunt start), so this really
+-- only runs once per Start press, not once per battle.
+local startupItemCheckPending = false
 -- Was 10. A real verbose log (the shiny Raticate investigated alongside
 -- shinyLatchedThisBattle above) directly proved species_addr can read 0
 -- for 10+ CONSECUTIVE frames purely as part of a battle's own intro
@@ -2258,6 +3372,9 @@ local function register_hooks()
         end
         realEncounterConfirmed = true
         pendingBattleSettle = true
+        thiefUsedThisBattle = false
+        thiefPpCheckedThisBattle = false
+        thiefLowHpCheckedThisBattle = false
         vprint("combat started")
         item = memory.readbyte(item_addr)
         atkdef = memory.readbyte(enemy_addr)
@@ -2694,10 +3811,51 @@ function M.on_resume()
     shinyvalue = 0
     shinyLatchedThisBattle = false
     learnMovePromptDetected = false
+    startupItemCheckPending = true
+    killModeWasEnabled = false
+    killModeAutosaveNextTime = nil
 end
 
 function M.step()
     check_stuck_and_notify()
+
+    -- Kill mode safety savestates - see KILL_MODE_SAFETY_SLOT's own
+    -- declaration/comment above for the full rationale. Checked every
+    -- tick (cheap - just a forms.ischecked() read) so both a mid-run
+    -- checkbox toggle AND a fresh Start click with it already checked
+    -- are caught the same way, via the OFF->ON edge this produces.
+    do
+        local killModeEnabledNow = Gui.kill_non_shiny(hud)
+        if killModeEnabledNow and not killModeWasEnabled then
+            local saveOk = false
+            pcall(function() saveOk = savestate.save(KILL_MODE_SAFETY_SAVE_PATH, true) end)
+            if saveOk then
+                print(string.format(
+                    "Kill mode: safety savestate saved to %s - if a move-learn/level-up hiccup ever corrupts a move, load this file to get back to right before this Kill mode run started.",
+                    KILL_MODE_SAFETY_SAVE_PATH))
+            else
+                print(string.format("Kill mode: WARNING - couldn't save the safety savestate to %s.", KILL_MODE_SAFETY_SAVE_PATH))
+            end
+            -- (Re)arm the periodic autosave timer fresh each time Kill
+            -- mode (re)starts, rather than letting it carry over a stale
+            -- deadline from a previous run.
+            killModeAutosaveNextTime = os.time() + KILL_MODE_AUTOSAVE_INTERVAL_SECONDS
+        elseif not killModeEnabledNow then
+            killModeAutosaveNextTime = nil
+        end
+        killModeWasEnabled = killModeEnabledNow
+
+        if killModeEnabledNow and killModeAutosaveNextTime and os.time() >= killModeAutosaveNextTime then
+            local saveOk = false
+            pcall(function() saveOk = savestate.save(KILL_MODE_AUTOSAVE_PATH, true) end)
+            if saveOk then
+                vprint(string.format("Kill mode: periodic autosave refreshed (%s).", KILL_MODE_AUTOSAVE_PATH))
+            else
+                print(string.format("Kill mode: WARNING - periodic autosave to %s failed.", KILL_MODE_AUTOSAVE_PATH))
+            end
+            killModeAutosaveNextTime = os.time() + KILL_MODE_AUTOSAVE_INTERVAL_SECONDS
+        end
+    end
 
     -- Feeds launcher.lua's Discord Rich Presence status line (see
     -- data/presence.lua) - cheap two-byte read, done every tick so the
@@ -2926,6 +4084,27 @@ function M.step()
     end
 
     if overworld_loaded then
+        -- Runs at most once per Start press - see startupItemCheckPending's
+        -- declaration above and the reset in M.on_resume(). Deliberately
+        -- placed before do_nudge_cycle()/searching begins so the lead is
+        -- guaranteed empty-handed (and Thief able to steal) from the very
+        -- first encounter of the hunt onward.
+        --
+        -- Gated on Thief mode actually being enabled - this whole feature
+        -- only exists because Thief needs an empty-handed lead to steal
+        -- at all (see the Gen 2 mechanic comment on the Thief decision
+        -- block below); a user NOT using Thief this session may well be
+        -- intentionally holding an item on their lead for an unrelated
+        -- reason, so this must never touch it uninvited.
+        if startupItemCheckPending then
+            startupItemCheckPending = false
+            if Gui.thief_mode_enabled(hud) then
+                check_and_clear_lead_item_on_startup()
+            else
+                vprint("Startup check: Thief mode isn't enabled - leaving your lead's held item alone.")
+            end
+        end
+
         if do_nudge_cycle() then
             mark_progress()
         end
@@ -3080,15 +4259,19 @@ function M.step()
             -- DEBUG MODE: when true, every filter/exception/living-dex
             -- check below is bypassed entirely - ANY detected shiny gets
             -- an immediate catch attempt as long as the master Auto-Catch
-            -- toggle is on, full stop. This exists purely to isolate
-            -- whether the species-filter/exception/living-dex logic is
-            -- involved in the confirmed "shiny detected, Stats recorded,
-            -- but never caught" bug, or whether the real cause is earlier
-            -- (shinyvalue not reading 1 at decision time at all - see the
-            -- "Decision check" vprint just above). If shinies STILL don't
-            -- get caught with this on, that conclusively rules out every
-            -- filter as the cause. Set back to false once root-caused.
-            local DEBUG_CATCH_ANY_SHINY = true
+            -- toggle is on, full stop. This existed purely to isolate an
+            -- earlier "shiny detected, Stats recorded, but never caught"
+            -- bug from the species-filter/exception/living-dex logic -
+            -- that investigation finished and this got left flipped to
+            -- true, which is itself a real bug a user actually hit: with
+            -- this on, "Only auto-catch a species the FIRST time (living
+            -- dex mode)" being checked in the GUI does nothing at all -
+            -- every shiny gets re-caught every time regardless, exactly
+            -- as if that checkbox (and the auto-catch exception list)
+            -- were silently ignored. Now permanently false - flip back to
+            -- true only for a deliberate one-off debugging session, never
+            -- leave it set afterward.
+            local DEBUG_CATCH_ANY_SHINY = false
 
             if Gui.stop_on_shiny(hud) then
                 -- Plain, filter-less blanket stop - manual mode,
@@ -3283,111 +4466,245 @@ function M.step()
                     return true
                 end
             else
-                Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Fleeing battle...")
+                -- Thief mode (wild.lua only - see chkThiefMode in
+                -- gui_module.lua): steal the wild Pokemon's held item
+                -- with whatever's in move slot 1, once per battle, then
+                -- flee exactly like normal. thiefUsedThisBattle (reset
+                -- per-battle in the EnemyWildmonInitialized hook) stops
+                -- this from re-triggering on every subsequent tick of
+                -- the same battle - it's a one-shot per encounter, not a
+                -- replacement for kill mode's repeated-attack loop above.
+                -- FIRST_MOVE_PP_ADDR specifically (not the OR-both-moves
+                -- `hasPP` used for kill mode just above) - if the move in
+                -- slot 1 (assumed to be Thief) has 0 PP, this is skipped
+                -- entirely and falls straight through to flee_battle()
+                -- below, i.e. exactly the same as if Thief mode had never
+                -- been turned on at all, per direct request.
+                local thiefHasPP = memory.readbyte(FIRST_MOVE_PP_ADDR) > 0
+                -- Thief-specific HP check (THIEF_LOW_HP_THRESHOLD, NOT
+                -- the shared hpSafe/LOW_HP_FLEE_THRESHOLD used by Kill
+                -- mode just above) - see that constant's own comment for
+                -- why Thief gets a separate, lower floor. No debounce
+                -- needed the way thiefHasPP gets below - HP isn't
+                -- documented to flicker the way PP was.
+                local thiefHpSafe = thief_has_safe_hp()
+                -- Set true only when a steal genuinely lands this turn -
+                -- read after flee_battle() below to decide whether to
+                -- run auto_unequip_thief_item() (see its own comment).
+                local thiefStoleItemThisTurn = false
 
-                -- Running from a wild battle in Gen 2 isn't guaranteed to
-                -- succeed - there's a chance-based escape formula, and a
-                -- failed attempt shows "Can't escape!" while the battle
-                -- continues (the enemy gets a turn). Selecting RUN and
-                -- pressing A only confirms we ATTEMPTED to flee, not that
-                -- it worked - so retry the whole sequence if the first
-                -- attempt's exit-wait times out, rather than assuming
-                -- success and getting stuck.
-                local escapeAttempts = 0
-                local fledSuccessfully = false
-                while not fledSuccessfully and escapeAttempts < 5 and memory.readbyte(species_addr) ~= 0 do
-                    escapeAttempts = escapeAttempts + 1
+                -- REMOVED (real user report, with hard proof): this used
+                -- to be a proactive "out of PP" notice fired once per
+                -- battle from a single speculative FIRST_MOVE_PP_ADDR
+                -- read, taken right when the battle menu loads - before
+                -- Thief has even decided to act this turn. A real report
+                -- showed it firing "Thief mode: move slot 1 is out of PP"
+                -- at 11:27, sandwiched directly between two genuinely
+                -- successful Thief steals (11:25 and 11:28) with nothing
+                -- done in between (no restart, no PP restored) - proving
+                -- this specific read can be flatly wrong even after the
+                -- 60-frame debounce it already had, not just wrong for a
+                -- single flicker frame. Three separate attempts to fix
+                -- this (rounds 5, 9, 10 - tighter debounce, re-arm on
+                -- refill, debounced re-arm) all failed to make this
+                -- specific speculative read trustworthy enough to inform
+                -- the user with.
+                --
+                -- Rather than keep guessing at a fourth debounce, this
+                -- notice is removed entirely. It was never load-bearing
+                -- for Thief's actual behavior - thiefHasPP (declared
+                -- above) still gates whether Thief attempts to act this
+                -- battle at all
+                -- (an occasional misread here just means Thief quietly
+                -- skips one battle's steal and tries again normally next
+                -- battle, exactly as if Thief mode were off for that one
+                -- encounter - no different from before, and self-
+                -- corrects immediately). The genuinely reliable PP-
+                -- depletion detection - and the notification the user
+                -- actually wants - already lives in do_thief_turn()
+                -- itself: the pre-attack re-check right before pressing A
+                -- on move slot 1, and the post-attack ROM-hook-driven
+                -- catch (moveSelectScreenOpen bouncing back to the
+                -- move-select screen) - both of which only ever check PP
+                -- at the exact moment it's actually about to be spent,
+                -- not speculatively at battle start, and neither has ever
+                -- been shown to false-positive the way this one just was.
 
-                    -- Don't rely on have_battle_controls (hook-driven)
-                    -- for retries - the hook watches for the menu
-                    -- LOADING, and after "Can't escape!" the game may
-                    -- return to the same already-open menu without a
-                    -- full reload event, meaning the hook might never
-                    -- re-fire and have_battle_controls could stay false
-                    -- forever. Check the cursor position directly
-                    -- instead, which doesn't depend on any hook at all.
-                    local waitForControlsFrames = 0
-                    while memory.readbyte(species_addr) ~= 0 and waitForControlsFrames < 300 do
-                        local cy0 = memory.readbyte(MENU_CURSOR_Y)
-                        local cx0 = memory.readbyte(MENU_CURSOR_X)
-                        if (cy0 == FIGHT_CURSOR.y or cy0 == RUN_CURSOR.y) and (cx0 == FIGHT_CURSOR.x or cx0 == RUN_CURSOR.x) then
-                            have_battle_controls = true
-                            break
-                        end
-                        emu.frameadvance()
-                        press_button("B")
-                        waitForControlsFrames = waitForControlsFrames + 1
+                -- Low-HP notice - user-requested (same once-per-battle
+                -- check latch via thiefLowHpCheckedThisBattle, same
+                -- one-time-ever notify latch via thiefLowHpNotified as
+                -- the old PP notice used to have, before that one was
+                -- removed above for being unreliable) so the user gets
+                -- told,
+                -- once, that Thief is being skipped for low HP instead of
+                -- it just silently falling through to a normal flee every
+                -- time this comes up for the rest of the session.
+                if Gui.thief_mode_enabled(hud) and have_battle_controls and not thiefLowHpCheckedThisBattle then
+                    thiefLowHpCheckedThisBattle = true
+                    if not thiefHpSafe and not thiefLowHpNotified then
+                        thiefLowHpNotified = true
+                        print("Thief mode: HP is below 20% - pausing Thief steals until it recovers (healing/switching/etc). Continuing to hunt normally in the meantime.")
+                        send_alert("Thief mode: HP below 20% - pausing steals until it recovers. Still hunting normally in the meantime.", COLOR_BLUE)
                     end
+                end
 
-                    local nav_attempts = 0
-                    local ran_away = false
-                    while have_battle_controls and memory.readbyte(species_addr) ~= 0 do
-                        local cy = memory.readbyte(MENU_CURSOR_Y)
-                        local cx = memory.readbyte(MENU_CURSOR_X)
+                -- currentItem ~= 0 is checked separately from (and
+                -- before) the filter match - species_matches_filter
+                -- returns true unconditionally for a blank filter
+                -- ("steal any item"), which without this would waste a
+                -- Thief PP swinging at a Pokemon holding nothing at all
+                -- to steal. A specific filter already can't match item
+                -- ID 0 either way, but this makes the "nothing to steal"
+                -- case explicit and correct for both filter modes.
+                if Gui.thief_mode_enabled(hud) and not thiefUsedThisBattle and thiefHasPP and thiefHpSafe
+                    and currentItem ~= 0
+                    and species_matches_filter(Gui.thief_item_filter(hud), currentItem, currentItemName) then
+                    thiefUsedThisBattle = true
+                    Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Using Thief...")
 
-                        if cy == RUN_CURSOR.y and cx == RUN_CURSOR.x then
-                            vprint(string.format("Pressing A to select RUN (Y=%d X=%d)", cy, cx))
-                            press_button("A")
-                            ran_away = true
+                    -- Keep using Thief across MULTIPLE turns of this same
+                    -- battle (no flee_battle() in between) until the
+                    -- steal actually lands or it's no longer safe/
+                    -- possible to keep trying - user-requested, since a
+                    -- wild Pokemon using Protect/Detect (or a plain miss)
+                    -- previously caused an immediate flee with the item
+                    -- never actually stolen, even though Thief still had
+                    -- PP left to just try again. Protect's own success
+                    -- chance drops sharply with each consecutive use in
+                    -- Gen 2, so it reliably fails within a few turns -
+                    -- and Thief's own PP (10 by default, before any PP
+                    -- Ups) naturally caps how many attempts are even
+                    -- possible via the PP check below, so
+                    -- THIEF_MAX_RETRY_ATTEMPTS is just a defensive
+                    -- backstop, not the real limiter.
+                    local THIEF_MAX_RETRY_ATTEMPTS = 15
+                    local thiefAttempts = 0
+                    while true do
+                        thiefAttempts = thiefAttempts + 1
+                        local thiefResult = do_thief_turn()
+                        if thiefResult == "stuck" then
+                            Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount,
+                                "Stopped - Thief attack didn't return to the battle menu")
+                            send_alert("\xE2\x9A\xA0\xEF\xB8\x8F Grinding stopped: Thief mode's attack didn't return to the battle menu in time (the wild Pokemon may have fainted from it, or something else needs your input). Handle it manually, then resume.", COLOR_RED)
+                            return true
+                        elseif thiefResult == "skipped" then
+                            -- The battle menu wasn't interactive in time this
+                            -- attempt (see do_thief_turn's own comment) -
+                            -- no attack actually happened, so there's
+                            -- nothing to check the item for, and nothing
+                            -- gained by immediately retrying. Fall
+                            -- straight through to the normal flee below,
+                            -- same as if Thief mode were off this
+                            -- encounter.
+                            vprint("Thief: skipped this attempt (battle menu wasn't ready in time) - continuing normally")
+                            break
+                        elseif thiefResult == "fainted" then
+                            -- The wild Pokemon fainted from this very
+                            -- attack, ending the battle immediately -
+                            -- do_thief_turn() already confirmed this is a
+                            -- clean, harmless battle end (see its own
+                            -- comment), not a stuck bot. Previously this
+                            -- case fell through to do_thief_turn()
+                            -- reporting "stuck" instead (no species_addr
+                            -- exit condition existed at all), which is
+                            -- the exact false-positive stop a real user
+                            -- reported - restarting the bot afterward
+                            -- "fixed" it only because the STARTUP
+                            -- held-item check happened to clean up
+                            -- whatever Thief had already stolen.
+                            --
+                            -- The enemy's own item_addr/species_addr
+                            -- reads go stale the instant the battle
+                            -- state clears, so they can't tell us
+                            -- whether the steal landed before the KO -
+                            -- check the LEAD's own held item directly
+                            -- instead (get_lead_held_item(), the same
+                            -- WRAM read the startup check already
+                            -- trusts), which is unaffected by the battle
+                            -- having ended.
+                            local leadItemAfterThief = get_lead_held_item()
+                            if leadItemAfterThief ~= 0 then
+                                local leadItemName = get_item_name(leadItemAfterThief)
+                                print(string.format("Thief: stole %s from %s right as it fainted from the attack!", leadItemName, currentSpeciesName))
+                                -- User-requested: notifying Discord on
+                                -- every single steal turned into spam for
+                                -- fast grinding sessions - now gated on
+                                -- the "Notify on Discord for every item
+                                -- stolen" checkbox (Advanced Settings,
+                                -- defaults to on). The console print
+                                -- above and thiefStoleItemThisTurn below
+                                -- both stay unconditional either way -
+                                -- this only ever suppresses the Discord
+                                -- message itself.
+                                if Gui.thief_notify_enabled(hud) then
+                                    send_catch_notification(string.format("Thief: stole %s from %s right as it fainted!", leadItemName, currentSpeciesName),
+                                        COLOR_GREEN, currentSpecies, false, leadItemName)
+                                end
+                                thiefStoleItemThisTurn = true
+                            else
+                                vprint(string.format("Thief: %s fainted from the attack, but the lead isn't holding anything afterward - the steal likely didn't land (or there was nothing to steal)", currentSpeciesName))
+                            end
                             break
                         else
-                            nav_attempts = nav_attempts + 1
-                            if nav_attempts > 12 then
-                                vprint("Navigation stuck after 12 attempts - backing out with B and stopping this attempt")
-                                press_button("B")
+                            -- item_addr tracks the enemy's held item live, so
+                            -- re-reading it now (after the attack resolved)
+                            -- tells us directly whether the steal actually
+                            -- landed, rather than guessing from animation/text.
+                            local thiefSpecies = memory.readbyte(species_addr)
+                            local thiefSpeciesName = get_pokemon_name(thiefSpecies)
+                            local itemAfterThief = memory.readbyte(item_addr)
+                            if currentItem ~= 0 and itemAfterThief == 0 then
+                                print(string.format("Thief: stole %s from %s!%s", currentItemName, thiefSpeciesName,
+                                    thiefAttempts > 1 and string.format(" (took %d attempts - something was blocking earlier steals, e.g. Protect)", thiefAttempts) or ""))
+                                -- Gated the same way as the fainted-on-
+                                -- attack steal case above - see that
+                                -- comment for the full rationale.
+                                if Gui.thief_notify_enabled(hud) then
+                                    send_catch_notification(string.format("Thief: stole %s from %s!", currentItemName, thiefSpeciesName),
+                                        COLOR_GREEN, thiefSpecies, false, currentItemName)
+                                end
+                                thiefStoleItemThisTurn = true
                                 break
-                            end
-                            local next_input = navigate_to_menu_option(RUN_CURSOR)
-                            vprint(string.format("Y=%d X=%d -> pressing %s", cy, cx, next_input))
-                            press_and_wait_for_cursor_change(next_input, 30)
-                            local ny, nx = memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)
-                            if ny == cy and nx == cx then
-                                vprint(string.format("  no change after %s (still Y=%d X=%d) - possible timeout", next_input, ny, nx))
+                            elseif currentItem == 0 then
+                                vprint("Thief: used, but the wild Pokemon wasn't holding anything to steal")
+                                break
+                            else
+                                vprint(string.format("Thief: attempt %d used, but %s is still holding %s (likely blocked by Protect/Detect, or a miss)",
+                                    thiefAttempts, thiefSpeciesName, currentItemName))
+                                -- Decide whether it's still worth using
+                                -- Thief again THIS SAME battle, rather
+                                -- than looping unconditionally:
+                                if memory.readbyte(species_addr) == 0 then
+                                    vprint("Thief: battle already ended (wild Pokemon fled/fainted on its own) - nothing more to do")
+                                    break
+                                elseif not thief_has_safe_hp() then
+                                    print("Thief: giving up further attempts this battle - HP below 20%, fleeing now")
+                                    break
+                                elseif memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 then
+                                    vprint("Thief: out of PP for move slot 1 - can't try again this battle")
+                                    break
+                                elseif thiefAttempts >= THIEF_MAX_RETRY_ATTEMPTS then
+                                    print(string.format("Thief: giving up after %d attempts this battle - moving on", thiefAttempts))
+                                    break
+                                end
+                                -- Otherwise: loop again and use Thief once
+                                -- more, same battle, no flee in between.
                             end
                         end
                     end
-
-                    if ran_away then
-                        vprint(string.format("Ran away (attempt %d) - clearing exit text until battle actually ends", escapeAttempts))
-                        local exitWaitFrames = 0
-                        while memory.readbyte(species_addr) ~= 0 and exitWaitFrames < 180 do
-                            emu.frameadvance()
-                            press_button("B")
-                            exitWaitFrames = exitWaitFrames + 1
-                        end
-                        if memory.readbyte(species_addr) == 0 then
-                            fledSuccessfully = true
-                            Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Escaped, wrapping up...")
-                        else
-                            vprint(string.format("Escape attempt %d timed out (Can't escape!, most likely) - retrying", escapeAttempts))
-                        end
-                        have_battle_controls = false
-                    end
                 end
-
-                if not fledSuccessfully and memory.readbyte(species_addr) ~= 0 then
-                    print(string.format("WARNING: could not escape after %d attempts - continuing anyway", escapeAttempts))
+                flee_battle()
+                if thiefStoleItemThisTurn then
+                    -- Gen 2 Thief hands the item to the Thief user
+                    -- itself, not the Bag - see
+                    -- auto_unequip_thief_item's own comment. Runs after
+                    -- flee_battle() has already fully returned (species
+                    -- confirmed 0, well past the post-battle flicker
+                    -- window per flee_battle's own 180-frame exit wait),
+                    -- so this always starts from a genuinely settled
+                    -- overworld state.
+                    auto_unequip_thief_item()
                 end
-
-                -- Same fix as do_catch_sequence's post-catch reset above
-                -- (see that comment for the full root-cause writeup),
-                -- applied here for the exact same reason: species_addr is
-                -- already documented to flicker non-zero for up to 90+
-                -- frames after a battle genuinely ends - including after
-                -- a successful flee, not just a catch. Confirmed via a
-                -- real user report: a shiny that doesn't match the
-                -- auto-catch filter correctly flees here, but without
-                -- this reset, the next M.step() tick(s) can sample one of
-                -- those stale nonzero reads, re-enter the "in battle"
-                -- shiny branch with shinyvalue still 1 (nothing else
-                -- clears it) and dv_flag_addr still left at 0x01 from the
-                -- battle that just ended, and re-send the exact same
-                -- "Shiny found" Discord embed - observed as ~5 duplicate
-                -- notifications for one shiny. A real new shiny always
-                -- re-sets shinyvalue via shiny() inside the ROM hook, so
-                -- clearing it here can never suppress a genuine one.
-                shinyvalue = 0
-                shinyLatchedThisBattle = false
             end
         end
     end

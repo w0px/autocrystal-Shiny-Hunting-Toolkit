@@ -439,20 +439,57 @@ local SUDOWOODO_HOLD_FRAMES = 12
 -- thousands of times in a row back to back, only ever changing at
 -- (roughly) a 30-minute reroll boundary.
 --
--- BATTLE_TARGET_EXPECTED_SPECIES is what makes it safe to give Lapras a
--- pre-first-press entropy injection despite the "never split before the
--- first press" rule elsewhere (see that comment for the full reasoning -
--- the risk is a stray encounter firing during that blind window and
--- getting misread as real data). Any dropdown target listed here gets
+-- BATTLE_TARGET_EXPECTED_SPECIES: any dropdown target listed here gets
 -- its battle-hook encounter checked against the expected species before
--- being trusted - a mismatch is silently discarded and retried instead
--- of recorded, the same protection the Gift Pokemon path already has for
--- Eevee/Shuckle/Spearow. This is what closes the loop and makes the
--- pre-first-press split safe specifically for the target(s) listed here,
--- without touching the shared safety rule that still protects every
--- other target with real dialogue to mash through.
+-- being trusted - a mismatch (or species 0/255) is silently discarded
+-- and retried instead of recorded, the same protection the Gift Pokemon
+-- path already has for Eevee/Shuckle/Spearow.
+--
+-- NOTE: this table is validation-only as of the Celebi addition below -
+-- it does NOT by itself mean a target skips its dialogue-mash phase. See
+-- NO_DIALOGUE_BATTLE_TARGETS just below for that separate, narrower
+-- concern (which Lapras alone needs and Celebi must NOT get).
+--
+-- Celebi added after a real user report: the GUI/Stats showed garbage
+-- like "Unknown #0" and a leftover "Mr. Mime [Card Key]" reading that
+-- never once appeared in the console's own log. Root cause: the
+-- EnemyWildmonInitialized hook's unconditional, unvalidated print (near
+-- the top of this file) was always correct in their case, since it's a
+-- raw snapshot taken the instant the hook fires - but the LATER
+-- settle-loop re-read in pendingEncounterUpdate handling (which is what
+-- actually gets recorded via Stats.record_encounter/
+-- Gui.update_last_encounter) sometimes caught a transient bad value a
+-- few frames afterward, and with no validation table entry for Celebi,
+-- nothing discarded it. Worse than cosmetic: that same late re-read also
+-- re-derives shinyvalue (shiny(atkdef, spespc), called again on the
+-- settled bytes) - a bad late read could silently zero out a genuine
+-- shiny's shinyvalue right before it would have been recorded. Lapras
+-- already proved this exact class of bug matters (see its own comment
+-- history below); Celebi just never got the fix applied since it's a
+-- non-vanilla addition that was never put through the same testing.
 local BATTLE_TARGET_EXPECTED_SPECIES = {
     ["Lapras"] = "Lapras",
+    ["Celebi"] = "Celebi",
+}
+
+-- Deliberately a SEPARATE table from BATTLE_TARGET_EXPECTED_SPECIES
+-- above, even though the only two targets involved overlap. That table
+-- answers "does this target's battle-hook reading get validated against
+-- a known species" (Lapras AND Celebi, now). This one answers the much
+-- narrower "does this target have ZERO dialogue before the battle, so
+-- even the very first press needs its own blind entropy injection" -
+-- true only for Lapras, whose script goes straight from faceplayer to
+-- startbattle with no textbox at all (confirmed against
+-- UnionCaveB2F.asm). Celebi has a real multi-page shrine cutscene
+-- (CELEBI_HOLD_FRAMES) that still needs the normal per-tick dialogue-mash
+-- fallback further down in the press-dispatch chain - routing it through
+-- the no-dialogue branch instead (by mistakenly keying that branch off
+-- BATTLE_TARGET_EXPECTED_SPECIES, which now also contains Celebi) would
+-- skip that cutscene handling and very likely break Celebi from
+-- triggering at all. Keep this table limited to genuinely dialogue-free
+-- targets only.
+local NO_DIALOGUE_BATTLE_TARGETS = {
+    ["Lapras"] = true,
 }
 
 -- Suicune (Tin Tower 1F, the real "loadwildmon SUICUNE, 40 / startbattle"
@@ -1538,6 +1575,7 @@ local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
     "chkKillMode", "txtKillFilter",
+    "chkThiefMode", "txtThiefFilter",
     "chkStopOnShiny",
     "chkTrueRandomness",
 }
@@ -2937,19 +2975,22 @@ function M.step()
         dribble_entropy_until_hook(DIALOGUE_MASH_CAP, DIALOGUE_MASH_CAP, function() press_button("Up", SUICUNE_WALK_HOLD_FRAMES) end)
         firstPressPending = false
         return false
-    elseif StaticTargetDropdown and BATTLE_TARGET_EXPECTED_SPECIES[forms.gettext(StaticTargetDropdown)] then
+    elseif StaticTargetDropdown and NO_DIALOGUE_BATTLE_TARGETS[forms.gettext(StaticTargetDropdown)] then
         -- Deliberate, narrow exception to the "never before the first
-        -- press" rule above - see BATTLE_TARGET_EXPECTED_SPECIES's
-        -- declaration for the full reasoning. Targets listed here (only
-        -- Lapras today) have no dialogue at all, so the battle starts
-        -- from this exact first press and normal splitting (which only
-        -- ever starts on the SECOND press) never gets a chance to fire -
-        -- every reset was silently 100% deterministic. Safe here
-        -- specifically because the species-validation guard in
-        -- pendingEncounterUpdate above discards and retries anything
-        -- that isn't genuinely the expected species, so a stray
-        -- encounter firing during this blind window can no longer get
-        -- misread as real data the way the rule above exists to prevent.
+        -- press" rule above - see NO_DIALOGUE_BATTLE_TARGETS's
+        -- declaration for the full reasoning (and why this is now keyed
+        -- off that table specifically, NOT BATTLE_TARGET_EXPECTED_SPECIES,
+        -- now that Celebi is in the latter but must never reach this
+        -- branch). Targets listed here (only Lapras today) have no
+        -- dialogue at all, so the battle starts from this exact first
+        -- press and normal splitting (which only ever starts on the
+        -- SECOND press) never gets a chance to fire - every reset was
+        -- silently 100% deterministic. Safe here specifically because the
+        -- species-validation guard in pendingEncounterUpdate above
+        -- discards and retries anything that isn't genuinely the expected
+        -- species, so a stray encounter firing during this blind window
+        -- can no longer get misread as real data the way the rule above
+        -- exists to prevent.
         --
         -- Previously a single blind split, "unchanged since it was never
         -- reported broken" - but Lapras has its OWN documented history of

@@ -49,6 +49,7 @@ local DISABLEABLE_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
     "chkKillMode", "txtKillFilter",
+    "chkThiefMode", "txtThiefFilter", "chkThiefNotify",
     "chkTrueRandomness",
     "chkStopPerfect", "chkStopNegative",
     "chkAutoCatch",
@@ -128,6 +129,9 @@ local function save_advanced_settings(w)
     w._savedCustomHpTargetText = forms.gettext(w.txtCustomHpTarget)
     w._savedVerbose = forms.ischecked(w.chkVerbose)
     w._savedTrueRandomness = forms.ischecked(w.chkTrueRandomness)
+    w._savedThiefModeEnabled = forms.ischecked(w.chkThiefMode)
+    w._savedThiefFilterText = forms.gettext(w.txtThiefFilter)
+    w._savedThiefNotifyEnabled = forms.ischecked(w.chkThiefNotify)
 end
 
 local function save_autocatch_settings(w)
@@ -190,6 +194,9 @@ function M.open_advanced_settings(w)
         w.txtCustomHpTarget = nil
         w.chkVerbose = nil
         w.chkTrueRandomness = nil
+        w.chkThiefMode = nil
+        w.txtThiefFilter = nil
+        w.chkThiefNotify = nil
     end)
     -- Same fix as the main shell window - see its own comment for the
     -- full reasoning (a real user report of controls being cut off with
@@ -204,6 +211,45 @@ function M.open_advanced_settings(w)
     w.txtItemFilter = forms.textbox(advForm, w._savedItemFilterText or "", 190, 20, nil, 165, y - 2)
     y = y + 20
     w.lblItemFilterHint = forms.label(advForm, "(ID or name, blank = any item)", 28, y, 380, 16)
+    y = y + 30
+
+    -- Available for every module now (kill-mode-style battle interaction
+    -- requires an actual wild battle to attack in, which static/egg/
+    -- gamecorner/starters genuinely don't have - they just receive the
+    -- Pokemon directly with no FIGHT/RUN menu at all - so the checkbox
+    -- itself still shows there, but stays greyed out via those modules'
+    -- own DISABLED_FIELDS/reconfigure calls, same as Kill Mode already
+    -- is for them). Assumes the lead Pokemon already has Thief taught in
+    -- move slot 1 - this doesn't teach or verify the move itself, it
+    -- just uses whatever's in that slot every time PP allows, on the
+    -- assumption the user set that up themselves. If move slot 1 has 0
+    -- PP, the module skips this entirely and behaves exactly like Thief
+    -- mode was never turned on (falls straight through to its normal
+    -- flee behavior) - it does NOT fall back to a different move the way
+    -- Kill Mode/Catch-mode's attack turns do, since a random second move
+    -- stealing nothing is not what "steal held items" means.
+    w.chkThiefMode = forms.checkbox(advForm, "Steal held item with Thief (move slot 1), then flee", 10, y)
+    forms.setproperty(w.chkThiefMode, "Width", 380)
+    if w._savedThiefModeEnabled then forms.setproperty(w.chkThiefMode, "Checked", true) end
+    y = y + 22
+    w.lblThiefFilter = forms.label(advForm, "Only steal these items (comma-sep, blank=any):", 28, y, 380, 16)
+    y = y + 18
+    w.txtThiefFilter = forms.textbox(advForm, w._savedThiefFilterText or "", 320, 20, nil, 28, y)
+    y = y + 22
+
+    -- User-requested: every successful Thief steal used to always send a
+    -- Discord notification unconditionally, which turned into unwanted
+    -- spam for anyone grinding fast enough to rack up steals every
+    -- minute or two. Defaults to CHECKED (notify, matching the original
+    -- always-on behavior) so nobody's existing setup goes silent just
+    -- from updating - _savedThiefNotifyEnabled is only ever nil before
+    -- the very first time this popup gets saved with this checkbox
+    -- present, so "~= false" (rather than the plain truthy check every
+    -- other checkbox here uses) is what makes that first-run default
+    -- land on checked instead of unchecked.
+    w.chkThiefNotify = forms.checkbox(advForm, "Notify on Discord for every item stolen", 10, y)
+    forms.setproperty(w.chkThiefNotify, "Width", 380)
+    if w._savedThiefNotifyEnabled ~= false then forms.setproperty(w.chkThiefNotify, "Checked", true) end
     y = y + 30
 
     w.chkOverrideCritSafety = forms.checkbox(advForm, "Override crit-safety - use a custom HP% target instead", 10, y)
@@ -495,6 +541,12 @@ function M.create(existingForm, yOffset, disabledFields)
     widgets.txtKillFilter   = forms.textbox(existingForm, "", 320, 20, nil, 28, y)
     y = y + 34
 
+    -- Thief mode itself now lives in Advanced Settings (see
+    -- open_advanced_settings below) instead of cluttering the main form -
+    -- it's a niche wild.lua-only option, same reasoning as Auto-Catch/
+    -- Discord/the rest of Advanced Settings already living in their own
+    -- popups rather than here.
+
     widgets.lblSepAutoCatch = forms.label(existingForm, SEPARATOR, 10, y, 340, 16)
     y = y + 18
 
@@ -772,6 +824,64 @@ end
 
 function M.kill_species_filter(w)
     local raw = forms.gettext(w.txtKillFilter)
+    if raw == nil or raw:match("^%s*$") then
+        return nil
+    end
+    local tokens = {}
+    for token in raw:gmatch("[^,]+") do
+        local trimmed = token:match("^%s*(.-)%s*$")
+        if trimmed ~= "" then
+            table.insert(tokens, trimmed)
+        end
+    end
+    if #tokens == 0 then return nil end
+    return tokens
+end
+
+-- Same simple non-popup pattern as kill_non_shiny/kill_species_filter
+-- above (chkThiefMode/txtThiefFilter both live on the always-visible
+-- main form, never nil once created, so no saved-fallback needed).
+-- Thief mode now lives in Advanced Settings (a lazily-created popup, see
+-- open_advanced_settings) instead of the always-visible main form, so it
+-- needs the same nil-safe saved-value fallback every other Advanced/
+-- Auto-Catch/Discord getter in this file uses - the widget only exists
+-- while that popup happens to be open.
+function M.thief_mode_enabled(w)
+    if w.chkThiefMode == nil then return w._savedThiefModeEnabled or false end
+    local enabled = forms.ischecked(w.chkThiefMode)
+    w._savedThiefModeEnabled = enabled
+    return enabled
+end
+
+-- Same nil-safe saved-value fallback pattern as thief_mode_enabled above,
+-- but defaults to true (notify) rather than false when nothing's been
+-- saved yet - see this checkbox's own creation comment for why (matches
+-- the original always-on behavior for anyone who hasn't touched this new
+-- setting).
+function M.thief_notify_enabled(w)
+    if w.chkThiefNotify == nil then
+        if w._savedThiefNotifyEnabled == nil then return true end
+        return w._savedThiefNotifyEnabled
+    end
+    local enabled = forms.ischecked(w.chkThiefNotify)
+    w._savedThiefNotifyEnabled = enabled
+    return enabled
+end
+
+-- Blank = steal any held item. Otherwise only bother using Thief when
+-- the wild Pokemon's held item matches one of these (name or ID,
+-- comma-separated) - same token format/parsing as every other filter
+-- in this file, matched via wild.lua's own species_matches_filter
+-- (already generic over "id + name", used the same way for the
+-- Auto-Catch-on-item filter).
+function M.thief_item_filter(w)
+    local raw
+    if w.txtThiefFilter == nil then
+        raw = w._savedThiefFilterText
+    else
+        raw = forms.gettext(w.txtThiefFilter)
+        w._savedThiefFilterText = raw
+    end
     if raw == nil or raw:match("^%s*$") then
         return nil
     end
