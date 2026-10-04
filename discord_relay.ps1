@@ -1,5 +1,5 @@
 param(
-    [string]$DiscordWebhookUrl = "YOUR WEBHOOK"
+    [string]$DiscordWebhookUrl = "YOURWEBHOOKHERE"
 )
 
 Add-Type -AssemblyName System.Web
@@ -42,7 +42,43 @@ while ($listener.IsListening) {
         # emoji), which silently turned it into "?" here even though it
         # arrived correctly from the sender.
         $utf8Bytes = [System.Text.Encoding]::UTF8.GetBytes($jsonPayload)
-        Invoke-RestMethod -Uri $DiscordWebhookUrl -Method Post -Body $utf8Bytes -ContentType "application/json; charset=utf-8" | Out-Null
+
+        # wait=true: a real report showed a "caught!" embed rendered
+        # ABOVE (i.e. apparently delivered before) its own earlier
+        # "found! attempting to catch" embed for the same encounter, even
+        # though wild.lua/fishing.lua/headbutt.lua send them from a single
+        # Lua thread strictly in order, and comm.httpPost blocks until
+        # this relay responds. Root cause traced to Discord's own webhook
+        # API: WITHOUT ?wait=true it replies 204 as soon as the POST is
+        # merely accepted, before the message is actually created - so two
+        # embeds fired moments apart can finish being created on Discord's
+        # side out of order even though they were POSTed in order (per
+        # Discord's docs: wait=true "waits for server confirmation of
+        # message send before response"). Since this relay only handles
+        # one request at a time (single-threaded GetContext() loop below)
+        # and doesn't reply "ok" to BizHawk until this call returns, adding
+        # wait=true here means the SECOND embed's POST to Discord can't
+        # even be issued until the first one is confirmed fully created -
+        # closing the one remaining gap in the ordering guarantee.
+        # NOTE: must use ${DiscordWebhookUrl} (curly-braced), NOT bare
+        # $DiscordWebhookUrl, immediately before a literal "?" or "&" here.
+        # CONFIRMED via direct reproduction in PowerShell 7.4: inside a
+        # double-quoted string, "$DiscordWebhookUrl?wait=true" silently
+        # evaluates to just "=true" - PowerShell's parser swallows the
+        # variable reference AND the "?wait" text together instead of
+        # stopping the variable name at "?" and treating the rest as
+        # literal (which is what happens correctly with the curly-braced
+        # form). That silently turned every single relayed message since
+        # this wait=true fix was added into a request to the URI "=true" -
+        # which fails to parse (no hostname), so every notification was
+        # failing with "Invalid URI: The hostname could not be parsed"
+        # with NOTHING actually reaching Discord. Verified fixed by
+        # printing/parsing the resulting URI directly - curly braces make
+        # PowerShell stop the variable name exactly at the "}" and treat
+        # everything after it (the "?wait=true" or "&wait=true") as plain
+        # literal text, same as intended originally.
+        $requestUri = if ($DiscordWebhookUrl -match '\?') { "${DiscordWebhookUrl}&wait=true" } else { "${DiscordWebhookUrl}?wait=true" }
+        Invoke-RestMethod -Uri $requestUri -Method Post -Body $utf8Bytes -ContentType "application/json; charset=utf-8" | Out-Null
         Write-Host "Forwarded to Discord successfully."
     } catch {
         Write-Host "Failed to forward to Discord: $_"
