@@ -1237,8 +1237,20 @@ end
 --                out of throws, navigation stuck, Stop was pressed). The
 --                caller should stop without reloading, same as it would
 --                have without Auto-Catch at all.
-local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl)
-    local label = isShiny and "Shiny " or ""
+-- labelOverride: optional - lets a non-shiny catch still get a
+-- distinguishing prefix on every single notification this function sends
+-- (found/caught/every failure mode all read off the same `label` below),
+-- without touching isShiny itself - isShiny stays reserved for the
+-- actual shiny-specific behavior. Added for Perfect/Perfect Negative DV
+-- catches per a real user request: those were previously only called out
+-- in a console-only print right before this function ran, so the Discord
+-- "found! Attempting to catch it automatically." and "caught
+-- successfully" messages looked identical to any other ordinary
+-- auto-catch (item match) - no way to tell from Discord alone that it
+-- was a Perfect DV roll. Mirrors the identical fix in wild.lua/
+-- fishing.lua/headbutt.lua.
+local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labelOverride)
+    local label = labelOverride or (isShiny and "Shiny " or "")
     print(label .. "found! Starting auto-catch sequence...")
 
     local caughtSpeciesId = memory.readbyte(species_addr)
@@ -2771,13 +2783,22 @@ function M.step()
                     or (isPerfectNegativeDVs and Gui.catch_on_perfect_negative(hud)))
 
             if catchAllowedByItem or catchAllowedByPerfect then
+                -- Only set for the Perfect-DV branch below - see
+                -- do_catch_sequence's labelOverride param for why. Left
+                -- nil for the item-match branch so that path keeps its
+                -- existing fully-generic notifications unchanged.
+                local perfectDVLabel = nil
                 if catchAllowedByItem then
                     print(string.format("%s found holding %s - auto-catching (item match, not shiny).", speciesName, itemName))
                 else
                     local perfectLabel = isPerfectDVs and "Perfect DVs (15/15/15/15)" or "Perfect Negative DVs (0/0/0/0)"
                     print(string.format("%s found with %s - auto-catching.", speciesName, perfectLabel))
+                    -- Short, "Shiny "-style prefix (not the full
+                    -- "(15/15/15/15)" detail above) for the Discord-facing
+                    -- messages.
+                    perfectDVLabel = isPerfectDVs and "Perfect DV " or "Perfect Negative DV "
                 end
-                local outcome = do_catch_sequence(false)
+                local outcome = do_catch_sequence(false, nil, nil, perfectDVLabel)
                 if outcome == "caught" then
                     Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
                         "Caught via auto-catch! Stopped.")

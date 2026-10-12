@@ -1801,8 +1801,20 @@ local CATCH_HP_TARGET_PERCENT = 0.40
 -- successful shiny auto-catch previously sent 3 Discord messages (lean
 -- "found/attempting", lean "caught successfully", and a redundant
 -- detailed "Shiny Found!" sandwiched after both) - this keeps it to 2.
-local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl)
-    local label = isShiny and "Shiny " or ""
+-- labelOverride: optional - lets a non-shiny catch still get a
+-- distinguishing prefix on every single notification this function sends
+-- (found/caught/every failure mode all read off the same `label` below),
+-- without touching isShiny itself - isShiny stays reserved for the
+-- actual shiny-specific behavior (Stats.record_catch, the shinyEmbedFields
+-- branch above). Added for Perfect/Perfect Negative DV catches per a
+-- real user request: those were previously only called out in a
+-- console-only print right before this function ran, so the Discord
+-- "found! Attempting to catch it automatically." and "caught
+-- successfully" messages looked identical to any other ordinary
+-- auto-catch (living dex, item match) - no way to tell from Discord
+-- alone that it was a Perfect DV roll.
+local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labelOverride)
+    local label = labelOverride or (isShiny and "Shiny " or "")
     print(label .. "found! Starting auto-catch sequence...")
 
     -- Captured here, early, while species_addr is still known-reliable
@@ -3017,6 +3029,27 @@ function M.step()
     if pendingEncounterUpdate then
         pendingEncounterUpdate = false
 
+        -- Defensive guard added after a real crash report (wild.lua, same
+        -- architecture - see that file's copy of this exact comment for
+        -- the full writeup): NLua.Exceptions.LuaScriptException: attempt
+        -- to perform arithmetic on a nil value (upvalue 'atkdef') -
+        -- occurring right after a successful Perfect DV / Perfect
+        -- Negative DV auto-catch. Root cause: the Perfect-DV catch cleanup
+        -- further down deliberately sets atkdef/spespc to nil right after
+        -- a successful catch (closes a real stale-data double-catch bug),
+        -- but do_catch_sequence()'s long internal emu.frameadvance() loop
+        -- gives a stray EnemyWildmonInitialized hook firing (species_addr
+        -- is documented elsewhere in this file to flicker non-zero for up
+        -- to 90+ frames after a battle genuinely ends) a window to set
+        -- pendingEncounterUpdate=true again before the catch sequence even
+        -- returns - leaving this block to run against nil atkdef/spespc
+        -- once the post-catch cleanup nils them regardless. Mirrors the
+        -- existing `if atkdef and spespc then` guard already used further
+        -- down around the isPerfectDVs/isPerfectNegativeDVs computation.
+        if atkdef == nil or spespc == nil then
+            print("Skipping a pending encounter update with no backing DV data (stray hook fire right after a catch) - waiting for the next real encounter instead of crashing.")
+        else
+
         -- NOTE: a "wait for dv_flag_addr, then re-read atkdef/spespc and
         -- recompute shininess" step was tried here across the last two
         -- fixes and REVERTED after confirmed real-world evidence (a user
@@ -3117,6 +3150,8 @@ function M.step()
             -- M.step() first, later in this same function, even though a
             -- "stopped" message had already been sent).
             return true
+        end
+
         end
     end
 
@@ -3428,7 +3463,15 @@ function M.step()
             -- above.
             local perfectLabel = isPerfectDVs and "Perfect DVs (15/15/15/15)" or "Perfect Negative DVs (0/0/0/0)"
             print(string.format("%s found with %s - auto-catching.", currentSpeciesName, perfectLabel))
-            local stillHunting = do_catch_sequence(false)
+            -- Short, "Shiny "-style prefix (not the full "(15/15/15/15)"
+            -- detail above) for the Discord-facing messages - see
+            -- do_catch_sequence's labelOverride param for why this is
+            -- needed at all: without it, every notification from here on
+            -- (found/caught/any failure) reads completely generic, with
+            -- no way to tell from Discord alone this was a Perfect DV
+            -- catch rather than an ordinary living-dex/item-match one.
+            local perfectDVLabel = isPerfectDVs and "Perfect DV " or "Perfect Negative DV "
+            local stillHunting = do_catch_sequence(false, nil, nil, perfectDVLabel)
             if not stillHunting then
                 -- Same root cause/fix as wild.lua's identical branch (see
                 -- that comment for the full writeup): species_addr can
