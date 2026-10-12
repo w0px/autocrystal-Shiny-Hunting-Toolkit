@@ -1,5 +1,5 @@
 param(
-    [string]$DiscordWebhookUrl = "YOURWEBHOOKHERE"
+    [string]$DiscordWebhookUrl = "ONETIMEIFORGOTTOREMOVEMYOWNWEBHOOK"
 )
 
 Add-Type -AssemblyName System.Web
