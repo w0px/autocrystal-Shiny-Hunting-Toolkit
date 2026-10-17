@@ -2233,7 +2233,28 @@ function M.step()
     -- gets the same exclusion for the same reason - its battle also comes
     -- exclusively through the EnemyWildmonInitialized hook, never a party
     -- addition, and it's just as exposed to this class of false positive.
-    local skipsGiftPath = StaticTargetDropdown and is_open_world_style_target(forms.gettext(StaticTargetDropdown))
+    --
+    -- Lapras and Celebi (BATTLE_TARGET_EXPECTED_SPECIES members) need the
+    -- exact same exclusion, for the exact same reason: their real catches
+    -- also only ever arrive through the EnemyWildmonInitialized hook +
+    -- do_catch_sequence, never a bare party-size bump, so this path should
+    -- never fire for them at all. CONFIRMED by a real user log: during a
+    -- Celebi hunt, right after a reroll_savestate_pool() reroll, a single
+    -- tick's currentPartySize read a stale elevated value (the same WRAM-
+    -- reuse class of bug described above) and this path read whatever
+    -- garbage sat at the new-slot offset as a stable "Feraligatr Atk:6
+    -- Def:10 Spe:10 Spc:10" - which happens to satisfy the shiny DV check.
+    -- Celebi isn't one of the three names this path's own species guard
+    -- checks a few lines down (Eevee/Shuckle/Spearow - the actual real
+    -- gift-receive targets), so nothing caught it: the bot declared a
+    -- false shiny and stopped the whole hunt. Reusing BATTLE_TARGET_EXPECTED_SPECIES
+    -- membership here (rather than a third table) because it already
+    -- identifies exactly "targets whose real encounter exclusively comes
+    -- through the battle hook" - anything in it by definition never has a
+    -- genuine gift-receive to miss by skipping this path too.
+    local staticTargetName = StaticTargetDropdown and forms.gettext(StaticTargetDropdown)
+    local skipsGiftPath = staticTargetName and
+        (is_open_world_style_target(staticTargetName) or BATTLE_TARGET_EXPECTED_SPECIES[staticTargetName] ~= nil)
     local currentPartySize = memory.readbyte(party_base_addr)
     if not skipsGiftPath and currentPartySize > partysizeBeforeReceiving then
         -- Debounce: a genuine gift-receive stays elevated; a one-frame
