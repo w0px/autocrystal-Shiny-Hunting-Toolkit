@@ -1,0 +1,27 @@
+# Personal files the bot creates while you use it - never commit these.
+
+# Settings (Discord webhook, ping ID, options) and the remembered BizHawk path
+autocrystal/modules/data/gui_settings.txt
+autocrystal/start_settings.txt
+
+# Lifetime stats, encounter and relay logs, savestates and backups
+autocrystal/modules/data/*.txt
+autocrystal/modules/data/*.State
+autocrystal/modules/data/*.bak
+autocrystal/modules/data/*.old
+autocrystal/modules/*.txt
+autocrystal/data/*_stats.txt
+
+# Sprites fetched by "Download sprites..." (download_sprites.ps1) and the
+# card versions made from them - everyone downloads their own
+autocrystal/data/sprites/normal/*.png
+!autocrystal/data/sprites/normal/egg.png
+autocrystal/data/sprites/shiny/
+autocrystal/data/sprites/animated/
+autocrystal/data/sprites/animated_card/
+autocrystal/data/sprites/animated_2x/
+*.part
+
+# BizHawk itself goes in the release zip, not the repository
+BizHawk/*
+!BizHawk/README.txt
