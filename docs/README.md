@@ -1,3 +1,11 @@
+
+
+<h1 align="center">autocrystal</h1>
+
+<p align="center">
+  <b>Pokémon G/S/C Automated Shiny & Perfect DV Hunting, Fishing, Headbutt, Egg, Static, Item & Level Grinding Toolkit</b><br>
+  <b>API Project:</b> <a href="https://github.com/w0px/w0p-autocrystal">w0p-autocrystal</a><br>
+  <b>Discord:</b> w0p
 <p align="center">
   <img
     src="https://github.com/user-attachments/assets/5c0f7928-15db-4d34-b5f5-3c53a770c37d"
@@ -6,30 +14,10 @@
     height="151">
 </p>
 
-<h1 align="center">autocrystal</h1>
 
-<p align="center">
-  <b>Pokémon G/S/C Automated Shiny & Perfect DV Hunting, Fishing, Headbutt, Egg, Static, Item & Level Grinding Toolkit</b><br>
-  <b>API Project:</b> <a href="https://github.com/w0px/w0p-autocrystal">w0p-autocrystal</a><br>
-  <b>Discord:</b> w0p
-</p>
-
-<p align="center">
-  <img src="images/launcher_running.png" alt="The autocrystal launcher while hunting - a shiny Nidorina was just found" width="380">
-</p>
-
-## Highlights
-
-- **One click to start** – `start.exe` opens a bundled, ready-to-go **BizHawk 2.11.1** with the launcher already loaded. Nothing else to download, install or configure.
-- **BizHawk and the launcher stay together** – they open side by side at the same height and move and resize as one unit.
-- **PokéGear-style launcher** – live counters, the last encounter's **animated sprite** (the shiny one for shinies), and your 8 most recent encounters.
-- **All options in four settings windows** – General, Auto-Catch, Discord and Advanced, **remembered between sessions**.
-- **Encounter Stats window** – lifetime and per-session numbers for every species you've met, with shiny odds and sprites.
-- **Discord, set up inside the launcher** – paste your webhook and you're done: shiny/catch/stop notifications with animated sprites, optional pings, and a Rich Presence card on your profile.
 
 ## Table of Contents
 
-- [Highlights](#highlights)
 - [Functions](#functions)
 - [How to Run](#how-to-run)
   - [Requirements](#requirements)
@@ -169,7 +157,6 @@
   <img src="images/launcher_idle.png" alt="The launcher right after start.exe, before a ROM is loaded" width="380">
 </p>
 
-That's all – no Lua Console, no batch files, no command-line flags. Everything below is optional.
 
 ### BizHawk and the Launcher Move as One
 
