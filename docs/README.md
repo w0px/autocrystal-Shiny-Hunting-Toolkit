@@ -49,7 +49,7 @@
   - [Savestate Slot Usage](#savestate-slot-usage)
   - [Simulating Randomness: RNG Manipulation in Deterministic Emulation](#simulating-randomness-rng-manipulation-in-deterministic-emulation)
   - [How Headbutt Trees Work in Gen 2](#how-headbutt-trees-work-in-gen-2)
-- [Roadmap](#roadmap)
+
 
 
 ## Functions
@@ -343,21 +343,21 @@ Randomness is handled automatically: every 30 minutes the bot re-rolls its reset
 - Place any Pokémon that knows **Surf** from your party into a PC box
 - Automatically handles phone calls and other interruptions (e.g. egg hatching)
 - Register your fishing rod on the Select button: Pack → Fishing Rod → SEL
-
+<p align="center">
 <img width="512" height="410" alt="Registering the rod on Select" src="https://github.com/user-attachments/assets/bc09182a-441e-47a0-9b63-3ea6fd400329" />
-
+</p>
 - Stand facing a water tile
-
+<p align="center">
 <img width="357" height="289" alt="Facing a water tile" src="https://github.com/user-attachments/assets/7ce8d36e-e236-4936-b828-6dc3e5480fb1" />
-
+</p>
 
 ## Headbutt Module
 
 - Automatically handles phone calls and other interruptions (e.g. egg hatching)
 - Stand facing a Headbutt tree and start the module – see [How Headbutt Trees Work in Gen 2](#how-headbutt-trees-work-in-gen-2) for picking a good tree
-
+<p align="center">
 <img width="504" height="475" alt="Facing a Headbutt tree" src="https://github.com/user-attachments/assets/4ab1a4a0-e977-4c50-8edd-9a53b675d07a" />
-
+</p>
 
 ## Egg Module
 
@@ -366,10 +366,11 @@ Randomness is handled automatically: every 30 minutes the bot re-rolls its reset
 - The bot resets from savestate slot 4 (changeable in the **Savestate slot** picker) until the egg holds a shiny, then stops
 - Walk it until it hatches
 
-<img width="356" height="243" alt="Standing in front of the egg NPC" src="https://github.com/user-attachments/assets/8e8dea01-cea2-42c9-978e-138991556db5" />
-
 <p align="center">
-  <img src="images/launcher_egg.png" alt="The Egg module after finding a shiny egg" width="380">
+<img width="356" height="243" alt="Standing in front of the egg NPC" src="https://github.com/user-attachments/assets/8e8dea01-cea2-42c9-978e-138991556db5" />
+</p>
+<p align="center">
+  <img src="images/launcher_egg.png" alt="The Egg module after finding a shiny egg" width="380" align="center">
 </p>
 
 
@@ -378,9 +379,9 @@ Randomness is handled automatically: every 30 minutes the bot re-rolls its reset
 - Pick the **Static target** in the launcher – Sudowoodo, Eevee, Shuckle, Spearow, Celebi, Lapras, Suicune, Snorlax, or **Static (open world)** for any other static encounter
 - Stand in front of the NPC handing you the Pokémon / in front of the static encounter, without interacting
 - The bot resets from savestate slot 5 (changeable in the **Savestate slot** picker), re-rolling it every 30 minutes just like the Starters module
-
+<p align="center">
 <img width="461" height="359" alt="Standing in front of a static encounter" src="https://github.com/user-attachments/assets/947e7e38-c76b-47b9-b353-cb216d83628d" />
-
+</p>
 
 ## Game Corner Module
 
@@ -396,9 +397,9 @@ Randomness is handled automatically: every 30 minutes the bot re-rolls its reset
 - Every **500 steps**, the friendship of all Pokémon in the party increases by **1**
 - Shows the friendship value of the **first Pokémon in the party** in the launcher
 - Sends a Discord notification once **220 friendship** is reached
-
+<p align="center">
 <img width="249" height="261" alt="Friendship progress" src="https://github.com/user-attachments/assets/9d475e9d-b7f9-41c9-930f-7672828408a8" />
-
+</p>
 
 # FAQ
 
@@ -845,6 +846,3 @@ TreeIndex = ⌊(Z·n + Z + n) / 5⌋ mod 10
 ```
 
 This result shows that, if a single row or column of trees is traversed, moving to an adjacent tree increases the tree's index by **(Z + 1) / 5** (modulo 10), where **Z** is the distance of that row or column from its origin edge (north or west). This means that the closer a row or column is to the edge, the slower the indices of those trees change as the row or column is traversed.
-
-
-## Roadmap
