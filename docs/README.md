@@ -1,11 +1,4 @@
 
-
-<h1 align="center">autocrystal</h1>
-
-<p align="center">
-  <b>Pokémon G/S/C Automated Shiny & Perfect DV Hunting, Fishing, Headbutt, Egg, Static, Item & Level Grinding Toolkit</b><br>
-  <b>API Project:</b> <a href="https://github.com/w0px/w0p-autocrystal">w0p-autocrystal</a><br>
-  <b>Discord:</b> w0p
 <p align="center">
   <img
     src="https://github.com/user-attachments/assets/5c0f7928-15db-4d34-b5f5-3c53a770c37d"
@@ -14,7 +7,16 @@
     height="151">
 </p>
 
+<h1 align="center">autocrystal</h1>
 
+<p align="center">
+  <b>Pokémon G/S/C Automated Shiny & Perfect DV Hunting, Fishing, Headbutt, Egg, Static, Item & Level Grinding Toolkit</b><br>
+  <b>API Project:</b> <a href="https://github.com/w0px/w0p-autocrystal">w0p-autocrystal</a><br>
+  <b>Discord:</b> w0p
+</p>
+<p align="center">
+<img width="115" height="100" alt="launcher_art" src="https://github.com/user-attachments/assets/f71e211e-3df6-4fa6-ae47-b6b8dcb60f87" />
+</p>
 
 ## Table of Contents
 
