@@ -11,6 +11,10 @@
 -- HOW TO USE: same as before - sit at the main battle menu, cursor on
 -- FIGHT, first move has >1 PP left, then load this script.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local FIXED_START = 0xC000
 local FIXED_END   = 0xCFFF
 local SWITCH_START = 0xD000

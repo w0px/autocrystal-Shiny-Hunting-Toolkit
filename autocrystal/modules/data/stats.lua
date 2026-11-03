@@ -33,6 +33,65 @@ local BAK_FILE_PATH = STATS_FILE_PATH .. ".bak"
 -- STATS_FILE_PATH - see M.save() for why.
 local TMP_FILE_PATH = STATS_FILE_PATH .. ".tmp"
 
+-- ===== The check line =====
+-- Every save ends with "check=" plus a keyed hash of everything above it,
+-- so lifetime totals typed into the file by hand (to show off a million
+-- encounters in Discord's Rich Presence) don't stick: M.load() finds the
+-- check doesn't match, keeps the edited file aside as EDITED_FILE_PATH
+-- and goes back to the backup - or to 0 when that doesn't check out
+-- either. The file stays plain text you can read. It's a deterrent, not
+-- security: the bot is open source, so anyone reading this can rebuild
+-- the hash.
+local EDITED_FILE_PATH = script_dir .. "wild_stats.edited.txt"
+-- Exists once a checked save has been written. Before that a file with no
+-- check line at all is just from an older version and gets trusted (and
+-- checked from its next save on); after it, a missing check line means it
+-- was taken out by hand.
+local SIGNED_MARKER_PATH = STATS_FILE_PATH .. ".signed"
+local CHECK_KEY = "autocrystal lifetime stats v1"
+
+-- FNV-1a, 64-bit (Lua 5.4 integers wrap on overflow), keyed at both ends.
+local function checksum(text)
+    local h = -3750763034362895579 -- 0xcbf29ce484222325
+    local function mix(s)
+        for i = 1, #s do
+            h = (h ~ s:byte(i)) * 1099511628211
+        end
+    end
+    mix(CHECK_KEY)
+    mix(text)
+    mix(CHECK_KEY)
+    return string.format("%016x", h)
+end
+
+local function signing_started()
+    local f = io.open(SIGNED_MARKER_PATH, "r")
+    if f then f:close() end
+    return f ~= nil
+end
+
+-- "signed" (the check line matches), "unsigned" (no check line - an older
+-- version's file, trusted until the first checked save) or "edited".
+local function trust(text)
+    local norm = text:gsub("\r", "")
+    local body, sig = norm:match("^(.*\n)check=(%x+)%s*$")
+    if body then
+        return checksum(body) == sig and "signed" or "edited"
+    end
+    if norm:find("check=", 1, true) or signing_started() then
+        return "edited"
+    end
+    return "unsigned"
+end
+
+local function read_text(path)
+    local f = io.open(path, "r")
+    if f == nil then return nil end
+    local text = f:read("a")
+    f:close()
+    return text
+end
+
 M.totalEncounters = 0
 M.totalShinies = 0
 M.encountersSinceShiny = 0
@@ -158,15 +217,15 @@ local function warn_invalid_species(id, what)
     print(string.format("Stats: ignored %s for invalid species ID %s (not a real Gen II Pokemon - a bogus memory read) - not recorded.", what, key))
 end
 
--- Parses one stats file (primary or backup) into M's fields. Returns
--- true if a recognized "encounters=" line was actually found - the one
+-- Parses one stats file's text (primary or backup) into M's fields.
+-- Returns true if a recognized "encounters=" line was actually found - the one
 -- signal M.load() below uses to tell "this file has real data" apart
 -- from "this file exists but is empty/corrupted" (a plain empty file
 -- and a fresh, hasn't-hunted-yet-but-genuinely-new file are otherwise
 -- indistinguishable).
-local function parse_stats_file(f)
+local function parse_stats_text(text)
     local sawEncounters = false
-    for line in f:lines() do
+    for line in text:gmatch("[^\n]+") do
         -- Tolerate a trailing "\r" (a CRLF file read without Windows'
         -- text-mode translation, e.g. a copy edited/opened elsewhere):
         -- without this, the LAST id:count pair on each per-species line
@@ -264,17 +323,46 @@ local function sanitize_invalid_species()
     end
 end
 
+-- Back to all zeros / empty, the tables cleared in place (the stats
+-- window holds on to them).
+local function reset_fields()
+    M.totalEncounters, M.totalShinies, M.encountersSinceShiny = 0, 0, 0
+    M.lastShinySpeciesId = nil
+    for _, t in ipairs({M.caughtSpecies, M.speciesEncounters, M.speciesShinies, M.speciesPerfect, M.speciesPerfectNegative}) do
+        for k in pairs(t) do t[k] = nil end
+    end
+end
+
+-- The stats file was changed by hand (see "The check line" above): kept
+-- aside as EDITED_FILE_PATH, then the backup if it checks out, else 0.
+local function recover_from_edit(path)
+    print("WARNING: " .. path .. " was changed outside the bot (its check line doesn't match) - lifetime stats only count what the bot recorded itself.")
+    os.remove(EDITED_FILE_PATH)
+    os.rename(path, EDITED_FILE_PATH)
+    reset_fields()
+    local bak = read_text(BAK_FILE_PATH)
+    if bak and trust(bak) ~= "edited" and parse_stats_text(bak) then
+        print(string.format("Stats: restored from the backup (%s): encounters=%d, shinies=%d. The edited file was kept as %s.",
+            BAK_FILE_PATH, M.totalEncounters, M.totalShinies, EDITED_FILE_PATH))
+    else
+        reset_fields()
+        print("WARNING: the backup doesn't check out either - lifetime stats start from 0. The edited file was kept as " .. EDITED_FILE_PATH .. ".")
+    end
+    sanitize_invalid_species()
+    M.save()
+end
+
 function M.load()
     M.loaded = true
-    local f = io.open(STATS_FILE_PATH, "r")
-    if f == nil then
+    local path, text = STATS_FILE_PATH, read_text(STATS_FILE_PATH)
+    if text == nil then
         -- M.save() has to delete the old file before renaming the new
         -- .tmp into place (os.rename can't overwrite on Windows), so a
         -- crash between those two steps leaves only the .tmp behind. It's
         -- always a complete save at that point - the old file is only
         -- ever deleted after the .tmp was fully written and closed.
-        f = io.open(TMP_FILE_PATH, "r")
-        if f == nil then
+        path, text = TMP_FILE_PATH, read_text(TMP_FILE_PATH)
+        if text == nil then
             -- No file at all yet - a genuinely fresh install. Nothing to
             -- warn about, nothing to recover; M's fields stay at their
             -- declared defaults (all 0 / empty), same as always.
@@ -282,8 +370,13 @@ function M.load()
         end
         print("Stats: " .. STATS_FILE_PATH .. " was missing, but the last save was found at " .. TMP_FILE_PATH .. " - loading that instead.")
     end
-    local sawEncounters = parse_stats_file(f)
-    f:close()
+    -- An empty file (see BAK_FILE_PATH) has nothing to check - the
+    -- "nothing recognizable" recovery below handles it.
+    if text:find("%S") and trust(text) == "edited" then
+        recover_from_edit(path)
+        return
+    end
+    local sawEncounters = parse_stats_text(text)
 
     if not sawEncounters then
         -- The file exists but nothing recognizable was in it - see the
@@ -292,10 +385,11 @@ function M.load()
         -- what let a real user's stats get zeroed out and then
         -- permanently overwritten by the next save.
         print("WARNING: " .. STATS_FILE_PATH .. " exists but no valid stats could be read from it (empty or corrupted) - lifetime totals would start from 0 this session instead of your real history.")
-        local bak = io.open(BAK_FILE_PATH, "r")
-        if bak then
-            local recovered = parse_stats_file(bak)
-            bak:close()
+        local bak = read_text(BAK_FILE_PATH)
+        if bak and trust(bak) == "edited" then
+            print("WARNING: backup at " .. BAK_FILE_PATH .. " was changed outside the bot - starting from 0 with no way to auto-recover this time.")
+        elseif bak then
+            local recovered = parse_stats_text(bak)
             if recovered then
                 print(string.format(
                     "Recovered lifetime stats from backup (%s): encounters=%d, shinies=%d. This will be written back to %s the next time stats are saved.",
@@ -359,6 +453,8 @@ local function refresh_backup_if_current_file_is_valid()
         end
     end
     if not looksValid then return end
+    -- Nor a file edited by hand - the backup is what M.load() goes back to.
+    if trust(content) == "edited" then return end
 
     local bak = io.open(BAK_FILE_PATH, "wb")
     if bak then
@@ -385,6 +481,22 @@ end
 -- refresh is throttled.
 local BACKUP_REFRESH_INTERVAL = 50
 local savesSinceBackupRefresh = 0
+
+-- After the first checked save: the backup gets that checked copy right
+-- away (an older version's unchecked backup stops being trusted the
+-- moment SIGNED_MARKER_PATH exists), then the marker is written.
+local signingStarted = false
+local function start_signing()
+    if signingStarted then return end
+    signingStarted = true
+    if signing_started() then return end
+    refresh_backup_if_current_file_is_valid()
+    local marker = io.open(SIGNED_MARKER_PATH, "w")
+    if marker then
+        marker:write("Stats are saved with a check line from here on - see data/stats.lua.\n")
+        marker:close()
+    end
+end
 
 -- The in-place fallback at the bottom of M.save() warns once per
 -- session, not on every encounter.
@@ -417,6 +529,7 @@ function M.save()
         table.insert(parts, string.format("lastshinyspecies=%d\n", M.lastShinySpeciesId))
     end
     local content = table.concat(parts)
+    content = content .. "check=" .. checksum(content) .. "\n"
 
     -- Written to TMP_FILE_PATH first, then swapped into place, so
     -- STATS_FILE_PATH is only ever the previous complete save or the new
@@ -437,6 +550,7 @@ function M.save()
             -- only the (complete) .tmp, which M.load() falls back to.
             os.remove(STATS_FILE_PATH)
             if os.rename(TMP_FILE_PATH, STATS_FILE_PATH) then
+                start_signing()
                 return
             end
         end
@@ -455,6 +569,7 @@ function M.save()
     end
     f:write(content)
     f:close()
+    start_signing()
 end
 
 -- Call once per real encounter/reset attempt, from any module. speciesId
@@ -465,7 +580,10 @@ end
 -- 0x00/0x00 as Perfect Negative DVs for that species.
 -- A speciesId outside 1-251 is a bogus read, not an encounter, and is
 -- ignored entirely (see is_valid_species above).
-function M.record_encounter(speciesId, atkdef, spespc)
+-- skipSave: true leaves writing the file to the caller's own M.save() -
+-- for static.lua's frame search, which records several encounters a
+-- second and saves once per batch.
+function M.record_encounter(speciesId, atkdef, spespc, skipSave)
     if speciesId ~= nil and not is_valid_species(speciesId) then
         warn_invalid_species(speciesId, "an encounter")
         return
@@ -488,7 +606,7 @@ function M.record_encounter(speciesId, atkdef, spespc)
             end
         end
     end
-    M.save()
+    if not skipSave then M.save() end
 end
 
 function M.species_perfect_count(speciesId)
@@ -511,6 +629,8 @@ function M.record_shiny(speciesId)
         return
     end
     M.totalShinies = M.totalShinies + 1
+    -- The launcher's RECENT SHINIES panel (data/shiny_history.lua).
+    pcall(function() require("data.shiny_history").add(speciesId, M.encountersSinceShiny) end)
     M.encountersSinceShiny = 0
     M.session.shinies = M.session.shinies + 1
     if speciesId ~= nil then

@@ -21,7 +21,9 @@
 -- Includes the same anti-determinism fix discovered for Starters: soft-
 -- resetting with perfectly identical input timing produces IDENTICAL
 -- "random" results every attempt (a well-known Gen 1/2 RNG quirk) unless
--- you deliberately introduce timing variance after each reload.
+-- you deliberately introduce timing variance after each reload - since
+-- replaced by frame search (data/frame_search.lua): every frame the talk
+-- could start on, tried once each, in order.
 
 local M = {}
 
@@ -33,16 +35,21 @@ Mem = require("data.memory")
 Gui = require("gui_module")
 PokemonNames = require("data.pokemon_names")
 Stats = require("data.stats")
-RngEnabler = require("data.rng_enabler")
 SavestateBackup = require("data.savestate_backup")
 ConsoleLog = require("data.console_log")
+local FrameSearch = require("data.frame_search")
+local ShinySavestate = require("data.shiny_savestate")
+-- Party, map and wScriptRunning reads go through this - WRAM bank 1 no
+-- matter which bank the game has switched in (see FrameSearch.wram).
+local wram = FrameSearch.wram
+local GsJp = require("data.gs_jp")
 
 -- Full 388-entry (map group, map number) -> name table, shared with
 -- wild.lua/fishing.lua/headbutt.lua/friendship.lua/static.lua/
 -- starters.lua - see data/location_names.lua for where this comes from
 -- (the actual pret/pokecrystal disassembly, not a guess). Egg-hatching
 -- involves walking, so location can genuinely vary here too.
-local LocationNames = require("data.location_names")
+local LocationNames = require("data.gs_jp").location_names -- Crystal's or Gold/Silver's, by the loaded game
 
 local function get_pokemon_name(id)
     return PokemonNames[id] or ("Unknown #" .. tostring(id))
@@ -146,13 +153,6 @@ local function divider_field()
 end
 
 local COLOR_GOLD = 16766720
-local COLOR_RED = 15158332
-
--- Even leaner colored embed for bot-status alerts (stuck detection) that
--- aren't about a specific encounter.
-local function send_alert(title, color)
-    send_discord_embed(title, nil, nil, color, nil)
-end
 
 local EGG_PLACEHOLDER = 0xFD
 -- Value fixed once per run inside M.init() below, via the launcher's
@@ -163,7 +163,8 @@ local EGG_PLACEHOLDER = 0xFD
 local SAVESTATE_SLOT
 
 local party_base_addr
-local wScriptRunningAddr -- non-zero while any overworld script (dialogue/call/cutscene) is running; used by reroll_savestate_pool() to confirm the game is truly idle before trusting a save - see there
+local wScriptRunningAddr -- non-zero while NPC dialogue or a cutscene runs - but not a phone call (see FrameSearch.script_busy)
+local wScriptModeAddr -- set during a phone call too; frame search clears any script before a probe
 local eggSlotIndex -- fixed once determined: the same slot every reset, since party size before receiving never changes
 local eggDvAddr
 local eggSpeciesListAddr
@@ -175,44 +176,15 @@ local resetCount = 0
 local stepsTaken = 0
 local sessionEncounterCount = 0
 local confirmedShinyAtkv, confirmedShinyDefv, confirmedShinySpdv, confirmedShinySpcv
--- Up to 8 split points across the reset sequence instead of 1 giant
--- delay - confirmed via direct measurement on Starters that this closes
--- the gap toward true uniform coverage far better than a single delay
--- (98.8% unique with 8 splits vs ~71.5% with just 1-2). Bringing egg.lua
--- up to the same standard after its own test showed only 60% unique.
-local MASH_SPLITS_TARGET = 5
-local mashSplitsFired = 0
-local lastResetTime = nil
-local consecutiveStuckReloads = 0
 
--- Same periodic savestate re-roll as static.lua (see rng_mechanics.md):
--- BizHawk is fully deterministic, so whatever DV states are reachable
--- from a given savestate are a FIXED set no matter how many times it's
--- reloaded and retried - if that set happens to exclude every shiny
--- combination, no amount of resetting will ever find one. Every
--- REROLL_INTERVAL_SECONDS, right at a clean boundary (still waiting for
--- the egg, nothing mid-flight), this re-baselines the savestate with a
--- fresh, unpredictable starting point instead of staying stuck on
--- whatever pool the very first savestate happened to land on. This also
--- supersedes "True Randomness" here - see reroll_savestate_pool() below
--- and the removed Gui.true_randomness_enabled() check in the not-shiny
--- branch.
-local REROLL_INTERVAL_SECONDS = 1800 -- 30 minutes
-local lastRerollTime = nil
--- Increments once per reroll_savestate_pool() call and gets stamped into
--- every per-encounter log line below (win:N) - lets a pasted log batch be
--- split by savestate-pool window after the fact, so the DV combos seen in
--- one 30-minute window can be diffed against the next one to confirm the
--- reroll is actually landing on a genuinely different reachable pool
--- (rather than, say, silently reusing the same one).
-local rerollWindow = 1
+-- This Start's FrameSearch (data/frame_search.lua) - made by M.on_resume()
+-- with new_frame_search() (defined further down).
+local search, new_frame_search
 -- A mystery-egg delivery (e.g. Togepi) has its own confirmation dialogue
 -- that the standard day-care egg flow doesn't - walking logic assumes
 -- the character is immediately free to move, so this needs clearing
 -- once before the first walk attempt after a shiny is confirmed.
 local hatchDialogueCleared = true
-local splitAfterReceivedPending = false
-local splitAfterSettlePending = false
 
 -- State machine: "waiting_for_egg" -> "walking_to_hatch" (only reached
 -- after confirming a shiny) -> done
@@ -239,10 +211,11 @@ end
 -- ===== Movement (verbatim from wild.lua's proven drift-proof system) -
 -- only used during the walking_to_hatch phase, after a shiny is found =====
 local MOVEMENT_FLAG_ADDR = 0xD4DD
+local PLAYER_X_ADDR, PLAYER_Y_ADDR = 0xDCB8, 0xDCB7 -- M.init() moves all three for Japanese Crystal
 local MOVEMENT_IDLE_VALUE = 0xFF
 
 local function attempt_step(direction)
-    local startX, startY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+    local startX, startY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
 
     -- A is held throughout the entire movement attempt, not just pressed
     -- once beforehand - this clears any leftover post-shiny dialogue as
@@ -270,7 +243,7 @@ local function attempt_step(direction)
         if memory.readbyte(enemy_species_addr) ~= 0 then return true end
     end
 
-    local endX, endY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+    local endX, endY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
     return (endX ~= startX or endY ~= startY)
 end
 
@@ -278,7 +251,7 @@ local safe_pair = nil
 local homeX, homeY = nil, nil
 
 local function walk_toward_home()
-    local curX, curY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+    local curX, curY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
     if curX == homeX and curY == homeY then return true end
 
     if curX < homeX then
@@ -292,12 +265,12 @@ local function walk_toward_home()
     end
 
     if memory.readbyte(enemy_species_addr) ~= 0 then return false end
-    curX, curY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+    curX, curY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
     return (curX == homeX and curY == homeY)
 end
 
 local function find_safe_pair(verbose)
-    local anchorX, anchorY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+    local anchorX, anchorY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
     local candidates = {
         {out = "Right", back = "Left"},
         {out = "Left",  back = "Right"},
@@ -313,7 +286,7 @@ local function find_safe_pair(verbose)
             local movedBack = attempt_step(pair.back)
             if memory.readbyte(enemy_species_addr) ~= 0 then return nil end
 
-            local nowX, nowY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+            local nowX, nowY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
             if movedBack and nowX == anchorX and nowY == anchorY then
                 vprint(string.format("Found safe zero-drift pair: %s / %s", pair.out, pair.back))
                 return pair
@@ -332,12 +305,12 @@ local function do_nudge_cycle()
     local madeRealProgress = false
 
     if homeX == nil then
-        homeX, homeY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+        homeX, homeY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
         vprint(string.format("Anchoring home tile at X=%d Y=%d", homeX, homeY))
     end
 
     if safe_pair == nil then
-        local curX, curY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+        local curX, curY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
         if curX ~= homeX or curY ~= homeY then
             local reachedHome = walk_toward_home()
             if memory.readbyte(enemy_species_addr) ~= 0 then return false end
@@ -352,13 +325,13 @@ local function do_nudge_cycle()
             madeRealProgress = (safe_pair ~= nil)
         end
     else
-        local startX, startY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+        local startX, startY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
         local movedOut = attempt_step(safe_pair.out)
         if memory.readbyte(enemy_species_addr) ~= 0 then return false end
         local movedBack = attempt_step(safe_pair.back)
         if memory.readbyte(enemy_species_addr) ~= 0 then return false end
 
-        local endX, endY = memory.readbyte(0xdcb8), memory.readbyte(0xdcb7)
+        local endX, endY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
         local trulyReturned = (endX == startX and endY == startY)
         madeRealProgress = movedOut and movedBack and trulyReturned
 
@@ -375,8 +348,7 @@ end
 -- also greyed out - egg.lua never reads any of those Gui getters (no
 -- wild-battle capture flow here). True Randomness IS in this list now -
 -- egg.lua no longer calls Gui.true_randomness_enabled() at all, since
--- reroll_savestate_pool()'s periodic full-coverage injection supersedes
--- it (same reasoning as static.lua - see rng_mechanics.md). Greyed out
+-- frame search (trying every frame) supersedes it. Greyed out
 -- here so it's visually obvious it has no effect while Egg is the active
 -- module. Verbose Logging stays checkable.
 local DISABLED_FIELDS = {
@@ -391,7 +363,7 @@ local DISABLED_FIELDS = {
     "chkOverrideCritSafety", "txtCustomHpTarget",
     "chkCatchOnItem", "txtCatchItemFilter",
     "chkTrueRandomness",
-    "chkDontWeaken",
+    "chkCatchRetry", "txtCatchRetryCount", "chkCatchRetryAlways", "chkCatchSendNext",
 }
 function M.init(sharedForm, yOffset, existingHud)
     -- comm.httpPost has no default timeout, meaning if the Discord
@@ -416,6 +388,13 @@ function M.init(sharedForm, yOffset, existingHud)
     local version = memory.readbyte(0x141)
     local region = memory.readbyte(0x142)
 
+    -- The Japanese versions (data/gs_jp.lua): revisions that haven't been
+    -- checked stop here and say why.
+    if GsJp.japanese(version, region) and not GsJp.supported(version, region) then
+        print(GsJp.unsupported_reason(version))
+        return false
+    end
+
     if version == 0x54 then
         if region == 0x4A then party_base_addr = 0xDC9D
         elseif region == 0x45 then party_base_addr = 0xDCD7
@@ -423,6 +402,11 @@ function M.init(sharedForm, yOffset, existingHud)
         -- Verified against pokecrystal.sym: wScriptRunning ($D438). Same
         -- address static.lua already relies on for this same purpose.
         wScriptRunningAddr = 0xD438
+        wScriptModeAddr = 0xD437 -- pokecrystal11.sym
+        if GsJp.japanese(version, region) then
+            wScriptRunningAddr, wScriptModeAddr = GsJp.w(0xD438), GsJp.w(0xD437)
+            MOVEMENT_FLAG_ADDR, PLAYER_X_ADDR, PLAYER_Y_ADDR = GsJp.w(0xD4DD), GsJp.w(0xDCB8), GsJp.w(0xDCB7)
+        end
     elseif version == 0x55 or version == 0x58 then
         if region == 0x4A then party_base_addr = 0xD9E8
         elseif region == 0x45 then party_base_addr = 0xDA22
@@ -431,20 +415,24 @@ function M.init(sharedForm, yOffset, existingHud)
         -- Verified against pokegold1.sym: wScriptRunning ($D15F, plain
         -- SVBK-switched WRAM view). Same address static.lua uses.
         wScriptRunningAddr = 0xD15F
+        wScriptModeAddr = 0xD15E -- pokegold1.sym/pokesilver.sym
+        if GsJp.japanese(version, region) then
+            wScriptRunningAddr, wScriptModeAddr = GsJp.w(0xD15F), GsJp.w(0xD15E)
+        end
     else
         print("No valid ROM detected")
         return false
     end
 
     if version == 0x54 then
-        if region == 0x4A then enemy_species_addr = 0xd23d + 0x22
+        if region == 0x4A then enemy_species_addr = GsJp.w(0xD20C) + 0x22
         else enemy_species_addr = 0xd20c + 0x22 end
     else
         -- Verified against pokegold.sym for EU/US: enemy_species_addr
         -- should be based on wEnemyMonDVs ($D0F5), NOT $DA22 (which is
         -- actually wPartyCount) - same bug already found and fixed
         -- elsewhere. JP/KR still unverified, no symbol data available.
-        if region == 0x4A then enemy_species_addr = 0xd9e8 + 0x22
+        if region == 0x4A then enemy_species_addr = GsJp.w(0xD0F5) + 0x22
         elseif region == 0x4B then enemy_species_addr = 0xdb1f + 0x22
         else enemy_species_addr = 0xd0f5 + 0x22 end
     end
@@ -492,162 +480,84 @@ function M.on_resume()
     -- Start). This buffer gives that transition time to settle first.
     for i = 1, 10 do emu.frameadvance() end
 
-    SavestateBackup.backup_slot_before_first_write(SAVESTATE_SLOT, "Egg")
+    SavestateBackup.backup_slot_before_write(SAVESTATE_SLOT,
+        SavestateBackup.label("Egg", EggTargetDropdown and forms.gettext(EggTargetDropdown)))
     savestate.saveslot(SAVESTATE_SLOT)
-    partysizeBeforeReceiving = memory.readbyte(party_base_addr)
+    partysizeBeforeReceiving = wram(party_base_addr)
     eggSlotIndex = partysizeBeforeReceiving
     eggDvAddr = party_base_addr + 0x1D + eggSlotIndex * 0x30
     eggSpeciesListAddr = party_base_addr + 1 + eggSlotIndex
     state = "waiting_for_egg"
     safe_pair = nil
     homeX, homeY = nil, nil
-    mashSplitsFired = 0
-    splitAfterReceivedPending = false
-    splitAfterSettlePending = false
-    lastResetTime = os.time()
-    consecutiveStuckReloads = 0
-    -- Fresh clock for the periodic pool re-roll - the savestate just
-    -- taken above already got its own "free" reroll (whatever RNG state
-    -- existed at the moment Start was clicked), so the next automatic
-    -- one shouldn't fire until a full interval from now.
-    lastRerollTime = os.time()
+    if search then search:drop_retry() end
+    search = new_frame_search()
 end
 
-local REROLL_SPLIT_COUNT = 6
-local REROLL_SCRIPT_CLEAR_TIMEOUT = 180 -- frames to wait for wScriptRunning to clear
+local SCRIPT_CLEAR_TIMEOUT = 180 -- B presses to wait for script_busy() to clear
 
--- Presses B/A until wScriptRunningAddr reads 0 (or the bounded timeout is
+local function script_busy()
+    return FrameSearch.script_busy(wScriptRunningAddr, wScriptModeAddr)
+end
+
+-- Presses B until script_busy() is false (or the bounded timeout is
 -- hit) - a real confirmation that no dialogue/call/cutscene is mid-flight,
 -- not a guess. No-op (returns immediately) if nothing is open, which is
 -- the common case on every call. Ported from static.lua's identical
--- helper - see reroll_savestate_pool() below for the bug this fixes.
+-- helper - frame search uses it to clear a phone call before a probe.
+-- Only B, never A: at the NPC's YES/NO an A would take the egg (Start
+-- pressed mid-conversation) - B answers NO. See static.lua's copy.
 local function wait_for_no_active_script(label)
     if not wScriptRunningAddr then return true end
     local waited = 0
-    while memory.readbyte(wScriptRunningAddr) ~= 0 and waited < REROLL_SCRIPT_CLEAR_TIMEOUT do
-        press_button(waited % 2 == 0 and "B" or "A")
+    while script_busy() and waited < SCRIPT_CLEAR_TIMEOUT do
+        press_button("B")
         waited = waited + 1
     end
     if waited > 0 then
         print(string.format(
-            "reroll_savestate_pool(): wScriptRunning was active (%s) - %s after %d frame(s).",
+            "Egg: a script/phone call was running (%s) - %s after %d B press(es).",
             label or "script/dialogue/call in progress",
-            (memory.readbyte(wScriptRunningAddr) == 0) and "cleared it" or "gave up waiting for it to clear",
+            script_busy() and "gave up waiting for it to clear" or "cleared it",
             waited))
     end
     return true
 end
 
--- Re-baselines the savestate with a fresh, unpredictable starting point -
--- see REROLL_INTERVAL_SECONDS above for why this matters. Only called
--- while still waiting for the egg, nothing mid-flight.
---
--- FIXED (confirmed via a tester log): this used to do ONE single
--- blocking RngEnabler.enable_randomness(FULL_COVERAGE_RANGE) wait - up
--- to 70000 frames, ~9.7 minutes average, with ZERO button presses the
--- entire time. Two things went wrong every single time this fired:
---   1) That easily exceeds STUCK_RESET_TIMEOUT (60s), and nothing here
---      ever refreshed lastResetTime during/after it - so the very next
---      check_stuck_and_force_reset() call ALWAYS treated this deliberate
---      delay as "stuck" and forced an extra reload, unconditionally,
---      every single reroll. The tester's log showed exactly this: "no
---      reset for 60+ seconds" printed immediately after every single
---      "Re-rolling savestate pool" message.
---   2) Worse: sitting fully idle for that long with no input at all is
---      exactly the kind of window a Pokegear call, sign, or any other
---      unrelated overworld script can silently open in - and the old
---      code saved whatever state existed right after the wait with no
---      check at all. If the game had drifted out of "still waiting for
---      the egg" during that window, the corrupted state got saved as
---      the new pool baseline - and since every future reload/mash cycle
---      starts from that same corrupted state and BizHawk is perfectly
---      deterministic, every encounter after that point comes out
---      identical, forever. This is exactly what the tester's log showed:
---      identical raw atkdef/spespc on every single encounter starting
---      right after a reroll.
--- Same underlying bug already found and fixed in static.lua (see that
--- module's reroll_savestate_pool() for the original writeup) - ported
--- here now: split into several short chunks instead of one giant blind
--- wait, checking wScriptRunning after every chunk, plus a stability
--- check right before saving.
-local function reroll_savestate_pool()
-    rerollWindow = rerollWindow + 1
-    print(string.format(
-        "Re-rolling savestate pool after %d minutes (entering window %d) - injecting fresh entropy across %d short split(s) and re-baselining to avoid getting permanently stuck if this pool excludes the shiny states.",
-        math.floor(REROLL_INTERVAL_SECONDS / 60), rerollWindow, REROLL_SPLIT_COUNT))
-
-    for i = 1, REROLL_SPLIT_COUNT do
-        RngEnabler.enable_randomness(RngEnabler.SPLIT_RANGE)
-        wait_for_no_active_script(string.format("split %d/%d", i, REROLL_SPLIT_COUNT))
-    end
-
-    -- Confirm we're still genuinely waiting for the egg (party size
-    -- unchanged) before trusting this as the new baseline - see the
-    -- writeup above for exactly what goes wrong if we don't.
-    local partySizeAfterSplits = memory.readbyte(party_base_addr)
-    if partySizeAfterSplits ~= partysizeBeforeReceiving then
-        print(string.format(
-            "Re-roll aborted: party size changed during the entropy wait (now %d, expected %d) - saving this would have corrupted the pool. Reloading the last known-good baseline instead and will retry next interval.",
-            partySizeAfterSplits, partysizeBeforeReceiving))
-        savestate.loadslot(SAVESTATE_SLOT)
-        mashSplitsFired = 0
-        splitAfterReceivedPending = false
-        splitAfterSettlePending = false
-        lastResetTime = os.time()
-        lastRerollTime = os.time()
-        return
-    end
-
-    -- Final check right before saving - covers the (rare) case something
-    -- started during the stability read just above.
-    wait_for_no_active_script("final pre-save check")
-
-    savestate.saveslot(SAVESTATE_SLOT)
-    lastRerollTime = os.time()
-    -- The splits above still take several real seconds - without this,
-    -- the very next stuck check could still misfire on a slow machine.
-    -- See the writeup above for the full "no reset for 60+ seconds"
-    -- symptom this caused every time.
-    lastResetTime = os.time()
-end
-
--- If 60 seconds pass without reaching a shiny/not-shiny decision (e.g.
--- a phone call interrupted the mashing sequence), force the same
--- reload this module already does every normal cycle anyway - simpler
--- and more reliable than guessing what recovery input is needed, since
--- it just goes back to a known-good state unconditionally. This part
--- ALWAYS happens immediately (it's a real fix, not a guess) - what's
--- two-tier is just the Discord notification: the first forced reload
--- only prints to console, and only escalates to Discord if a SECOND
--- consecutive stuck-trigger happens without a normal cycle completing
--- in between (i.e. the forced reload didn't actually fix anything).
-local STUCK_RESET_TIMEOUT = 60
-local function check_stuck_and_force_reset()
-    if lastResetTime == nil then
-        lastResetTime = os.time()
-        return
-    end
-    if os.time() - lastResetTime >= STUCK_RESET_TIMEOUT then
-        consecutiveStuckReloads = consecutiveStuckReloads + 1
-        print(string.format("WARNING: no reset for %d+ seconds (stuck check #%d) - likely stuck (phone call, etc). Forcing a reload.",
-            STUCK_RESET_TIMEOUT, consecutiveStuckReloads))
-        if consecutiveStuckReloads >= 2 then
-            send_alert(string.format(
-                "\xE2\x9A\xA0\xEF\xB8\x8F Likely stuck: no reset for over %d seconds, even after a forced reload attempt. Check on it.",
-                STUCK_RESET_TIMEOUT * consecutiveStuckReloads), COLOR_RED)
-        end
-        savestate.loadslot(SAVESTATE_SLOT)
-        mashSplitsFired = 0
-        splitAfterReceivedPending = false
-        splitAfterSettlePending = false
-        lastResetTime = os.time()
-    end
+-- This Start's search: from the NPC, hold A through the dialogue until the
+-- egg joins the party. The Odd Egg's transfer writes a placeholder party
+-- count first (see M.step()), so for it the count has to be exactly one
+-- more.
+function new_frame_search()
+    local source = EggTargetDropdown and forms.gettext(EggTargetDropdown) or "Togepi"
+    return FrameSearch.new({
+        label = "Egg - " .. source,
+        press = "hold",
+        detect = FrameSearch.gift_detector({party = party_base_addr, before = function() return partysizeBeforeReceiving end,
+            exact = source == "Odd Egg"}),
+        -- The party's species list shows EGG_PLACEHOLDER until it hatches.
+        is_real = function(roll) return roll.species == EGG_PLACEHOLDER end,
+        name = function() return "Egg" end,
+        record = function(roll)
+            resetCount = resetCount + 1
+            Stats.record_encounter(nil, nil, nil, true)
+            Gui.update_last_encounter(hud, resetCount, roll.species, "Egg",
+                math.floor(roll.atkdef / 16), roll.atkdef % 16, math.floor(roll.spespc / 16), roll.spespc % 16, false, nil)
+            Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount)
+        end,
+        special = function(roll) return shiny(roll.atkdef, roll.spespc) end,
+        slot = function() return SAVESTATE_SLOT end,
+        status = function(text)
+            Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount, text)
+        end,
+        script_addr = wScriptRunningAddr,
+        script_busy = script_busy,
+        clear_script = function() return wait_for_no_active_script("frame search") end,
+    })
 end
 
 -- ===== M.step =====
 function M.step()
-    check_stuck_and_force_reset()
-
     -- Feeds launcher.lua's Discord Rich Presence status line (see
     -- data/presence.lua) - cheap two-byte read, done every tick. Only
     -- updates when the (group, number) pair is a RECOGNIZED location -
@@ -656,14 +566,14 @@ function M.step()
     -- location. See wild.lua's M.step() for the original fix this
     -- mirrors.
     do
-        local mapKey = string.format("%d:%d", memory.readbyte(0xdcb5), memory.readbyte(0xdcb6))
+        local mapKey = string.format("%d:%d", wram(GsJp.map_group_addr()), wram(GsJp.map_group_addr() + 1))
         if LocationNames[mapKey] then
             AutocrystalCurrentLocation = LocationNames[mapKey]
         end
     end
 
     if state == "waiting_for_egg" then
-        local currentPartySize = memory.readbyte(party_base_addr)
+        local currentPartySize = wram(party_base_addr)
 
         -- Read this early too - the "still waiting" gate below needs to
         -- branch per-source, same reasoning as the branch further down.
@@ -693,39 +603,14 @@ function M.step()
             stillWaitingForEgg = currentPartySize <= partysizeBeforeReceiving
         end
 
-        if stillWaitingForEgg then
-            -- Only safe to re-roll right here: still waiting for the egg,
-            -- nothing mid-flight (received-but-not-settled, DV read
-            -- pending, etc).
-            if lastRerollTime and os.time() - lastRerollTime >= REROLL_INTERVAL_SECONDS then
-                reroll_savestate_pool()
-            end
-
-            -- Still working through the NPC's dialogue - keep mashing A.
-            if mashSplitsFired < MASH_SPLITS_TARGET then
-                RngEnabler.enable_randomness(RngEnabler.SPLIT_RANGE)
-                mashSplitsFired = mashSplitsFired + 1
-            end
-            for i = 1, 4 do emu.frameadvance() end
-            press_button("A")
-            return false
-        end
-
-        -- Egg received - split point right at the moment of receiving.
-        if splitAfterReceivedPending then
-            RngEnabler.enable_randomness(RngEnabler.SPLIT_RANGE)
-            splitAfterReceivedPending = false
+        -- Frame search does the searching; only an egg it handed over - in
+        -- the party now, on the real timeline - is read and handled below.
+        if stillWaitingForEgg or not search.handedOver then
+            return search:step()
         end
 
         -- Short wait only - not mashing through extended dialogue.
         for i = 1, 10 do emu.frameadvance() end
-
-        -- Final split point, right after the settle wait, just before
-        -- actually reading DVs.
-        if splitAfterSettlePending then
-            RngEnabler.enable_randomness(RngEnabler.SPLIT_RANGE)
-            splitAfterSettlePending = false
-        end
 
         -- Split into two genuinely separate code paths, not just a label -
         -- explicitly requested after Odd Egg debugging (settle-frame check
@@ -763,16 +648,16 @@ function M.step()
             -- check just as easily as real data. Diagnostic fields added
             -- below (species/partySize/slot/addr) to pin down whether
             -- this is even reading the right memory at all.
-            atkdef = memory.readbyte(eggDvAddr)
-            spespc = memory.readbyte(eggDvAddr + 1)
+            atkdef = wram(eggDvAddr)
+            spespc = wram(eggDvAddr + 1)
             do
                 local stableFrames = 0
                 local waited = 0
                 while stableFrames < 2 and waited < 30 do
                     emu.frameadvance()
                     waited = waited + 1
-                    local curAtkdef = memory.readbyte(eggDvAddr)
-                    local curSpespc = memory.readbyte(eggDvAddr + 1)
+                    local curAtkdef = wram(eggDvAddr)
+                    local curSpespc = wram(eggDvAddr + 1)
                     if curAtkdef == atkdef and curSpespc == spespc then
                         stableFrames = stableFrames + 1
                     else
@@ -785,16 +670,16 @@ function M.step()
                     print(string.format("Egg DV bytes weren't immediately stable, waited %d frames before trusting them (settled on atkdef=$%02X spespc=$%02X) - if a bogus instant-shiny recurs, this was it.", waited, atkdef, spespc))
                 end
             end
-            species = memory.readbyte(eggSpeciesListAddr) -- still 0xFD at this point, expected
+            species = wram(eggSpeciesListAddr) -- still 0xFD at this point, expected
             isShiny = shiny(atkdef, spespc)
         else
             -- Togepi path - deliberately UNTOUCHED, byte-for-byte the
             -- original code from before any Odd Egg debugging began. Do
             -- not "improve" this without a specific, confirmed Togepi bug
             -- report - it's already confirmed working.
-            atkdef = memory.readbyte(eggDvAddr)
-            spespc = memory.readbyte(eggDvAddr + 1)
-            species = memory.readbyte(eggSpeciesListAddr) -- still 0xFD at this point, expected
+            atkdef = wram(eggDvAddr)
+            spespc = wram(eggDvAddr + 1)
+            species = wram(eggSpeciesListAddr) -- still 0xFD at this point, expected
             isShiny = shiny(atkdef, spespc)
         end
 
@@ -814,13 +699,13 @@ function M.step()
             -- a real, freshly-written party slot at all, which would
             -- point at a wrong address/timing bug well upstream of the
             -- settle-frame check above rather than a race within it.
-            encounterLine = string.format("#%d | win:%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s | species=$%02X(expect $FD) partySize=%d(was %d) slot=%d dvAddr=$%04X",
-                resetCount, rerollWindow, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or "",
+            encounterLine = string.format("#%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s | species=$%02X(expect $FD) partySize=%d(was %d) slot=%d dvAddr=$%04X",
+                resetCount, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or "",
                 species, currentPartySize, partysizeBeforeReceiving, eggSlotIndex, eggDvAddr)
         else
             -- Original Togepi print line, unchanged.
-            encounterLine = string.format("#%d | win:%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s",
-                resetCount, rerollWindow, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or "")
+            encounterLine = string.format("#%d | raw atkdef=$%02X spespc=$%02X | Atk:%d Def:%d Spe:%d Spc:%d%s",
+                resetCount, atkdef, spespc, atkv, defv, spdv, spcv, isShiny and " <<< SHINY" or "")
         end
         print(encounterLine)
 
@@ -838,6 +723,7 @@ function M.step()
 
         if isShiny then
             print(string.format("SHINY egg found! Atk:%d Def:%d Spe:%d Spc:%d - stopping here, walk it out to hatch yourself", atkv, defv, spdv, spcv))
+            ShinySavestate.save_if_enabled(Gui, hud, "Egg")
             confirmedShinyAtkv, confirmedShinyDefv, confirmedShinySpdv, confirmedShinySpcv = atkv, defv, spdv, spcv
             local encountersBeforeThisShiny = Stats.encountersSinceShiny
             Stats.record_shiny()
@@ -857,31 +743,19 @@ function M.step()
                     {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
                 },
                 COLOR_GOLD,
-                -- The egg picture - there's no public URL for it, so
-                -- discord_relay.ps1 uploads data/sprites/egg_discord.png
-                -- along with the message (Discord's "attachment://" image).
-                "attachment://egg_discord.png"
+                -- The egg picture (animated) - there's no public URL for
+                -- it, so discord_relay.ps1 uploads data/sprites/
+                -- egg_discord.gif along with the message (Discord's
+                -- "attachment://" image).
+                "attachment://egg_discord.gif"
             )
             return true
         else
             Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
                 "Not shiny - resetting...")
+            -- Read differently on the real timeline than in the search -
+            -- back to the next frame to try, and carry on.
             savestate.loadslot(SAVESTATE_SLOT)
-            lastResetTime = os.time()
-            consecutiveStuckReloads = 0
-            -- REMOVED: "True Randomness" mode used to use the full
-            -- 65536+ frame range for this delay instead, gated behind
-            -- the shared checkbox. Superseded by reroll_savestate_pool()
-            -- above, which does the same full-coverage injection but
-            -- only once per REROLL_INTERVAL_SECONDS instead of every
-            -- single reset - see rng_mechanics.md for the Monte Carlo
-            -- comparison that motivated this same change in static.lua.
-            -- Gui.true_randomness_enabled() is deliberately not read
-            -- here anymore.
-            RngEnabler.enable_randomness(RngEnabler.SPLIT_RANGE)
-            mashSplitsFired = 0
-            splitAfterReceivedPending = true
-            splitAfterSettlePending = true
             return false
         end
 
@@ -909,7 +783,7 @@ function M.step()
             stepsTaken = stepsTaken + 1
         end
 
-        local currentSpeciesListValue = memory.readbyte(eggSpeciesListAddr)
+        local currentSpeciesListValue = wram(eggSpeciesListAddr)
         if currentSpeciesListValue ~= EGG_PLACEHOLDER then
             local speciesName = get_pokemon_name(currentSpeciesListValue)
             print(string.format("Hatched! %s - confirmed shiny, all done.", speciesName))

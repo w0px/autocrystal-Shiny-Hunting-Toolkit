@@ -5,6 +5,10 @@
 -- Load this script. It moves FIGHT -> PKMN -> RUN -> PACK, printing the
 -- value of each candidate address at every stop. No action needed from you.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local CANDIDATES = {0xC0A3, 0xC0A4, 0xC0A5, 0xCFAC}
 
 local function read_all()

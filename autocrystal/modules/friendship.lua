@@ -40,7 +40,8 @@ end
 -- where this comes from (the actual pret/pokecrystal disassembly, not
 -- a guess). Friendship-walking can happen anywhere you choose to stand,
 -- so this feeds the Rich Presence location the same as those modules.
-local LocationNames = require("data.location_names")
+local LocationNames = require("data.gs_jp").location_names -- Crystal's or Gold/Silver's, by the loaded game
+local GsJp = require("data.gs_jp")
 
 local function location_name(group, number)
     return LocationNames[string.format("%d:%d", group, number)]
@@ -222,6 +223,25 @@ local enemy_species_addr
 local party_base_addr
 local lastFriendshipBySlot = {} -- slotIndex (0-based) -> last known value
 local targetPokemonName = "?" -- slot 1 specifically, the evolution target
+local targetSpecies = nil
+
+-- Who evolves by friendship (EVOLVE_HAPPINESS in evos_attacks.asm) and
+-- into what. Anyone else at 220 just has high friendship - nothing to
+-- evolve, so the messages don't say "level up to evolve".
+local FRIENDSHIP_EVOLUTIONS = {
+    [42] = "Crobat", [113] = "Blissey", [172] = "Pikachu", [173] = "Clefairy",
+    [174] = "Jigglypuff", [175] = "Togetic",
+}
+local EEVEE = 133 -- Espeon by day, Umbreon at night
+
+-- What leveling up now does, or nil when it evolves into nothing.
+local function evolution_hint(species)
+    if species == EEVEE then
+        return "Level up (battle or Rare Candy) to evolve it - Espeon in the morning or day, Umbreon at night."
+    end
+    local into = FRIENDSHIP_EVOLUTIONS[species]
+    return into and string.format("Level up (battle or Rare Candy) to evolve it into %s.", into) or nil
+end
 
 local function happiness_addr(slotIndex)
     return party_base_addr + HAPPINESS_OFFSET + slotIndex * PARTY_MON_SIZE
@@ -434,7 +454,7 @@ local function friendship_labels(value)
     return string.format("Target: %s - Friendship: %d", targetPokemonName, value),
         string.format("Threshold: %d", EVOLUTION_THRESHOLD),
         string.format("Still needed: %d", math.max(0, EVOLUTION_THRESHOLD - value)),
-        (value >= EVOLUTION_THRESHOLD) and "READY - level up to evolve" or "-"
+        (value >= EVOLUTION_THRESHOLD) and (evolution_hint(targetSpecies) and "READY - level up to evolve" or "Max friendship reached") or "-"
 end
 
 -- Walking raises happiness for every party member simultaneously, not
@@ -488,7 +508,8 @@ local DISABLED_FIELDS = {
     "chkOverrideCritSafety", "txtCustomHpTarget",
     "chkCatchOnItem", "txtCatchItemFilter",
     "chkStopPerfect", "chkStopNegative",
-    "chkDontWeaken",
+    "chkCatchRetry", "txtCatchRetryCount", "chkCatchRetryAlways", "chkCatchSendNext",
+    "chkShinySavestate", -- no shinies here
 }
 
 function M.init(sharedForm, yOffset, existingHud)
@@ -519,20 +540,32 @@ function M.init(sharedForm, yOffset, existingHud)
         PLAYER_Y_ADDR = 0xDCB7
     end
 
+    -- The Japanese versions (data/gs_jp.lua): revisions that haven't been
+    -- checked stop here and say why.
+    if GsJp.japanese(version, region) and not GsJp.supported(version, region) then
+        print(GsJp.unsupported_reason(version))
+        return false
+    end
+
     if version == 0x54 then
         if region == 0x4A then
-            enemy_species_addr = 0xd23d + 0x22
+            -- Japanese Crystal: the wild Pokemon, the walking flag and the
+            -- position, moved to where it keeps them.
+            enemy_species_addr = GsJp.w(0xD20C) + 0x22
             party_base_addr = 0xDC9D
+            MOVEMENT_FLAG_ADDR, PLAYER_X_ADDR, PLAYER_Y_ADDR = GsJp.w(MOVEMENT_FLAG_ADDR), GsJp.w(PLAYER_X_ADDR), GsJp.w(PLAYER_Y_ADDR)
         else
             enemy_species_addr = 0xd20c + 0x22
             party_base_addr = 0xDCD7
         end
     elseif version == 0x55 or version == 0x58 then
         if region == 0x4A then
-            -- STILL UNVERIFIED - same enemy_addr=party_base_addr bug
-            -- pattern, no JP-specific symbol data available.
-            enemy_species_addr = 0xd9e8 + 0x22
+            -- Japanese Gold/Silver: the wild Pokemon, the walking flag and
+            -- the position, moved to where they keep them; the party was
+            -- already right.
+            enemy_species_addr = GsJp.w(0xD0F5) + 0x22
             party_base_addr = 0xD9E8
+            MOVEMENT_FLAG_ADDR, PLAYER_X_ADDR, PLAYER_Y_ADDR = GsJp.w(MOVEMENT_FLAG_ADDR), GsJp.w(PLAYER_X_ADDR), GsJp.w(PLAYER_Y_ADDR)
         elseif region == 0x4B then
             -- STILL UNVERIFIED - same caveat as the JP branch above.
             enemy_species_addr = 0xdb1f + 0x22
@@ -552,7 +585,8 @@ function M.init(sharedForm, yOffset, existingHud)
         return false
     end
 
-    targetPokemonName = get_pokemon_name(memory.readbyte(species_addr(0)))
+    targetSpecies = memory.readbyte(species_addr(0))
+    targetPokemonName = get_pokemon_name(targetSpecies)
 
     hud = existingHud
     Gui.reconfigure(hud, DISABLED_FIELDS)
@@ -582,7 +616,8 @@ function M.on_resume()
     nextStuckRecoveryTime = nil
     stuckDiscordSent = false
     corruptionRecoveryAttempted = false
-    targetPokemonName = get_pokemon_name(memory.readbyte(species_addr(0)))
+    targetSpecies = memory.readbyte(species_addr(0))
+    targetPokemonName = get_pokemon_name(targetSpecies)
 
     lastFriendshipBySlot = {}
     local partyCount = get_safe_party_count()
@@ -610,7 +645,7 @@ function M.step()
     -- interrupting the walk), not an actual new location. See
     -- wild.lua's M.step() for the original fix this mirrors.
     do
-        local mapKey = string.format("%d:%d", memory.readbyte(0xdcb5), memory.readbyte(0xdcb6))
+        local mapKey = string.format("%d:%d", memory.readbyte(GsJp.map_group_addr()), memory.readbyte(GsJp.map_group_addr() + 1))
         if LocationNames[mapKey] then
             AutocrystalCurrentLocation = LocationNames[mapKey]
         end
@@ -704,13 +739,14 @@ function M.step()
 
     if lastFriendship >= EVOLUTION_THRESHOLD then
         Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionIncreaseCount,
-            string.format("Friendship threshold reached (%d)! Level up to evolve.", lastFriendship))
+            string.format("Friendship threshold reached (%d)!%s", lastFriendship,
+                evolution_hint(targetSpecies) and " Level up to evolve." or ""))
         if not thresholdNotified then
             thresholdNotified = true
-            local curMapGroup, curMapNumber = memory.readbyte(0xdcb5), memory.readbyte(0xdcb6)
+            local curMapGroup, curMapNumber = memory.readbyte(GsJp.map_group_addr()), memory.readbyte(GsJp.map_group_addr() + 1)
             send_discord_embed(
                 string.format("\xF0\x9F\x8E\x89 Friendship Threshold Reached! %s", targetPokemonName),
-                "Level up (battle or Rare Candy) to trigger the evolution.",
+                evolution_hint(targetSpecies), -- none when it doesn't evolve by friendship
                 {
                     {name = "Current Friendship", value = tostring(lastFriendship), inline = true},
                     {name = "Threshold", value = tostring(EVOLUTION_THRESHOLD), inline = true},

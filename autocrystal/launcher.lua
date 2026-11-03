@@ -23,6 +23,13 @@ package.path = script_dir .. "modules/?.lua;" .. script_dir .. "?.lua;" .. scrip
 
 Gui = require("gui_module")
 Presence = require("data.presence")
+-- logs/ and autosaves/ in this folder - see data/paths.lua. Both made in
+-- one go, before anything writes to them (the very first time, that's one
+-- mkdir).
+local Paths = require("data.paths")
+Paths.ensure(Paths.LOG_DIR, Paths.AUTOSAVE_DIR)
+local DebugLog = require("data.debug_log")
+local TreeOverlay = require("data.tree_overlay")
 
 -- `art` = artwork filename (in data/) to show while this mode is selected
 -- in the dropdown. Modules without a confirmed art mapping yet just fall
@@ -37,6 +44,11 @@ local MODULES = {
     { name = "Friendship", module = "friendship", available = true, art = "launcher_art8.png" },
     { name = "Game Corner", module = "gamecorner", available = true, art = "launcher_art9.png" },
 }
+
+-- Advanced Settings' dark mode, before anything is built - every control
+-- takes its colors when it's made.
+GuiSettings.load()
+Gui.apply_theme(GuiSettings.get_bool("darkmode") == true)
 
 -- The starting height doesn't matter - forms.setsize gives the window its
 -- real height right after the shared HUD is built further down, from where
@@ -61,7 +73,7 @@ end
 local dropdown = forms.dropdown(shell, dropdownItems, 14, 32, 280, 20)
 Gui.style_dropdown(dropdown)
 
-local statusLabel = forms.label(shell, "Idle - load a supported ROM, then select a module.", 14, 92, 300, 20)
+local statusLabel = forms.label(shell, "Idle - click Open ROM, then select a module.", 14, 92, 300, 20)
 
 -- Static target picker - built here, eagerly, at launcher startup,
 -- specifically so it EXISTS and is already selectable before the first
@@ -89,6 +101,8 @@ end
 
 local staticTargetLabel = forms.label(shell, "Static target:", 14, 114, 90, 16)
 forms.setproperty(staticTargetLabel, "Visible", false)
+-- Every static target searches frame by frame - see frame_search_step()
+-- in modules/static.lua.
 StaticTargetDropdown = forms.dropdown(shell, {"Static (open world)", "Sudowoodo", "Eevee", "Shuckle", "Spearow", "Celebi", "Lapras", "Suicune", "Snorlax"}, 109, 112, 160, 20)
 Gui.style_dropdown(StaticTargetDropdown)
 select_dropdown_item(StaticTargetDropdown, "Static (open world)")
@@ -170,9 +184,10 @@ local CONTENT_Y_OFFSET = TOP_PANEL_Y + TOP_PANEL_H + Gui.PANEL_GAP
 -- artwork file, draw each exactly once (the "first draw always works"
 -- pattern that's been reliable throughout), and just toggle which one
 -- is Visible - a simple boolean property, not a repeated draw.
--- 94px = 15% smaller than the original 110px, kept centered on the same
--- spot (373, 69) so it still sits in the same place in the top panel.
-local ART_X, ART_Y, ART_W, ART_H = 326, 22, 94, 94
+-- 84px (15% under the 99px it was; 94px, and 110px before that), kept
+-- centered on the same spot (373, 69) so it still sits in the same place
+-- in the top panel.
+local ART_X, ART_Y, ART_W, ART_H = 331, 27, 84, 84
 local artCanvases = {} -- filename -> picturebox handle
 local currentArtFile = nil
 
@@ -191,8 +206,9 @@ local function get_or_create_art_canvas(filename)
     -- species) both end up displayed at the same fixed size either way,
     -- rather than the small ones appearing tiny in a mostly-empty box.
     pcall(forms.setproperty, canvas, "SizeMode", "StretchImage")
-    -- The artwork PNGs have transparent backgrounds - show the window's
-    -- PokeGear green through them, not the default grey.
+    -- The artwork PNGs are transparent only around the Pokemon (the
+    -- Crystal sprites ones made from the animated sprites' first frames),
+    -- so they sit on the window's own background, cream or dark.
     pcall(forms.setproperty, canvas, "BackColor", Gui.THEME.background)
 
     local path = script_dir .. "data/" .. filename
@@ -238,11 +254,10 @@ local STATIC_TARGET_ART = {
     ["Celebi"] = "launcher_art_celebi.png",
     ["Lapras"] = "launcher_art_lapras.png",
     ["Suicune"] = "launcher_art_suicune.png",
-    -- Shiny Crystal sprite, per explicit request (matches the shiny-
-    -- hunting theme of the app itself). Falls back gracefully to the
-    -- Static module's default art (launcher_art3.png) via
-    -- art_file_exists() below if this file isn't present yet - the code
-    -- wiring here doesn't depend on the asset actually existing on disk.
+    -- Shiny Crystal sprites like the rest: the animated sprite's first
+    -- frame, trimmed, scaled nearest-neighbour to 92px tall, centered in
+    -- 115x100, transparent around the Pokemon.
+    ["Spearow"] = "launcher_art_spearow.png",
     ["Snorlax"] = "launcher_art_snorlax.png",
     -- "Eevee" intentionally omitted - no dedicated sprite asset, falls
     -- through to the Static module's own default art below
@@ -355,27 +370,76 @@ local function rom_loaded()
     return ok and system ~= nil and system ~= "NULL"
 end
 local romClosedWhileRunning = false
+local liveViewWarned = false
+
+-- ===== Open ROM =====
+-- BizHawk stops and restarts every Lua script whenever a game loads
+-- (LuaConsole.Restart), which closes this window and builds it again -
+-- unless the script loads the game itself with client.openrom(): then
+-- BizHawk keeps it running. So this button picks the ROM (the same file
+-- dialog BizHawk's File > Open ROM shows) and loads it, and the launcher
+-- stays as it is.
+-- Loaded right in the click, not handed to the main loop: that only runs
+-- while frames do, so with the emulator paused the ROM sometimes never
+-- loaded at all. client.openrom() is fine from a form callback (only input
+-- and memory callbacks are refused).
+local ROM_FILTER = "Game Boy ROMs (*.gbc;*.gb)|*.gbc;*.gb|All Files (*.*)|*.*"
+
+local function on_open_rom()
+    if running then return end
+    local okPick, path = pcall(forms.openfile, "", GuiSettings.get_text("romdir") or "", ROM_FILTER)
+    if not okPick or type(path) ~= "string" or path == "" then return end
+    local ok, err = pcall(client.openrom, path)
+    if ok and rom_loaded() then
+        forms.settext(statusLabel, "Loaded. Select a module, then click Start.")
+        local dir = path:match("^(.*)[/\\]")
+        if dir then
+            GuiSettings.set("romdir", dir)
+            GuiSettings.save()
+        end
+        DebugLog.note("===== Opened " .. path .. " =====")
+    else
+        forms.settext(statusLabel, "Couldn't open that ROM.")
+        print("Open ROM: " .. tostring(err))
+    end
+end
 
 btnStart = forms.button(shell, "Start", on_start, 14, 57, 96, 25)
 btnStop  = forms.button(shell, "Stop", on_stop, 114, 57, 96, 25)
+local btnOpenRom = forms.button(shell, "Open ROM", on_open_rom, 214, 57, 96, 25)
 Gui.style_button(btnStart)
 Gui.style_button(btnStop)
+Gui.style_button(btnOpenRom)
 forms.setproperty(btnStop, "Enabled", false)
+
+-- The game changed under the launcher (Open ROM above): every module set up
+-- for the old one is set up again on its next Start - addresses, version
+-- and memory hooks (each re-registered by name, replacing the old ones).
+local lastRomHash = nil
+local function forget_modules_on_new_rom()
+    local ok, hash = pcall(gameinfo.getromhash)
+    hash = ok and hash or ""
+    if lastRomHash ~= nil and hash ~= lastRomHash then
+        for name in pairs(initializedModules) do
+            initializedModules[name] = nil
+            package.loaded[name] = nil
+        end
+        loadedModule, loadedModuleName, ActiveModuleName = nil, nil, nil
+    end
+    lastRomHash = hash
+end
 
 -- Encounter Stats popup (see modules/stats_window.lua) - lifetime
 -- per-species encounters/shinies/Perfect DVs, combined across every
--- module. Lives here on the launcher itself (not in gui_module.lua's
--- module-only area) so it's usable any time, even before a module has
--- been started. Opened directly from the click, same as the existing
--- Auto-Catch/Discord/Advanced Settings popups - it only builds controls,
--- never calls emu.frameadvance().
+-- module - and Game Assistant (modules/live_view.lua), what's going on in the
+-- game right now. Their buttons sit with the settings buttons (see
+-- gui_module.lua's M.create()); both work any time, before any module has
+-- been started too. Ticked from the main loop below.
 StatsWindow = require("stats_window")
-Gui.style_button(forms.button(shell, "Stats...", function()
-    StatsWindow.open(script_dir)
-end, 214, 57, 96, 25))
+LiveView = require("live_view")
 
 -- The top panel's frame, around everything above (module picker,
--- Start/Stop/Stats, per-module pickers, artwork).
+-- Start/Stop, per-module pickers, artwork).
 Gui.draw_frame(shell, Gui.PANEL_X, TOP_PANEL_Y, Gui.PANEL_W, TOP_PANEL_H)
 
 -- ===== Shared HUD =====
@@ -386,6 +450,12 @@ Gui.draw_frame(shell, Gui.PANEL_X, TOP_PANEL_Y, Gui.PANEL_W, TOP_PANEL_H)
 -- just enables/disables fields), so sizing once from bottomY - where
 -- gui_module.lua's panels actually end - is right for all of them.
 sharedHud = Gui.create(shell, CONTENT_Y_OFFSET, nil, script_dir)
+-- Its Current/Recent Encounters keep filling while you play yourself.
+LiveView.attach(sharedHud)
+-- Everything printed goes to logs/autocrystal_log.txt; the Lua Console only
+-- shows it with Advanced Settings' Verbose Logging ticked - see
+-- data/debug_log.lua.
+DebugLog.install(function() return Gui.verbose_logging(sharedHud) end)
 forms.setsize(shell, 460, sharedHud.bottomY + 30)
 -- A real user report: on their display the bottom of the window was cut
 -- off with no way to reach it - Windows can render less than the asked-for
@@ -424,12 +494,14 @@ Gui.update_counts(sharedHud, Stats.totalEncounters, Stats.totalShinies, Stats.en
 --     the same height and keeps them docked: drag either one and the other
 --     follows, resize BizHawk and this window matches its height (set
 --     ARRANGE_WINDOWS below to false to place them yourself, or add
---     -NoDock to its args to only line them up at start). BizHawk's Lua
---     API can read its window position but not move it, hence a helper.
+--     -NoDock to its args to only line them up at start). Game Assistant and
+--     Encounter Stats dock to the group too while open, found by their
+--     titles (their Detach buttons change them). BizHawk's Lua API can read
+--     its window position but not move it, hence a helper.
 -- The relays get -ExitWhenProcessGone EmuHawk, so they close themselves
 -- once BizHawk does instead of lingering hidden, and -LogFile, since a
 -- hidden window can't show you anything: their output goes to
--- modules/data/discord_relay_log.txt and presence_relay_log.txt instead.
+-- logs/discord_relay_log.txt and presence_relay_log.txt instead.
 -- If one's already running (started by hand, or from before a script
 -- reload), the new copy can't take the port and simply exits.
 --
@@ -445,10 +517,11 @@ local ARRANGE_WINDOWS = true
 -- stats_window.lua name them - these get the launcher's icon too.
 local OTHER_WINDOW_TITLES = {
     "General Settings", "Auto-Catch Settings", "Discord Settings", "Advanced Settings", "Encounter Stats",
+    "Game Assistant",
 }
 
 local function relay_args(logName)
-    return string.format('-ExitWhenProcessGone EmuHawk -LogFile "%smodules/data/%s"', script_dir, logName)
+    return string.format('-ExitWhenProcessGone EmuHawk -LogFile "%s"', Paths.log_path(logName))
 end
 local function window_args()
     return string.format("-Hwnd %d", shell)
@@ -500,6 +573,11 @@ do
     if ARRANGE_WINDOWS then
         table.insert(helpers, {file = "arrange_windows.ps1", args = window_args})
     end
+    -- Card sprites made at an older size (or missing) get remade now,
+    -- before any is on screen - BizHawk keeps a shown GIF open.
+    if Gui.card_sprites_need_rescale(script_dir) then
+        table.insert(helpers, {file = "tools/scale_sprites.ps1", args = ""})
+    end
     start_helpers(helpers)
 end
 
@@ -509,6 +587,21 @@ end
 -- button's click callback, which is fine for os.execute.
 Gui.on_relays_toggled = function(disabled)
     if not disabled then start_helpers(RELAY_HELPERS) end
+end
+
+-- For the debug log's Start line: the module plus whatever its pickers in
+-- this window are set to.
+local function start_description(entry)
+    local parts = {entry.name}
+    if entry.name == "Static" then
+        table.insert(parts, "target " .. tostring(forms.gettext(StaticTargetDropdown)))
+    elseif entry.name == "Egg" then
+        table.insert(parts, "source " .. tostring(forms.gettext(EggTargetDropdown)))
+    end
+    if MODULE_DEFAULT_SAVESTATE_SLOT[entry.name] ~= nil then
+        table.insert(parts, "slot " .. tostring(forms.gettext(SavestateSlotDropdown)))
+    end
+    return table.concat(parts, ", ")
 end
 
 while true do
@@ -530,6 +623,12 @@ while true do
 
         local staticTargetText = forms.gettext(StaticTargetDropdown)
         show_art(art_for_selection(selectedEntry, staticTargetText))
+
+        -- Headbutt's tree overlay (Advanced Settings) - drawn every frame by
+        -- its own frame-end callback, so it keeps showing while a module's
+        -- step runs; see data/tree_overlay.lua. Never allowed to stop the bot.
+        pcall(TreeOverlay.set_wanted,
+            selectedText == "Headbutt" and Gui.tree_overlay_enabled(sharedHud) and rom_loaded())
 
         -- Static target picker only makes sense for the Static module -
         -- show it the instant "Static" is picked in the dropdown above
@@ -561,6 +660,8 @@ while true do
         lastSavestateSlotModuleName = selectedText
     end
 
+    if not running then forget_modules_on_new_rom() end
+
     if startRequestedEntry ~= nil then
         local chosen = startRequestedEntry
         startRequestedEntry = nil
@@ -570,19 +671,20 @@ while true do
         elseif not chosen.available then
             forms.settext(statusLabel, chosen.name .. " isn't built yet.")
         elseif not rom_loaded() then
-            forms.settext(statusLabel, "Load a supported ROM first (File > Open ROM).")
+            forms.settext(statusLabel, "Open a supported ROM first (Open ROM).")
         else
+            DebugLog.on_start(start_description(chosen))
             if initializedModules[chosen.module] == nil then
-                local mod = require(chosen.module)
+                local mod = DebugLog.call("require " .. chosen.module, require, chosen.module)
 
                 -- sharedHud already exists - it's built at startup, see
                 -- "Shared HUD" above the main loop.
-                local ok = mod.init(shell, CONTENT_Y_OFFSET, sharedHud)
+                local ok = DebugLog.call(chosen.module .. ".init", mod.init, shell, CONTENT_Y_OFFSET, sharedHud)
                 if ok == false then
                     -- Every module's init returns false for a game it
                     -- doesn't recognize (not Gold/Silver/Crystal, or an
                     -- unsupported region) and prints why in the console.
-                    forms.settext(statusLabel, "Unsupported ROM - see the Lua Console.")
+                    forms.settext(statusLabel, "Unsupported ROM - see autocrystal/logs/autocrystal_log.txt.")
                 else
                     initializedModules[chosen.module] = mod
                 end
@@ -606,11 +708,11 @@ while true do
                 -- let it reconfigure which settings apply and clear out
                 -- stale data from whatever was previously showing.
                 if mod.on_switch_to then
-                    mod.on_switch_to()
+                    DebugLog.call(chosen.module .. ".on_switch_to", mod.on_switch_to)
                 end
                 if mod.on_resume then
                     AutocrystalGlobalStopRequested = false
-                    mod.on_resume()
+                    DebugLog.call(chosen.module .. ".on_resume", mod.on_resume)
                 end
 
                 running = true
@@ -627,6 +729,7 @@ while true do
                 -- reset cycle could only cause confusion.
                 forms.setproperty(SavestateSlotDropdown, "Enabled", false)
                 forms.setproperty(btnStart, "Enabled", false)
+                forms.setproperty(btnOpenRom, "Enabled", false)
                 forms.setproperty(btnStop, "Enabled", true)
                 forms.settext(statusLabel, "Running: " .. chosen.name)
             end
@@ -647,13 +750,15 @@ while true do
         forms.setproperty(dropdown, "Enabled", true)
         forms.setproperty(SavestateSlotDropdown, "Enabled", true)
         forms.setproperty(btnStart, "Enabled", true)
+        forms.setproperty(btnOpenRom, "Enabled", true)
         forms.setproperty(btnStop, "Enabled", false)
         forms.settext(statusLabel, romClosedWhileRunning and "Stopped - the ROM was closed." or "Stopped. Pick a module and click Start.")
+        DebugLog.note(romClosedWhileRunning and "===== Stopped: the ROM was closed =====" or "===== Stopped with the Stop button =====")
         romClosedWhileRunning = false
     end
 
     if running and loadedModule ~= nil then
-        local done = loadedModule.step()
+        local done = DebugLog.call(loadedModuleName .. ".step", loadedModule.step)
 
         -- Discord Rich Presence: one call, here, covers every module -
         -- see data/presence.lua for why no per-module wiring is needed
@@ -669,17 +774,17 @@ while true do
                 end
             end
 
-            -- Static gets one extra bit of detail: which specific target
-            -- is selected (Shuckle/Eevee/Spearow/Celebi/Lapras/Suicune/
-            -- Sudowoodo/Snorlax), so the presence line reads "Static
-            -- (Shuckle)" instead of just "Static" for those - but "Static
-            -- (open world)" (the literal dropdown text) is deliberately
-            -- NOT shown here, since that's redundant/awkward next to the
-            -- module name itself; plain "Static" covers it.
+            -- Static gets one extra bit of detail: what it's hunting, so the
+            -- presence line reads "Static (Shuckle)" instead of just
+            -- "Static". For "Static (open world)" (the literal dropdown text
+            -- would be redundant next to the module name) that's the species
+            -- frame search found rolling there (AutocrystalHuntedSpecies,
+            -- set by modules/static.lua) - plain "Static" until the first roll.
             if loadedModuleName == "static" and StaticTargetDropdown then
-                local targetText = forms.gettext(StaticTargetDropdown)
-                if targetText == "Shuckle" or targetText == "Eevee" or targetText == "Spearow" or targetText == "Celebi" or targetText == "Lapras" or targetText == "Suicune" or targetText == "Sudowoodo" or targetText == "Snorlax" then
-                    displayName = displayName .. " (" .. targetText .. ")"
+                local hunted = forms.gettext(StaticTargetDropdown)
+                if hunted == "Static (open world)" then hunted = AutocrystalHuntedSpecies end
+                if hunted then
+                    displayName = displayName .. " (" .. hunted .. ")"
                 end
             end
 
@@ -695,8 +800,10 @@ while true do
             forms.setproperty(dropdown, "Enabled", true)
             forms.setproperty(SavestateSlotDropdown, "Enabled", true)
             forms.setproperty(btnStart, "Enabled", true)
+            forms.setproperty(btnOpenRom, "Enabled", true)
             forms.setproperty(btnStop, "Enabled", false)
             forms.settext(statusLabel, "Finished. Pick a module and click Start.")
+            DebugLog.note("===== Finished: the module stopped by itself =====")
         end
     end
 
@@ -705,4 +812,13 @@ while true do
     -- stats_window.lua's M.tick()). Outside the `running` block so it
     -- keeps updating its search filter even while no module is running.
     StatsWindow.tick()
+    -- RECENT SHINIES, redrawn once a module records a new one.
+    pcall(Gui.update_recent_shinies, sharedHud)
+    -- Keeps reading the game (for its recent list) even while closed; never
+    -- allowed to stop the bot.
+    local okLive, liveErr = pcall(LiveView.tick, rom_loaded(), running)
+    if not okLive and not liveViewWarned then
+        liveViewWarned = true
+        print("Game Assistant: " .. tostring(liveErr))
+    end
 end

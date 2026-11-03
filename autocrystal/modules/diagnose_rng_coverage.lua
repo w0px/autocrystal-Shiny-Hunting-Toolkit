@@ -11,6 +11,10 @@
 -- (the same slot Starters already uses - any valid state works, this
 -- isn't testing anything Starters-specific, just the RNG mechanism).
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local HRANDOMADD = 0xFFE1
 local HRANDOMSUB = 0xFFE2
 

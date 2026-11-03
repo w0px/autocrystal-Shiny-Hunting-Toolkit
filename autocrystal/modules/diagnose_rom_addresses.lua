@@ -36,6 +36,10 @@
 -- locally in your own BizHawk session, and the output is just small
 -- byte offsets, not any part of the ROM itself.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local script_path = debug.getinfo(1, "S").source:sub(2)
 local script_dir = script_path:match("(.*[/\\])") or "./"
 
@@ -283,7 +287,15 @@ end
 
 out("=== Scan complete ===")
 
+-- autocrystal/logs/, like the bot's own logs (data/paths.lua) - or next to
+-- this file if that can't be loaded.
 local outPath = script_dir .. "rom_address_scan_results.txt"
+do
+    local ok, paths = pcall(dofile, script_dir .. "data/paths.lua")
+    if ok and type(paths) == "table" then
+        outPath = paths.log_path("rom_address_scan_results.txt")
+    end
+end
 local f = io.open(outPath, "w")
 if f then
     f:write(table.concat(outLines, "\n"))

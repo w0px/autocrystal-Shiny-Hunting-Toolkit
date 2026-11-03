@@ -5,6 +5,10 @@
 -- once, rather than just whatever's currently paged into the CPU's
 -- 0xC000-0xDFFF window (which is all our previous scans have seen).
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 print("=== Memory domains ===")
 local domains = memory.getmemorydomainlist()
 for _, name in ipairs(domains) do

@@ -22,7 +22,8 @@
 -- Same anti-determinism fix as Starters/Egg/Static: soft-resetting with
 -- perfectly identical input timing produces IDENTICAL "random" results
 -- every attempt unless timing variance is deliberately introduced after
--- each reload.
+-- each reload - since replaced by frame search (data/frame_search.lua):
+-- every frame the purchase could start on, tried once each, in order.
 
 local M = {}
 
@@ -33,16 +34,21 @@ package.path = script_dir .. "?.lua;" .. script_dir .. "?/init.lua;" .. script_d
 Gui = require("gui_module")
 PokemonNames = require("data.pokemon_names")
 Stats = require("data.stats")
-RngEnabler = require("data.rng_enabler")
 SavestateBackup = require("data.savestate_backup")
 ConsoleLog = require("data.console_log")
+local FrameSearch = require("data.frame_search")
+local ShinySavestate = require("data.shiny_savestate")
+-- Party, map and wScriptRunning reads go through this - WRAM bank 1 no
+-- matter which bank the game has switched in (see FrameSearch.wram).
+local wram = FrameSearch.wram
+local GsJp = require("data.gs_jp")
 
 -- Full 388-entry (map group, map number) -> name table, shared with
 -- every other module - see data/location_names.lua for where this
 -- comes from (the actual pret/pokecrystal disassembly, not a guess).
 -- Always Goldenrod Game Corner in practice, but shown for consistency
 -- across every module.
-local LocationNames = require("data.location_names")
+local LocationNames = require("data.gs_jp").location_names -- Crystal's or Gold/Silver's, by the loaded game
 
 local function get_pokemon_name(id)
     return PokemonNames[id] or ("Unknown #" .. tostring(id))
@@ -119,10 +125,13 @@ local function send_discord_embed(title, description, fields, color, spriteUrl)
     end
 end
 
+-- The Pokemon in a Discord message's corner: the trimmed 72px sprite once
+-- "Download sprites..." has made it, else the public 56px one - see
+-- data/discord_sprite.lua.
+local DiscordSprite = require("data.discord_sprite")
+
 local function shiny_sprite_url(dexNumber)
-    return string.format(
-        "https://cdn.jsdelivr.net/gh/PokeAPI/sprites@master/sprites/pokemon/versions/generation-ii/crystal/animated/shiny/%d.gif",
-        dexNumber)
+    return DiscordSprite.url(dexNumber, true)
 end
 
 -- Generation II's Hidden Power type/power formula - see wild.lua for the
@@ -152,13 +161,6 @@ local function divider_field()
 end
 
 local COLOR_GOLD = 16766720
-local COLOR_RED = 15158332
-
--- Even leaner colored embed for bot-status alerts (stuck detection) that
--- aren't about a specific encounter.
-local function send_alert(title, color)
-    send_discord_embed(title, nil, nil, color, nil)
-end
 
 -- Value fixed once per run inside M.init() below, via the launcher's
 -- Savestate slot dropdown (falls back to 6, this module's historical
@@ -193,14 +195,9 @@ local function is_plausible_species(s)
     return s >= 1 and s <= 251
 end
 
--- Every split point happens during the mash-A phase - there's no
--- separate "received but not yet read" window like egg.lua has, since
--- we read DVs directly from the party slot the moment party size
--- increases, same read point as the last split.
-local MASH_SPLITS_TARGET = 8
-local mashSplitsFired = 0
-local lastResetTime = nil
-local consecutiveStuckReloads = 0
+-- This Start's FrameSearch (data/frame_search.lua) - made by M.on_resume()
+-- with new_frame_search() (defined further down).
+local search, new_frame_search
 
 local function shiny(atkdef, spespc)
     if spespc == 0xAA then
@@ -250,23 +247,27 @@ local SCRIPT_CLEAR_TIMEOUT = 300
 local function wait_for_no_active_script()
     if not wScriptRunningAddr then return end
     local waited = 0
-    while memory.readbyte(wScriptRunningAddr) ~= 0 and waited < SCRIPT_CLEAR_TIMEOUT do
+    while wram(wScriptRunningAddr) ~= 0 and waited < SCRIPT_CLEAR_TIMEOUT do
         press_button("B")
         waited = waited + 1
     end
     if waited > 0 then
         vprint(string.format(
             "Game Corner: wScriptRunning was active after the party-size increase (Pokedex-registration fade for a first-time prize, most likely) - %s after %d frame(s).",
-            (memory.readbyte(wScriptRunningAddr) == 0) and "cleared it" or "gave up waiting for it to clear",
+            (wram(wScriptRunningAddr) == 0) and "cleared it" or "gave up waiting for it to clear",
             waited))
     end
 end
 
 -- ===== M.init: runs ONCE =====
+-- True Randomness greyed out too: frame search (trying every frame)
+-- replaced the random delays it used to widen.
 local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkKillMode", "txtKillFilter",
     "chkThiefMode", "txtThiefFilter",
+    "chkTrueRandomness",
+    "chkCatchRetry", "txtCatchRetryCount", "chkCatchRetryAlways", "chkCatchSendNext",
 }
 
 function M.init(sharedForm, yOffset, existingHud)
@@ -282,6 +283,13 @@ function M.init(sharedForm, yOffset, existingHud)
     local version = memory.readbyte(0x141)
     local region = memory.readbyte(0x142)
 
+    -- The Japanese versions (data/gs_jp.lua): revisions that haven't been
+    -- checked stop here and say why.
+    if GsJp.japanese(version, region) and not GsJp.supported(version, region) then
+        print(GsJp.unsupported_reason(version))
+        return false
+    end
+
     if version == 0x54 then
         if region == 0x4A then party_base_addr = 0xDC9D
         else party_base_addr = 0xDCD7 end
@@ -291,6 +299,7 @@ function M.init(sharedForm, yOffset, existingHud)
         -- progress" purpose - see wait_for_no_active_script() below for
         -- why this module needs it too now.
         wScriptRunningAddr = 0xD438
+        if GsJp.japanese(version, region) then wScriptRunningAddr = GsJp.w(0xD438) end
     elseif version == 0x55 or version == 0x58 then
         if region == 0x4A then party_base_addr = 0xD9E8
         elseif region == 0x4B then party_base_addr = 0xDB1F
@@ -298,6 +307,7 @@ function M.init(sharedForm, yOffset, existingHud)
         -- Verified against pokegold1.sym: wScriptRunning ($D15F, plain
         -- SVBK-switched WRAM view). Same address static.lua uses.
         wScriptRunningAddr = 0xD15F
+        if GsJp.japanese(version, region) then wScriptRunningAddr = GsJp.w(0xD15F) end
     else
         print("No valid ROM detected")
         return false
@@ -332,58 +342,53 @@ end
 -- Called every time Start is clicked. Saves the current position -
 -- prize menu open, cursor on the desired Pokemon - as the reset target.
 function M.on_resume()
-    SavestateBackup.backup_slot_before_first_write(SAVESTATE_SLOT, "GameCorner")
+    SavestateBackup.backup_slot_before_write(SAVESTATE_SLOT, "GameCorner")
     savestate.saveslot(SAVESTATE_SLOT)
-    partysizeBeforeReceiving = memory.readbyte(party_base_addr)
+    partysizeBeforeReceiving = wram(party_base_addr)
     newSlotIndex = partysizeBeforeReceiving
     newDvAddr = party_base_addr + 0x1D + newSlotIndex * 0x30
     newSpeciesAddr = party_base_addr + 1 + newSlotIndex
-    mashSplitsFired = 0
-    lastResetTime = os.time()
-    consecutiveStuckReloads = 0
     expectedSpecies = nil
+    if search then search:drop_retry() end
+    search = new_frame_search()
 end
 
--- If 60 seconds pass without reaching a shiny/not-shiny decision (e.g.
--- a phone call interrupted the mashing sequence), force the same
--- reload this module already does every normal cycle anyway - simpler
--- and more reliable than guessing what recovery input is needed, since
--- it just goes back to a known-good state unconditionally. This part
--- ALWAYS happens immediately (it's a real fix, not a guess) - what's
--- two-tier is just the Discord notification: the first forced reload
--- only prints to console, and only escalates to Discord if a SECOND
--- consecutive stuck-trigger happens without a normal cycle completing
--- in between (i.e. the forced reload didn't actually fix anything).
-local STUCK_RESET_TIMEOUT = 60
-local function check_stuck_and_force_reset()
-    if lastResetTime == nil then
-        lastResetTime = os.time()
-        return
-    end
-    if os.time() - lastResetTime >= STUCK_RESET_TIMEOUT then
-        consecutiveStuckReloads = consecutiveStuckReloads + 1
-        print(string.format("WARNING: no reset for %d+ seconds (stuck check #%d) - likely stuck (phone call, etc). Forcing a reload.",
-            STUCK_RESET_TIMEOUT, consecutiveStuckReloads))
-        if consecutiveStuckReloads >= 2 then
-            send_alert(string.format(
-                "\xE2\x9A\xA0\xEF\xB8\x8F Likely stuck: no reset for over %d seconds, even after a forced reload attempt. Check on it.",
-                STUCK_RESET_TIMEOUT * consecutiveStuckReloads), COLOR_RED)
-        end
-        savestate.loadslot(SAVESTATE_SLOT)
-        -- partysizeBeforeReceiving is deliberately NOT re-read here: the
-        -- reload always lands on the exact state on_resume() captured it
-        -- from, and reading right after loadslot() can catch memory before
-        -- the reload settles - the stale-value bug static.lua documents
-        -- (fake "party increased" reads of garbage every reset).
-        mashSplitsFired = 0
-        lastResetTime = os.time()
-    end
+-- This Start's search: from the prize menu (cursor on the Pokemon), hold A
+-- through "OK?" and the following text until the prize joins the party. A
+-- Pokemon not in the Pokedex yet plays a registration fade too (see
+-- M.step()), so the new slot has to show a real species before it's read.
+--
+-- No script_addr/clear_script, unlike the other modules: they start
+-- standing in the overworld, where a running script can only be something
+-- in the way (a phone call). Here the prize menu IS a running script -
+-- clearing it pressed B, which closed the menu, and every probe then
+-- talked to the clerk again and bought the menu's first prize (Abra)
+-- instead of the one the cursor was on. Nothing can interrupt a menu
+-- waiting for input, so there's nothing to clear.
+function new_frame_search()
+    return FrameSearch.new({
+        label = "Game Corner",
+        press = "hold",
+        detect = FrameSearch.gift_detector({party = party_base_addr, before = function() return partysizeBeforeReceiving end,
+            realSpecies = true, settle = 120}),
+        is_real = function(roll) return is_plausible_species(roll.species) end,
+        record = function(roll)
+            resetCount = resetCount + 1
+            Stats.record_encounter(roll.species, roll.atkdef, roll.spespc, true)
+            Gui.update_last_encounter(hud, resetCount, roll.species, get_pokemon_name(roll.species),
+                math.floor(roll.atkdef / 16), roll.atkdef % 16, math.floor(roll.spespc / 16), roll.spespc % 16, false, "(no item)")
+            Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount)
+        end,
+        special = function(roll) return shiny(roll.atkdef, roll.spespc) end,
+        slot = function() return SAVESTATE_SLOT end,
+        status = function(text)
+            Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount, text)
+        end,
+    })
 end
 
 -- ===== M.step =====
 function M.step()
-    check_stuck_and_force_reset()
-
     -- Feeds launcher.lua's Discord Rich Presence status line (see
     -- data/presence.lua) - cheap two-byte read, done every tick. Only
     -- updates when the (group, number) pair is a RECOGNIZED location -
@@ -392,34 +397,28 @@ function M.step()
     -- location. See wild.lua's M.step() for the original fix this
     -- mirrors.
     do
-        local mapKey = string.format("%d:%d", memory.readbyte(0xdcb5), memory.readbyte(0xdcb6))
+        local mapKey = string.format("%d:%d", wram(GsJp.map_group_addr()), wram(GsJp.map_group_addr() + 1))
         if LocationNames[mapKey] then
             AutocrystalCurrentLocation = LocationNames[mapKey]
         end
     end
 
-    local currentPartySize = memory.readbyte(party_base_addr)
+    -- Every probe starts with A on the prize menu, so it has to be open
+    -- (wScriptRunning is set while it is). Started anywhere else, A would
+    -- talk to the clerk and buy the menu's first prize, whatever was meant.
+    if not search.active and wram(wScriptRunningAddr) == 0 then
+        print("Game Corner: open the prize menu and put the cursor on the Pokemon you want, then click Start.")
+        Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
+            "Open the prize menu, cursor on the Pokemon, then Start.")
+        return true
+    end
 
-    if currentPartySize <= partysizeBeforeReceiving then
-        -- Still working through the "are you sure?" confirmation and
-        -- the following text - keep mashing A.
-        if mashSplitsFired < MASH_SPLITS_TARGET then
-            if Gui.true_randomness_enabled(hud) then
-                RngEnabler.enable_randomness(RngEnabler.FULL_COVERAGE_RANGE)
-                -- Up to 70000 deliberate idle frames - well past
-                -- STUCK_RESET_TIMEOUT at normal speed. Without this, the
-                -- next check_stuck_and_force_reset() took the wait itself
-                -- for a stall and reloaded, so the cycle restarted with
-                -- another long wait and never finished (the same bug
-                -- egg.lua's reroll_savestate_pool() writeup describes).
-                lastResetTime = os.time()
-            else
-                RngEnabler.enable_randomness(RngEnabler.SPLIT_RANGE)
-            end
-            mashSplitsFired = mashSplitsFired + 1
-        end
-        press_button("A")
-        return false
+    local currentPartySize = wram(party_base_addr)
+
+    -- Frame search does the searching; only a prize it handed over - in the
+    -- party now, on the real timeline - is read and handled below.
+    if currentPartySize <= partysizeBeforeReceiving or not search.handedOver then
+        return search:step()
     end
 
     -- Party size increased - the Pokemon is in, read its DVs directly.
@@ -473,9 +472,9 @@ function M.step()
     -- sequences like this fade sometimes do), so wait_for_no_active_
     -- script() alone wasn't airtight against every timing case reported.
     -- Bumped the cap from 30 to 120 frames to match.
-    local species = memory.readbyte(newSpeciesAddr)
-    local atkdef = memory.readbyte(newDvAddr)
-    local spespc = memory.readbyte(newDvAddr + 1)
+    local species = wram(newSpeciesAddr)
+    local atkdef = wram(newDvAddr)
+    local spespc = wram(newDvAddr + 1)
     local SETTLE_TIMEOUT = 120
     do
         local stableFrames = 0
@@ -483,9 +482,9 @@ function M.step()
         while stableFrames < 2 and waited < SETTLE_TIMEOUT do
             emu.frameadvance()
             waited = waited + 1
-            local curSpecies = memory.readbyte(newSpeciesAddr)
-            local curAtkdef = memory.readbyte(newDvAddr)
-            local curSpespc = memory.readbyte(newDvAddr + 1)
+            local curSpecies = wram(newSpeciesAddr)
+            local curAtkdef = wram(newDvAddr)
+            local curSpespc = wram(newDvAddr + 1)
             local curPlausible = is_plausible_species(curSpecies) and
                 (expectedSpecies == nil or curSpecies == expectedSpecies)
             if curSpecies == species and curAtkdef == atkdef and curSpespc == spespc and curPlausible then
@@ -508,18 +507,14 @@ function M.step()
     -- savestate was taken), so a mismatch here is provably a corrupted
     -- mid-animation read, not a real different Pokemon. Silently discard
     -- this cycle (no Stats.record_encounter, no shiny report, no GUI
-    -- update) and reload, same as check_stuck_and_force_reset() does for
-    -- a genuinely stuck cycle - this is the actual backstop against
-    -- false shinies, not just a nicer wait.
+    -- update) and reload (the next frame to search) - this is the actual
+    -- backstop against false shinies, not just a nicer wait.
     if not is_plausible_species(species) or (expectedSpecies ~= nil and species ~= expectedSpecies) then
         print(string.format(
             "Game Corner: discarding a bad read (species #%d, expected %s) after %d settle frames - reloading without recording it.",
             species, expectedSpecies and ("#" .. expectedSpecies) or "unknown yet", SETTLE_TIMEOUT))
         resetCount = resetCount - 1
         savestate.loadslot(SAVESTATE_SLOT)
-        mashSplitsFired = 0
-        lastResetTime = os.time()
-        consecutiveStuckReloads = 0
         return false
     end
     if expectedSpecies == nil then
@@ -551,6 +546,7 @@ function M.step()
     if isShiny then
         print(string.format("SHINY Game Corner Pokemon found! %s Atk:%d Def:%d Spe:%d Spc:%d - stopping here",
             speciesName, atkv, defv, spdv, spcv))
+        ShinySavestate.save_if_enabled(Gui, hud, speciesName)
         local encountersBeforeThisShiny = Stats.encountersSinceShiny
         Stats.record_shiny(species)
         Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
@@ -579,9 +575,6 @@ function M.step()
         Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
             "Not shiny - resetting...")
         savestate.loadslot(SAVESTATE_SLOT)
-        mashSplitsFired = 0
-        lastResetTime = os.time()
-        consecutiveStuckReloads = 0
         return false
     end
 end

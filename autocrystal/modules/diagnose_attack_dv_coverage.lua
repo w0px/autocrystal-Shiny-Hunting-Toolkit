@@ -27,7 +27,7 @@
 --    to slot 9 (separate from the main bot's slots 3/4) once the
 --    countdown ends, then starts resetting automatically.
 -- 3. Watch the console for a running tally every 100 resets, or check
---    attack_dv_coverage.txt in this folder at any time - it's updated
+--    attack_dv_coverage.txt in autocrystal/logs/ at any time - it's updated
 --    after every single reset, so you can check progress without
 --    stopping the script.
 --
@@ -37,8 +37,22 @@
 -- statistical range of each other, the coverage is confirmed healthy
 -- down to this level of detail.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local DIAG_SAVESTATE_SLOT = 9
+
+-- autocrystal/logs/, like the bot's own logs (data/paths.lua) - or
+-- BizHawk's current folder if that can't be loaded.
 local RESULTS_FILE = "attack_dv_coverage.txt"
+do
+    local script_dir = debug.getinfo(1, "S").source:sub(2):match("(.*[/\\])") or "./"
+    local ok, paths = pcall(dofile, script_dir .. "data/paths.lua")
+    if ok and type(paths) == "table" then
+        RESULTS_FILE = paths.log_path("attack_dv_coverage.txt")
+    end
+end
 local PRINT_EVERY = 100
 
 -- The 8 Attack DV values that satisfy the shiny condition's bit-1

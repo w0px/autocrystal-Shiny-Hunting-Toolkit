@@ -63,12 +63,16 @@ local REGION_LETTERS = {
     [0x46] = "F", [0x49] = "I", [0x53] = "S", [0x4B] = "K",
 }
 
--- Read lazily (on first tick) and memoized rather than at module-load
--- time, since a ROM may not be loaded into BizHawk yet the instant this
--- module gets require()'d.
-local gameVersionLabel = nil
+-- Read lazily (on first tick) rather than at module-load time, since a ROM
+-- may not be loaded into BizHawk yet the instant this module gets
+-- require()'d. Remembered per ROM (by its hash): the launcher's Open ROM
+-- swaps games without restarting this script, so a label kept for the
+-- whole session went on saying "Crystal" after switching to Gold.
+local gameVersionLabel, gameVersionHash = nil, nil
 local function get_game_version_label()
-    if gameVersionLabel then return gameVersionLabel end
+    local okHash, hash = pcall(gameinfo.getromhash)
+    hash = okHash and hash or ""
+    if gameVersionLabel and hash == gameVersionHash then return gameVersionLabel end
     local ok, versionByte = pcall(memory.readbyte, 0x141)
     if not ok then return "Pokémon" end
     local ok2, regionByte = pcall(memory.readbyte, 0x142)
@@ -76,7 +80,7 @@ local function get_game_version_label()
     if ok2 and REGION_LETTERS[regionByte] then
         name = name .. " (" .. REGION_LETTERS[regionByte] .. ")"
     end
-    gameVersionLabel = name
+    gameVersionLabel, gameVersionHash = name, hash
     return gameVersionLabel
 end
 
@@ -170,15 +174,25 @@ end
 -- longer FPS_SAMPLE_WINDOW_SECONDS window to keep the estimate stable
 -- rather than jittering between e.g. a 1s and 2s window from rounding.
 local FPS_SAMPLE_WINDOW_SECONDS = 3
+
+-- Frames actually emulated so far. emu.framecount() alone undercounts
+-- whenever a module loads a state back - static.lua's frame search does
+-- that after every ~240-frame probe, which read as ~10 fps - so the frames
+-- those loads undid (AutocrystalRewoundFrames, kept by static.lua) are
+-- added back on.
+local function frames_emulated()
+    return emu.framecount() + (AutocrystalRewoundFrames or 0)
+end
+
 local lastFpsSampleTime = os.time()
-local lastFpsSampleFrame = emu.framecount()
+local lastFpsSampleFrame = frames_emulated()
 local currentFpsEstimate = 0
 
 local function update_fps_estimate()
     local now = os.time()
     local elapsed = now - lastFpsSampleTime
     if elapsed >= FPS_SAMPLE_WINDOW_SECONDS then
-        local nowFrame = emu.framecount()
+        local nowFrame = frames_emulated()
         local frameDelta = nowFrame - lastFpsSampleFrame
         currentFpsEstimate = math.floor((frameDelta / elapsed) + 0.5)
         lastFpsSampleTime = now
@@ -229,6 +243,15 @@ end
 -- everything else (encounters, shinies, rate, fps, image tooltip text)
 -- is derived automatically from the shared Stats module, with zero
 -- per-hunting-module wiring required.
+-- The encounters/hour Rich Presence shows (this session's encounters over
+-- the time since its first tick) - for the Encounter Stats window, so the
+-- two always agree. nil before a module has run this session.
+function M.encounters_per_hour()
+    if sessionStartTime == nil then return nil end
+    local elapsedHours = math.max((os.time() - sessionStartTime) / 3600, 1 / 3600)
+    return math.floor(((Stats.totalEncounters - encountersAtSessionStart) / elapsedHours) + 0.5)
+end
+
 function M.tick(stateLabel)
     ensure_session_baseline()
     update_fps_estimate()

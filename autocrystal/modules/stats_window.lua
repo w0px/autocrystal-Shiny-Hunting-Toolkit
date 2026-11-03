@@ -43,7 +43,7 @@
 -- Sprites are the regular (non-shiny) local PNGs in
 -- data/sprites/normal/<dex>.png, whether or not a species has had a shiny
 -- - the Shinies count says that. They don't ship with the bot - the
--- window offers a "Download sprites..." button that runs
+-- window offers a "Download sprites" button that runs
 -- download_sprites.ps1 (same PokeAPI/jsdelivr source the Discord embeds
 -- use); they appear by themselves once downloaded. Any missing sprite
 -- just means that row shows text only.
@@ -69,7 +69,13 @@ local TAB_BUTTON_Y = 12 -- content y of the Total button = scroll reference
 -- ROWS_TOP so they never overlap it.
 local HEADER_FRAME_X, HEADER_FRAME_Y, HEADER_FRAME_W, HEADER_FRAME_H = 4, 4, 474, 172
 
+-- arrange_windows.ps1 docks the window titled exactly this against the
+-- launcher's right side; Detach adds " (detached)" to the title so it's let
+-- go of, Attach takes it off again, and a reopened window starts attached.
+local TITLE = "Encounter Stats"
+
 local state = {
+    detached = false,
     form = nil,
     rootDir = nil,
     mode = "total", -- "total" or "session"
@@ -104,7 +110,7 @@ local function file_exists(path)
 end
 
 local function sprite_path(dex)
-    return string.format("%sdata/sprites/normal/%d.png", state.rootDir, dex)
+    return Gui.still_sprite(state.rootDir, dex, false)
 end
 
 local function trim(s)
@@ -206,7 +212,11 @@ local function create_sprite(dex, contentY)
     -- Drawn into the picture rather than set as its BorderStyle: that
     -- recreates the picturebox's handle, and every forms.* call on it
     -- after that (this drawImage, showing/hiding it) silently does nothing.
-    pcall(forms.drawRectangle, canvas, 0, 0, SPRITE_SIZE - 1, SPRITE_SIZE - 1, Gui.THEME.border)
+    -- Dark mode's still sprites are transparent (Gui.still_sprite()) and
+    -- need no card.
+    if not Gui.dark then
+        pcall(forms.drawRectangle, canvas, 0, 0, SPRITE_SIZE - 1, SPRITE_SIZE - 1, Gui.THEME.border)
+    end
     pcall(forms.refresh, canvas)
     return canvas
 end
@@ -236,15 +246,18 @@ local function update()
     end
 
     local allRows, speciesTotal = build_ranked_rows(state.mode)
+    -- The same encounters/hour Rich Presence shows (data/presence.lua),
+    -- else this file's own from the active hunting time.
+    local rate = Presence and Presence.encounters_per_hour and Presence.encounters_per_hour()
+        or Stats.session_encounters_per_hour()
+    local rateText = rate and (fmt(rate) .. " encounters/hour") or "encounters/hour: once a module runs"
 
     if isSession then
-        local rate = Stats.session_encounters_per_hour()
         set_text(c.header1, string.format("This session: %s encounters  |  %d %s  |  %d species",
             fmt(Stats.session.encounters), Stats.session.shinies,
             Stats.session.shinies == 1 and "shiny" or "shinies", #allRows))
         set_text(c.header2, string.format("Active hunting time: %s  |  %s",
-            fmt_duration(Stats.session_active_seconds()),
-            rate and (fmt(rate) .. " encounters/hour") or "rate: not enough data yet"))
+            fmt_duration(Stats.session_active_seconds()), rateText))
     else
         local totalPerfect, totalPerfectNeg = 0, 0
         for _, row in ipairs(allRows) do
@@ -253,8 +266,8 @@ local function update()
         end
         set_text(c.header1, string.format("Lifetime: %s encounters  |  %d shinies  |  %d species",
             fmt(Stats.totalEncounters), Stats.totalShinies, #allRows))
-        set_text(c.header2, string.format("Perfect DVs: %d  |  Perfect Negative DVs: %d",
-            totalPerfect, totalPerfectNeg))
+        set_text(c.header2, string.format("Perfect DVs: %d  |  Perfect Negative: %d  |  %s",
+            totalPerfect, totalPerfectNeg, rateText))
     end
 
     local visible = {}
@@ -361,7 +374,7 @@ end
 local function build()
     if not Stats.loaded then Stats.load() end
 
-    local form = forms.newform(FORM_W, FORM_H, "Encounter Stats", function()
+    local form = forms.newform(FORM_W, FORM_H, TITLE, function()
         -- Only drop our own handles here - per gui_module.lua's onclose
         -- notes, reading controls during close is unreliable.
         state.form = nil
@@ -388,6 +401,15 @@ local function build()
     forms.setproperty(state.mode == "session" and c.btnSession or c.btnTotal, "Enabled", false)
     style_tabs()
 
+    state.detached = false
+    c.btnDock = forms.button(form, "Detach", function()
+        if state.form == nil then return end
+        state.detached = not state.detached
+        forms.settext(state.form, state.detached and (TITLE .. " (detached)") or TITLE)
+        forms.settext(c.btnDock, state.detached and "Attach" or "Detach")
+    end, 392, TAB_BUTTON_Y, 70, 24)
+    Gui.style_button(c.btnDock)
+
     c.header1 = forms.label(form, "", 12, 44, 458, 18)
     c.header2 = forms.label(form, "", 12, 64, 458, 18)
     Gui.style_header(c.header1)
@@ -399,6 +421,7 @@ local function build()
     -- handle, and forms.gettext() on the old one then always reads ""
     -- (see gui_module.lua's popup_textbox()).
     c.searchBox = forms.textbox(form, state.query, 150, 20, nil, 162, 90)
+    Gui.style_textbox(c.searchBox)
     Gui.style_button(forms.button(form, "Search", apply_search, 317, 88, 70, 24))
     Gui.style_button(forms.button(form, "Clear", function()
         if state.form == nil then return end
@@ -417,7 +440,7 @@ local function build()
             state.haveSprites and "Animated sprites aren't downloaded yet (one-time, ~500 small files)."
                 or "Sprites aren't downloaded yet (one-time, ~1000 small files).",
             12, 145, 300, 18)
-        c.spriteButton = forms.button(form, "Download sprites...", start_sprite_download, 317, 142, 145, 24)
+        c.spriteButton = forms.button(form, "Download sprites", start_sprite_download, 317, 142, 145, 24)
         Gui.style_button(c.spriteButton)
     end
 

@@ -13,6 +13,10 @@
 -- only to read each bank's $D269, then restores the original bank
 -- immediately, all without ever calling emu.frameadvance() in between.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local SVBK_ADDR = 0xFF70
 local TARGET_ADDR = 0xD269
 

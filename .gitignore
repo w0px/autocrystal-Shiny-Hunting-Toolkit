@@ -13,15 +13,25 @@ autocrystal/modules/*.txt
 autocrystal/data/*_stats.txt
 
 # Sprites fetched by "Download sprites..." (download_sprites.ps1) and the
-# card versions made from them - everyone downloads their own
+# card and Discord versions made from them - everyone downloads their own
 autocrystal/data/sprites/normal/*.png
-!autocrystal/data/sprites/normal/egg.png
 autocrystal/data/sprites/shiny/
 autocrystal/data/sprites/animated/
 autocrystal/data/sprites/animated_card/
+autocrystal/data/sprites/animated_discord/
 autocrystal/data/sprites/animated_2x/
 *.part
 
 # BizHawk itself goes in the release zip, not the repository
 BizHawk/*
 !BizHawk/README.txt
+
+# The bot's log and its automatic savestate backups
+autocrystal/logs/
+autocrystal/autosaves/
+
+# Signatures the bot keeps next to its stats files
+autocrystal/modules/data/*.signed
+
+# Still sprites made from the download (tools/scale_sprites.ps1)
+autocrystal/data/sprites/still/

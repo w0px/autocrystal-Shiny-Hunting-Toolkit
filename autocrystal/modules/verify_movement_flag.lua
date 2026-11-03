@@ -10,6 +10,10 @@
 --
 -- If your test direction is blocked, edit DIRECTION below.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local DIRECTION = "Down"
 local MOVEMENT_FLAG_ADDR = 0xD4DD
 local IDLE_VALUE = 0xFF

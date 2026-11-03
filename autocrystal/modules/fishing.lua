@@ -25,6 +25,7 @@ local script_dir = script_path:match("(.*[/\\])") or "./"
 package.path = script_dir .. "?.lua;" .. script_dir .. "?/init.lua;" .. script_dir .. "../?.lua;" .. package.path
 
 Mem = require("data.memory")
+GsJp = GsJp or require("data.gs_jp")
 Gui = require("gui_module")
 PokemonNames = require("data.pokemon_names")
 ItemNames = require("data.item_names")
@@ -32,7 +33,49 @@ Stats = require("data.stats")
 LevelUpMoves = require("data.level_up_moves")
 RngEnabler = require("data.rng_enabler")
 ConsoleLog = require("data.console_log")
+MoveNames = require("data.move_names")
 
+-- Party data, the battling slot and the move being learned read from WRAM
+-- bank 1 - see wild.lua's copy of this for why (the move list read empty
+-- in bank 6, so A went on into the move-learn prompt).
+local wram = require("data.frame_search").wram
+
+-- A Pokemon that knows 4 moves is learning a new one - see wild.lua's
+-- copy of this and of the joypad wrapper below: nothing gets pressed until
+-- the player has decided.
+local moveLearnHold = nil
+local joypadLib = joypad
+local joypad = setmetatable({
+    set = function(input)
+        return joypadLib.set(moveLearnHold and {} or input)
+    end,
+}, {__index = joypadLib})
+
+-- Every memory read in this file goes through here: $C000-$DFFF is read
+-- from WRAM bank 1 (wram() above), where the game keeps the battle's own
+-- variables - the wild Pokemon's species, HP and DVs, the bag, the
+-- party. While a text box or a battle animation runs (the extra "is
+-- hurt by poison!"/"is paralyzed!" ones included) Crystal often leaves
+-- another bank switched in at frame end - bank 5 (palettes) holds 0 at
+-- the species/HP/DV addresses, bank 6 text-box tiles - and a plain read
+-- returned that: "species 0, the battle is over" or "enemy HP 0" in the
+-- middle of a turn, so the bot dropped what it was doing and pressed on
+-- from the wrong place (into the bag, a submenu). Behind several
+-- "flicker"/"impossible value" notes further down too (species 0 for
+-- frames in the battle intro, re-read DVs of 0/0/0/0, level 255).
+local memoryLib = memory
+local memory = setmetatable({
+    readbyte = function(addr, domain)
+        if domain == nil then return wram(addr) end
+        return memoryLib.readbyte(addr, domain)
+    end,
+    read_u16_be = function(addr, domain)
+        if domain == nil and addr >= 0xC000 and addr < 0xDFFF then
+            return wram(addr) * 256 + wram(addr + 1)
+        end
+        return memoryLib.read_u16_be(addr, domain)
+    end,
+}, {__index = memoryLib})
 local hud
 
 local function get_pokemon_name(id)
@@ -41,6 +84,10 @@ end
 
 local function get_item_name(id)
     return ItemNames[id] or ("Unknown Item #" .. tostring(id))
+end
+
+local function get_move_name(id)
+    return MoveNames[id] or ("Move #" .. tostring(id))
 end
 
 local function vprint(msg)
@@ -145,16 +192,17 @@ local function send_discord_embed(title, description, fields, color, spriteUrl)
     end
 end
 
+-- The Pokemon in a Discord message's corner: the trimmed 72px sprite once
+-- "Download sprites..." has made it, else the public 56px one - see
+-- data/discord_sprite.lua.
+local DiscordSprite = require("data.discord_sprite")
+
 local function shiny_sprite_url(dexNumber)
-    return string.format(
-        "https://cdn.jsdelivr.net/gh/PokeAPI/sprites@master/sprites/pokemon/versions/generation-ii/crystal/animated/shiny/%d.gif",
-        dexNumber)
+    return DiscordSprite.url(dexNumber, true)
 end
 
 local function regular_sprite_url(dexNumber)
-    return string.format(
-        "https://cdn.jsdelivr.net/gh/PokeAPI/sprites@master/sprites/pokemon/versions/generation-ii/crystal/animated/%d.gif",
-        dexNumber)
+    return DiscordSprite.url(dexNumber, false)
 end
 
 -- Generation II's Hidden Power type/power formula - see wild.lua for the
@@ -181,7 +229,7 @@ end
 -- Full 388-entry (map group, map number) -> name table, shared with
 -- wild.lua - see data/location_names.lua for where this comes from
 -- (the actual pret/pokecrystal disassembly, not a guess).
-local LocationNames = require("data.location_names")
+local LocationNames = require("data.gs_jp").location_names -- Crystal's or Gold/Silver's, by the loaded game
 
 local function location_name(group, number)
     return LocationNames[string.format("%d:%d", group, number)]
@@ -202,7 +250,7 @@ local function current_location_name()
     if AutocrystalCurrentLocation then
         return AutocrystalCurrentLocation
     end
-    return location_name(memory.readbyte(0xdcb5), memory.readbyte(0xdcb6))
+    return location_name(memory.readbyte(GsJp.map_group_addr()), memory.readbyte(GsJp.map_group_addr() + 1))
 end
 
 -- A visible horizontal-rule divider between field groups - see wild.lua.
@@ -354,15 +402,19 @@ local thiefLowHpCheckedThisBattle = false
 
 -- ===== Kill mode safety savestates =====
 -- See wild.lua's own copy of this comment for the full rationale -
--- written as NAMED FILES (savestate.save(path, true)) in modules/data/,
--- the same location/mechanism Static/Starters/Egg/Game Corner's own
--- SavestateBackup files already use, rather than numbered
+-- written as NAMED FILES (savestate.save(path, true)) in autocrystal/
+-- autosaves/, the same location/mechanism Static/Starters/Egg/Game
+-- Corner's own SavestateBackup files already use, rather than numbered
 -- savestate.saveslot() slots - far more discoverable than a slot number,
 -- and since the filenames are exclusively ours there's no collision risk
 -- to guard against either. Gated on Kill mode specifically being
 -- checked, not on this module simply being active.
-local KILL_MODE_SAFETY_SAVE_PATH = script_dir .. "data/kill_mode_safety.State"
-local KILL_MODE_AUTOSAVE_PATH = script_dir .. "data/kill_mode_autosave.State"
+local Paths = require("data.paths")
+local ShinySavestate = require("data.shiny_savestate")
+local NextPokemon = require("data.next_pokemon")
+local MoveChoice = require("data.move_choice")
+local KILL_MODE_SAFETY_SAVE_PATH = Paths.autosave_path("kill_mode_safety.State")
+local KILL_MODE_AUTOSAVE_PATH = Paths.autosave_path("kill_mode_autosave.State")
 local KILL_MODE_AUTOSAVE_INTERVAL_SECONDS = 5 * 60
 local killModeWasEnabled = false
 local killModeAutosaveNextTime = nil
@@ -371,6 +423,13 @@ local stopRequested = false
 local stopReason = ""
 local realEncounterConfirmed = false
 local pendingEncounterUpdate = false
+-- Bumped by the encounter hook with every new encounter; show_encounter()
+-- puts each one on the Current Encounter panel exactly once.
+local encounterSerial, shownEncounterSerial, riskyLoggedFor = 0, 0, nil -- riskyLoggedFor: Kill mode's "running instead" line, once per encounter
+-- The first time through each battle, the battle code waits for that
+-- battle's encounter hook before deciding anything (see the wait after the
+-- dv_flag_addr check in M.step()) and notes the serial it decided on.
+local waitingForEncounterHook, decidedEncounterSerial = false, 0
 -- Set true (alongside pendingEncounterUpdate) the instant the ROM hook
 -- confirms a NEW encounter is shiny - cleared the moment the in-battle
 -- shiny-decision block ("if shinyvalue == 1 then" further down M.step())
@@ -425,13 +484,19 @@ local highestSpeSpc = 0
 local highestAtkDef = 0
 
 local MENU_CURSOR_Y, MENU_CURSOR_X
+-- The player's map coordinates (wXCoord/wYCoord) - see return_to_fishing_spot().
+local PLAYER_X_ADDR, PLAYER_Y_ADDR
 local RUN_CURSOR = {y = 2, x = 2}
 local wCurItemAddr, wItemsAddr, wNumItemsAddr
 local wBallsAddr, wNumBallsAddr
 -- Preference order when scanning the bag for something to throw -
 -- Poke Ball specifically preferred, falling back to other ball types
 -- only if no Poke Balls are left.
-local BALL_ITEM_IDS = {5, 4, 2, 1} -- Poke, Great, Ultra, Master
+local LEVEL_BALL, LURE_BALL = 159, 160
+-- What a Lure Ball does here (see find_ball_in_bag()).
+local LURE_MULTIPLIER = 3 -- every battle here starts on a rod
+-- Every kind auto-catch throws, in its order for a tie - never a Master Ball.
+local BALL_ITEM_IDS = {2, 4, 5, LEVEL_BALL, LURE_BALL} -- Ultra, Great, Poke, Level, Lure
 
 -- Sends the detailed "Shiny X Found!" embed built from pendingShinyFields
 -- (DVs, Hidden Power, Location, encounter stats, sprite - see where those
@@ -465,6 +530,7 @@ local function is_ball_item(itemId)
     for _, ballId in ipairs(BALL_ITEM_IDS) do
         if itemId == ballId then return true end
     end
+    if itemId == 1 then return true end -- a Master Ball: in the Balls pocket, never thrown
     if itemId >= 157 and itemId <= 166 then return true end
     if itemId == 177 then return true end
     return false
@@ -615,25 +681,23 @@ local move2NavFailStreak = 0
 -- move slot the cursor defaults to) before the timeout ever fired -
 -- confirmed via a user report of the bot "spamming" through a new-move
 -- prompt until the game forced a move to be learned automatically.
--- wild.lua already solved this the same way: track the active Pokemon's
--- level every frame and stop the instant a level-up is confirmed AND the
--- species is known to learn a move somewhere in that range AND there's
--- no free move slot to auto-fill into - more reliable than hooking the
--- exact learn-move routine (confirmed to never fire on Crystal) or
--- trusting a timeout alone (the whole sequence completes too fast when
--- mashing A every frame to reliably hit any reasonable timeout).
-local learnMovePromptDetected = false
+-- Now the same as wild.lua: the move-learn hook (register_hooks()) holds
+-- every button for a Pokemon that knows 4 moves (moveLearnHold), and a
+-- level-up into a move level switches the A presses to B as a backstop.
+-- wCurPartyMon and wPutativeTMHMMove - see wild.lua.
+local wCurPartyMonAddr, wPutativeTMHMMoveAddr
 
+-- All read through wram() (bank 1) - see its comment at the top.
 local function get_active_mon_level()
-    local slotIndex = memory.readbyte(curPartyMonAddr)
+    local slotIndex = wram(curPartyMonAddr)
     if slotIndex > 5 then slotIndex = 5 end
-    return memory.readbyte(party_base_addr + 0x27 + slotIndex * 0x30)
+    return wram(party_base_addr + 0x27 + slotIndex * 0x30)
 end
 
 local function get_active_mon_species()
-    local slotIndex = memory.readbyte(curPartyMonAddr)
+    local slotIndex = wram(curPartyMonAddr)
     if slotIndex > 5 then slotIndex = 5 end
-    return memory.readbyte(party_base_addr + 1 + slotIndex)
+    return wram(party_base_addr + 1 + slotIndex)
 end
 
 -- Verified via wPartyMon1Moves in both pokecrystal.sym ($DCE1, party
@@ -643,12 +707,12 @@ end
 -- will auto-fill it with NO prompt at all - no risk, safe to let A
 -- presses through without stopping for that specific level-up.
 local function get_active_mon_move_count()
-    local slotIndex = memory.readbyte(curPartyMonAddr)
+    local slotIndex = wram(curPartyMonAddr)
     if slotIndex > 5 then slotIndex = 5 end
     local baseAddr = party_base_addr + 0x0A + slotIndex * 0x30
     local count = 0
     for i = 0, 3 do
-        if memory.readbyte(baseAddr + i) ~= 0 then
+        if wram(baseAddr + i) ~= 0 then
             count = count + 1
         end
     end
@@ -711,17 +775,35 @@ local battleLevelBaseline = nil
 local battleLevelBaselineSpecies = nil
 local battleLevelBaselineMoveCount = nil
 
+-- ===== Auto-catch =====
+-- The ball with the best chance on this throw, out of the ones in the bag
+-- (item_effects.asm's BallMultiplierFunctionTable): Ultra x2, Great x1.5,
+-- Poke x1, Lure Ball x3 on a Pokemon hooked with a rod (x1 otherwise),
+-- all of those then scaled by the target's HP - (3 max - 2 now) / 3 max.
+-- A Level Ball skips that HP part: x8 when your Pokemon's level is over
+-- four times the target's, x4 over double, x2 over it, x1 otherwise. A tie
+-- goes to the one first in BALL_ITEM_IDS. Never a Master Ball. Returns the
+-- item ID, or nil if no ball it throws is left.
 local function find_ball_in_bag()
+    local have = {}
+    for i = 0, 11 do
+        local itemId = memory.readbyte(wBallsAddr + i * 2)
+        if itemId == 0xFF then break end
+        if memory.readbyte(wBallsAddr + i * 2 + 1) > 0 then have[itemId] = true end
+    end
+    local maxHP = memory.read_u16_be(enemy_max_hp_addr)
+    local hpFactor = maxHP > 0 and (3 * maxHP - 2 * memory.read_u16_be(enemy_hp_addr)) / (3 * maxHP) or 1
+    local mine, theirs = memory.readbyte(FIRST_MOVE_PP_ADDR + 5), memory.readbyte(enemy_addr + 7)
+    local levelBall = theirs >= mine and 1 or theirs >= mine // 2 and 2 or theirs >= mine // 4 and 4 or 8
+    local chance = {[2] = 2 * hpFactor, [4] = 1.5 * hpFactor, [5] = hpFactor,
+        [LURE_BALL] = LURE_MULTIPLIER * hpFactor, [LEVEL_BALL] = levelBall}
+    local best, bestChance
     for _, ballId in ipairs(BALL_ITEM_IDS) do
-        for i = 0, 11 do
-            local itemId = memory.readbyte(wBallsAddr + i * 2)
-            if itemId == 0xFF then break end
-            if itemId == ballId then
-                return ballId
-            end
+        if have[ballId] and (best == nil or chance[ballId] > bestChance) then
+            best, bestChance = ballId, chance[ballId]
         end
     end
-    return nil
+    return best
 end
 
 -- Total balls remaining across ALL ball types combined (Poke + Great +
@@ -736,7 +818,11 @@ local function total_ball_count()
     for i = 0, 11 do
         local itemId = memory.readbyte(wBallsAddr + i * 2)
         if itemId == 0xFF then break end
-        if is_ball_item(itemId) then
+        local throwable = false
+        for _, ballId in ipairs(BALL_ITEM_IDS) do
+            if itemId == ballId then throwable = true end
+        end
+        if throwable then
             total = total + memory.readbyte(wBallsAddr + i * 2 + 1)
         end
     end
@@ -819,20 +905,13 @@ local function navigate_to_pack_and_select_ball(ballId)
     end
 
     local scrollAttempts = 0
-    while scrollAttempts < 12 and memory.readbyte(species_addr) ~= 0 do
+    while scrollAttempts < 16 and memory.readbyte(species_addr) ~= 0 do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
             return false
         end
         local curItem = memory.readbyte(wCurItemAddr)
-        -- Fall back to whatever ball is actually visible if the
-        -- specific target can't be found - handles a disagreement
-        -- between our own bag-scan (wBallsAddr) and the live menu
-        -- display (wCurItem), confirmed via direct observation right
-        -- after the last ball of a stack gets used (the scan correctly
-        -- sees it's gone, but the menu still shows it briefly) - any
-        -- valid ball actually on screen is better than getting stuck.
-        if curItem == ballId or is_ball_item(curItem) then
+        if curItem == ballId then
             press_button("A")
             -- Selecting the ball opens a Use/Quit-style submenu. Give
             -- it a moment to appear, then let the caller's confirm-loop
@@ -850,13 +929,60 @@ local function navigate_to_pack_and_select_ball(ballId)
             end
             return true
         end
-        press_button("Down")
+        -- Up or Down towards it: where it sits in the Balls pocket against
+        -- where the cursor's item sits (one not in the pocket any more - a
+        -- used-up stack the menu still shows for a moment - counts as
+        -- below). Only that exact ball is ever selected: never another
+        -- kind on screen, never a Master Ball.
+        local target, here = nil, nil
+        for i = 0, 11 do
+            local itemId = memory.readbyte(wBallsAddr + i * 2)
+            if itemId == 0xFF then break end
+            if itemId == ballId then target = i end
+            if itemId == curItem then here = i end
+        end
+        if target == nil then break end
+        press_button((here == nil or here > target) and "Up" or "Down")
         scrollAttempts = scrollAttempts + 1
     end
 
     print("Catch-mode: couldn't find the ball in the Pack menu after scrolling")
     press_button("B")
     return false
+end
+
+-- Our own Pokemon is down with the target still standing: the game asks
+-- for the next Pokemon (or whites out) - a prompt blind A-mashing can't
+-- answer. Callers want it on 3 checks in a row, like do_kill_turn's own
+-- copy of this check; the target's HP rules out Selfdestruct/Explosion,
+-- where both go down and the battle simply ends.
+local function own_pokemon_down()
+    return memory.read_u16_be(OWN_HP_ADDR) == 0 and memory.read_u16_be(enemy_hp_addr) > 0
+end
+
+-- PP left on move slot 1-4 of the Pokemon in battle. The PP byte's top two
+-- bits are its PP Ups, so a move with PP Ups and none left doesn't read 0.
+local function move_pp(slot)
+    return memory.readbyte(FIRST_MOVE_PP_ADDR + slot - 1) % 64
+end
+
+-- The two battle structs for data/move_choice.lua: ours starts 8 bytes
+-- before its PP, the enemy's 6 before its DVs.
+local function battle_view()
+    return {read8 = function(addr) return memory.readbyte(addr) end,
+        own = FIRST_MOVE_PP_ADDR - 8, enemy = enemy_addr - 6}
+end
+
+-- Moves the move list's cursor to slot (1-4). Only once MoveSelectionAddr's
+-- hook has confirmed the list is open: its rows 1-2 share their cursor
+-- values with FIGHT and PACK on the main battle menu.
+local function go_to_move_slot(slot)
+    for _ = 1, 6 do
+        local cy = memory.readbyte(MENU_CURSOR_Y)
+        if cy == slot then return true end
+        press_and_wait_for_cursor_change(cy < slot and "Down" or "Up", 30)
+    end
+    return memory.readbyte(MENU_CURSOR_Y) == slot
 end
 
 -- Simplified attack turn for weakening the enemy before catching -
@@ -873,7 +999,7 @@ end
 -- meaningful HP) - enemy_hp_addr reading 0 is a more direct signal of
 -- an actual faint, less likely to share whatever specifically affects
 -- species_addr during this window.
-local function do_catch_attack_turn()
+local function do_catch_attack_turn(slot)
     local nav_attempts = 0
     while have_battle_controls do
         if stop_was_requested() then
@@ -947,7 +1073,23 @@ local function do_catch_attack_turn()
     -- caveat on this). The caller already confirmed at least one of
     -- the two has PP before calling this function at all.
     local usedSecondMove = false
-    if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 then
+    if slot and moveSelectScreenOpen then
+        -- A move from data/move_choice.lua: straight to its row.
+        if not go_to_move_slot(slot) then
+            move2NavFailStreak = move2NavFailStreak + 1
+            if move2NavFailStreak >= 25 then
+                print(string.format("Catch-mode: couldn't get the cursor to move %d, %d times in a row - stopping so you can handle this manually.",
+                    slot, move2NavFailStreak))
+                return "move2_stuck"
+            end
+            vprint(string.format("Couldn't get the cursor to move %d (it's on %d) - backing out and retrying.", slot, memory.readbyte(MENU_CURSOR_Y)))
+            press_button("B")
+            return
+        end
+        move2NavFailStreak = 0
+        usedSecondMove = slot ~= 1
+        vprint(string.format("Pressing A to use move %d", slot))
+    elseif move_pp(1) == 0 then
         usedSecondMove = true
         vprint("First move out of PP - using the second move instead")
         press_and_wait_for_cursor_change(navigate_to_menu_option(MOVE2_CURSOR), 30)
@@ -1081,6 +1223,7 @@ local function do_catch_attack_turn()
     -- can't safely mean "back at the top menu"; a false positive let a
     -- later turn misfire and open the BAG mid-battle. Relying on the
     -- hook plus the plain timeout fails SAFELY instead.
+    local ownDown = 0
     while not have_battle_controls do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1088,6 +1231,8 @@ local function do_catch_attack_turn()
         end
         emu.frameadvance()
         press_button("A")
+        ownDown = own_pokemon_down() and ownDown + 1 or 0
+        if ownDown >= 3 then return "own_fainted" end
         postAttackWait = postAttackWait + 1
         if postAttackWait > postAttackTimeout then
             print("Catch-mode: post-attack wait timed out (enemy may have fainted, or something else is blocking)")
@@ -1220,7 +1365,7 @@ local function do_thief_turn()
             -- hunting normally. Checking PP fresh right here, immediately
             -- before pressing A, catches this regardless of why the
             -- earlier read was wrong.
-            if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 then
+            if move_pp(1) == 0 then
                 print("Thief mode: move slot 1 is actually out of PP right now (caught right before attacking) - backing out without attacking so hunting can continue normally.")
                 -- Piggyback on the same one-time-ever notification the
                 -- earlier per-battle check normally sends - this path
@@ -1346,6 +1491,7 @@ local function do_thief_turn()
     local activeSpecies = battleLevelBaselineSpecies
     local confirmedHigherLevelFrames = 0
     local lastSeenLevel = get_active_mon_level()
+    local mashB = false -- see do_kill_turn
     local ownFaintConfirmedFrames = 0
     local BATTLE_END_CONFIRM_FRAMES = 30
     local battleEndConfirmedFrames = 0
@@ -1444,7 +1590,7 @@ local function do_thief_turn()
         -- it). A real, ordinary turn has no reason to sit at 0 PP AND
         -- no battle controls AND no faint for 20 straight frames - only
         -- this exact stuck refusal does.
-        if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 and not enemyFainted then
+        if move_pp(1) == 0 and not enemyFainted then
             ppStuckConfirmFrames = ppStuckConfirmFrames + 1
         else
             ppStuckConfirmFrames = 0
@@ -1524,20 +1670,14 @@ local function do_thief_turn()
             return "stuck"
         end
 
-        -- Same move-learn-prompt guard as do_kill_turn - see its own
-        -- comment above for the full rationale. Shares that function's
-        -- battleLevelBaseline/learnMovePromptDetected state (captured
-        -- once at battle start in M.step(), not per-attack), so it
-        -- stays correct across Thief's own multi-attempt retry loop
+        -- Same move-learn guard as do_kill_turn - see its own comment
+        -- below. Shares that function's battleLevelBaseline state
+        -- (captured once at battle start in M.step(), not per-attack), so
+        -- it stays correct across Thief's own multi-attempt retry loop
         -- within the same battle.
-        if learnMovePromptDetected then
-            if battleLevelBaselineMoveCount ~= nil and battleLevelBaselineMoveCount < 4 then
-                vprint("Thief mode: move-learn prompt detected, but a free move slot was available at battle start - auto-fills with no risk, continuing.")
-                learnMovePromptDetected = false
-            else
-                print("Thief mode: move-learn prompt detected - stopping immediately so you can decide (this Pokemon likely also just leveled up).")
-                return "stuck"
-            end
+        if moveLearnHold then
+            print("Thief mode: move-learn prompt for a Pokemon that knows 4 moves - stopping so you can decide.")
+            return "stuck"
         end
         local currentLevel = get_active_mon_level()
         -- Also reject anything above the real maximum level (100) -
@@ -1560,17 +1700,14 @@ local function do_thief_turn()
             confirmedHigherLevelFrames = (currentLevel > levelBeforeAttack and currentLevel <= 100) and 1 or 0
         end
         lastSeenLevel = currentLevel
-        if confirmedHigherLevelFrames >= 3 and learns_move_in_range(activeSpecies, levelBeforeAttack, currentLevel) then
-            if battleLevelBaselineMoveCount ~= nil and battleLevelBaselineMoveCount < 4 then
-                vprint(string.format("Thief mode: level increase to %d with a move-learn possible, but a free move slot was available at battle start - auto-fills with no risk, continuing.", currentLevel))
-            else
-                print(string.format("Thief mode: level increase to %d - this species learns a move somewhere in that range, a learn-prompt is likely showing. Stopping so you can decide.", currentLevel))
-                return "stuck"
-            end
+        if not mashB and confirmedHigherLevelFrames >= 3 and battleLevelBaselineMoveCount == 4
+            and learns_move_in_range(activeSpecies, levelBeforeAttack, currentLevel) then
+            vprint(string.format("Thief mode: level increase to %d with a new move possible and no free slot - pressing B from here (see do_kill_turn).", currentLevel))
+            mashB = true
         end
 
         emu.frameadvance()
-        press_button("A")
+        press_button(mashB and "B" or "A")
         postAttackWait = postAttackWait + 1
         if postAttackWait > postAttackTimeout then
             if enemyFainted then
@@ -1590,6 +1727,9 @@ end
 -- flee logic - see wild.lua's own copy for the full rationale.
 local function flee_battle()
     Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Fleeing battle...")
+    -- Safety net for the wait on the encounter hook in M.step(): a shiny
+    -- whose hook only fires after the decision to run is not run from.
+    local serialAtStart = encounterSerial
 
     local escapeAttempts = 0
     local fledSuccessfully = false
@@ -1616,6 +1756,11 @@ local function flee_battle()
             local cx = memory.readbyte(MENU_CURSOR_X)
 
             if cy == RUN_CURSOR.y and cx == RUN_CURSOR.x then
+                if shinyLatchedThisBattle and encounterSerial ~= serialAtStart then
+                    -- Leaves the latch set, so the next M.step() decides again.
+                    print("A shiny turned up after the decision to run - not running from it.")
+                    return
+                end
                 vprint(string.format("Pressing A to select RUN (Y=%d X=%d)", cy, cx))
                 press_button("A")
                 ran_away = true
@@ -1818,65 +1963,64 @@ local function confirm_battle_ended(maxFrames)
     return false
 end
 
--- The caller stops the bot right after this (the target may still be
--- there to catch by hand) - this just says why.
-local function report_unconfirmed_battle_end(label, speciesName, speciesId, isShiny, itemName)
-    if stop_was_requested() then
-        print("Catch-mode: Stop requested - aborting.")
-        return
-    end
-    print(string.format("Catch-mode: couldn't confirm the battle with %s%s actually ended - stopping instead of resuming the hunt, in case it's still there.", label, speciesName))
-    send_catch_notification(string.format("%s%s may still be in battle - bot stopped so you can check and catch it manually.", label, speciesName),
-        COLOR_RED, speciesId, isShiny, itemName)
-end
-
 local CATCH_HP_TARGET_PERCENT = 0.40
 
--- shinyEmbedFields/shinySpriteUrl (optional): the detailed fields built
--- in M.step()'s pendingEncounterUpdate handling for THIS same shiny
--- encounter (DVs, Hidden Power, Location, stats - see
--- send_pending_shiny_embed). When present, the initial "found!
--- attempting to catch" notification below uses these instead of the
--- lean send_catch_notification fields, so the detailed info that used
--- to arrive as its own separate embed is now merged into this first
--- message - confirmed via a real user report/screenshot that a
--- successful shiny auto-catch previously sent 3 Discord messages (lean
--- "found/attempting", lean "caught successfully", and a redundant
--- detailed "Shiny Found!" sandwiched after both) - this keeps it to 2.
--- labelOverride: optional - lets a non-shiny catch still get a
--- distinguishing prefix on every single notification this function sends
--- (found/caught/every failure mode all read off the same `label` below),
--- without touching isShiny itself - isShiny stays reserved for the
--- actual shiny-specific behavior (Stats.record_catch, the shinyEmbedFields
--- branch above). Added for Perfect/Perfect Negative DV catches per a
--- real user request: those were previously only called out in a
--- console-only print right before this function ran, so the Discord
--- "found! Attempting to catch it automatically." and "caught
--- successfully" messages looked identical to any other ordinary
--- auto-catch (living dex, item match) - no way to tell from Discord
--- alone that it was a Perfect DV roll.
-local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labelOverride)
-    local label = labelOverride or (isShiny and "Shiny " or "")
-    print(label .. "found! Starting auto-catch sequence...")
+-- Frame rollback (Auto-Catch Settings): up to Gui.catch_retry_attempts()
+-- tries at one encounter, whatever ended the last one (fled, fainted,
+-- stuck) - the Tries box, or no limit with "Always retry". Each retry
+-- waits a random moment at the battle menu first, so even a catch that
+-- got stuck (our own Pokemon fainted) can go differently next time.
+-- The battle menu of the encounter being caught, shiny on screen and the
+-- team as it was - where a frame-rollback retry goes back to. Saved by
+-- catch_attempt(), only while do_catch_sequence() runs.
+local catchMenuState
 
-    -- Captured here, early, while species_addr is still known-reliable
-    -- (right after confirming the encounter) - by the time the catch
-    -- succeeds and the battle has fully ended, species_addr would
-    -- already read 0, too late to use for later notifications.
-    local caughtSpeciesId = memory.readbyte(species_addr)
-    local caughtSpeciesName = get_pokemon_name(caughtSpeciesId)
-    -- Captured early too, same reasoning as the species/name above - this
-    -- is what makes it possible to show what item triggered/accompanied
-    -- an item-based auto-catch even after the battle (and item_addr's
-    -- validity) has ended.
-    local caughtItemName = get_item_name(memory.readbyte(item_addr))
-
-    if isShiny and shinyEmbedFields then
-        send_discord_embed(string.format("%s%s found! Attempting to catch it automatically.", label, caughtSpeciesName),
-            nil, shinyEmbedFields, COLOR_GOLD, shinySpriteUrl)
+-- One attempt at catching the Pokemon in battle right now. info: what's
+-- being caught ({label, id, name, isShiny} - read once, by
+-- do_catch_sequence below). attempt: nil the first time; 2, 3, ... on a
+-- retry from catchMenuState (then a random extra wait at the battle menu,
+-- so the battle doesn't just go the same way again). snapshot: save
+-- catchMenuState at the battle menu (first attempt, frame rollback on).
+-- Prints what happens; Discord is left to do_catch_sequence. Returns
+-- outcome, why:
+--   "caught"   - why = balls used
+--   "continue" - it's gone (fled, fainted) - keep hunting
+--   "failed"   - couldn't finish, but it may still be there: a menu that
+--                never came back, our own Pokemon down, 20 balls
+--   "stop"     - needs the player: no/low balls, out of PP; why = nil for
+--                the Stop button
+-- Auto-Catch Settings' "send out the next Pokemon" (frame rollback off):
+-- right after our own Pokemon fainted while catching - see
+-- data/next_pokemon.lua. True once the new one is out and the battle menu
+-- is back; the catch then carries on with balls only.
+local function send_next_pokemon()
+    print("Catch-mode: your Pokemon fainted - sending out the next one (balls only from here on).")
+    have_battle_controls = false
+    local ok, why = NextPokemon.send({
+        partyBase = party_base_addr,
+        read8 = function(addr) return memory.readbyte(addr) end,
+        press = press_button,
+        stop = stop_was_requested,
+        battleControls = function() return have_battle_controls end,
+        ownHP = function() return memory.read_u16_be(OWN_HP_ADDR) end,
+    })
+    if ok then
+        print(string.format("Catch-mode: sent out party slot %d - back to throwing balls.", why))
     else
-        send_catch_notification(string.format("%s%s found! Attempting to catch it automatically.", label, caughtSpeciesName),
-            COLOR_GOLD, caughtSpeciesId, isShiny, caughtItemName)
+        print("Catch-mode: didn't send out another Pokemon (" .. tostring(why) .. ").")
+    end
+    return ok
+end
+
+local function catch_attempt(info, attempt, snapshot)
+    local label, caughtSpeciesName = info.label, info.name
+    local function failed(why)
+        print(string.format("Catch-mode: %s - giving up on this attempt.", why))
+        return "failed", why
+    end
+    local function stopped()
+        print("Catch-mode: Stop requested - aborting.")
+        return "stop", nil
     end
 
     -- Unlike do_kill_turn() (which is naturally only reached after
@@ -1894,18 +2038,16 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
     -- real signal - so just wait for have_battle_controls and nothing else.
     local waitFrames = 0
     while not have_battle_controls and waitFrames < 300 do
-        if stop_was_requested() then
-            print("Catch-mode: Stop requested - aborting.")
-            return true
-        end
+        if stop_was_requested() then return stopped() end
         press_button("B")
         waitFrames = waitFrames + 1
     end
     if not have_battle_controls then
-        print("Catch-mode: battle menu never loaded within the timeout - stopping so you can take over.")
-        send_catch_notification(string.format("%s%s could not be caught, bot stopped (battle menu timeout).", label, caughtSpeciesName),
-            COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-        return true
+        return failed("the battle menu never loaded")
+    end
+
+    if snapshot and attempt == nil and catchMenuState == nil then
+        catchMenuState = memorysavestate.savecorestate()
     end
 
     -- species_addr can still be oscillating between 0 and the real
@@ -1916,17 +2058,19 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
     -- of time to settle first. Give it that same settling time here
     -- explicitly, rather than trusting species_addr immediately and
     -- risking a false "fainted" read on a Pokemon that's still at full
-    -- health, as happened before this fix.
-    for i = 1, 60 do
+    -- health, as happened before this fix. A retry waits a random bit
+    -- longer: the battle's randomness depends on exactly when each choice
+    -- is made, so the whole battle shifts.
+    local settleFrames = 60
+    if attempt then settleFrames = settleFrames + math.random(0, 119) end
+    for i = 1, settleFrames do
         emu.frameadvance()
     end
 
     local ballId = find_ball_in_bag()
     if not ballId then
         print("No balls in the bag - stopping so you can restock and catch it manually.")
-        send_catch_notification(string.format("%s%s could not be caught, bot stopped (no balls left).", label, caughtSpeciesName),
-            COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-        return true
+        return "stop", "no balls left"
     end
 
     -- Weaken the enemy to a safe-but-catchable HP range first, since
@@ -1935,31 +2079,60 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
     -- after EVERY attack, not periodically, to minimize the window
     -- where an over-leveled hit could overshoot straight to a faint.
     --
-    -- Skippable entirely via "Don't weaken enemy Pokemon" in Auto-Catch
-    -- Settings - see wild.lua's do_catch_sequence for the full reasoning
-    -- (identical logic, mirrored here).
-    if not Gui.dont_weaken_enabled(hud) then
+    -- Only with moves that can't knock it out (data/move_choice.lua works
+    -- out each one's damage) - a high-level Pokemon against a low-level
+    -- target just throws. With frame rollback on, a critical hit knocking
+    -- it out only means a reset, so crits don't hold a move back then.
+    do
     local lastDamageDealt = nil
     local previousHP = nil
+    -- Weakening that gets nowhere - it heals it back (Rest, Recover,
+    -- Leftovers), or the hits keep missing: once WEAKEN_STALL_TURNS attacks
+    -- in a row haven't taken it below the lowest HP it's been at, or after
+    -- WEAKEN_MAX_TURNS attacks in all, the balls go at whatever HP it has.
+    local WEAKEN_STALL_TURNS, WEAKEN_MAX_TURNS = 3, 15
+    local lowestHP, stallTurns, attackTurns = nil, 0, 0
     local overrideCritSafety = Gui.crit_safety_override_enabled(hud)
     local targetPercent = overrideCritSafety and Gui.custom_catch_hp_target(hud) or CATCH_HP_TARGET_PERCENT
+    local critsOk = overrideCritSafety or info.retry
     while true do
-        if stop_was_requested() then
-            print("Catch-mode: Stop requested - aborting.")
-            return true
-        end
+        if stop_was_requested() then return stopped() end
         local curHP = memory.read_u16_be(enemy_hp_addr)
         local maxHP = memory.read_u16_be(enemy_max_hp_addr)
         if maxHP == 0 then
-            print("Catch-mode: couldn't read enemy max HP - stopping so you can catch it manually.")
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (couldn't read enemy max HP).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return true
+            return failed("couldn't read the enemy's max HP")
         end
         if previousHP ~= nil and curHP < previousHP then
             lastDamageDealt = previousHP - curHP
         end
         if curHP <= maxHP * targetPercent then
+            break
+        end
+        if lowestHP == nil or curHP < lowestHP then lowestHP, stallTurns = curHP, 0 end
+        if stallTurns >= WEAKEN_STALL_TURNS or attackTurns >= WEAKEN_MAX_TURNS then
+            print(string.format("Catch-mode: %d attack%s and %s still has %d of %d HP (lowest %d) - weakening isn't getting anywhere, throwing balls now.",
+                attackTurns, attackTurns == 1 and "" or "s", caughtSpeciesName, curHP, maxHP, lowestHP))
+            break
+        end
+        -- Which move: data/move_choice.lua's pick of all 4 - the most damage
+        -- that still can't knock it out at its highest roll (a critical hit
+        -- included, unless the crit override is on). Once no move can do
+        -- that, throw. Without the game's move table, or once a hit took
+        -- more than it worked out, the old rule below: move 1 (2 without PP)
+        -- until another hit like the last, doubled for a crit, could faint it.
+        local weakenPick, noPickWhy = MoveChoice.weaken(battle_view(), {ignoreCrits = critsOk})
+        if weakenPick then
+            print("Catch-mode: weakening with " .. MoveChoice.describe(weakenPick, critsOk and "override" or nil) .. ".")
+        elseif noPickWhy == "none" then
+            print(string.format("Catch-mode: no move can take more of %s's %d HP without risking a knockout - throwing balls now.",
+                caughtSpeciesName, curHP))
+            break
+        elseif not info.retry then
+            -- The damage can't be worked out (or a hit just took more than
+            -- worked out): without rollback a blind hit could cost the
+            -- catch, so throw from here.
+            print(string.format("Catch-mode: can't tell what a hit would do to %s - throwing balls without weakening further.",
+                caughtSpeciesName))
             break
         end
         -- Predictive safety check: if another hit anywhere near the
@@ -1972,12 +2145,12 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         -- explicitly opted into the crit-safety override, accepting
         -- more risk in exchange for fewer wasted balls on a less
         -- valuable catch.
-        if not overrideCritSafety and lastDamageDealt ~= nil and curHP <= lastDamageDealt * 2 then
+        if weakenPick == nil and not overrideCritSafety and lastDamageDealt ~= nil and curHP <= lastDamageDealt * 2 then
             print(string.format("Catch-mode: another hit (possible crit) could faint the target (curHP=%d, last hit dealt %d) - stopping attacks early.",
                 curHP, lastDamageDealt))
             break
         end
-        if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 and memory.readbyte(FIRST_MOVE_PP_ADDR + 1) == 0 then
+        if weakenPick == nil and move_pp(1) == 0 and move_pp(2) == 0 then
             -- Confirmed via a real user report: attacking with a
             -- depleted move triggers the game's "No PP left!" message
             -- instead of an actual attack - no damage is dealt and the
@@ -1995,63 +2168,45 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
             -- "let the user take over" pattern as the "no balls in the
             -- bag" case above.
             print(string.format("Catch-mode: out of PP on the first two moves while weakening %s - stopping so you can handle this manually.", caughtSpeciesName))
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (out of PP on first two moves).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return true
+            return "stop", "out of PP on the first two moves"
         end
         previousHP = curHP
-        local result = do_catch_attack_turn()
-        if result == "fainted" then
-            print(string.format("%s%s fainted while weakening it for capture - it's gone. Clearing messages and resuming the hunt.", label, caughtSpeciesName))
+        attackTurns, stallTurns = attackTurns + 1, stallTurns + 1
+        local result = do_catch_attack_turn(weakenPick and weakenPick.slot)
+        if result == "fainted" or result == "stuck" then
+            -- "fainted": it went down to the weakening attack. "stuck":
+            -- most likely a genuine faint too - have_battle_controls only
+            -- fails to return if the battle ended entirely, which for the
+            -- weaken phase almost always means the wild Pokemon fainted -
+            -- but it also covers FIGHT-menu navigation failing with the
+            -- target still alive, so only call it gone once the battle is
+            -- confirmed over.
+            print(string.format("Catch-mode: %s%s %s - clearing messages.", label, caughtSpeciesName,
+                result == "fainted" and "fainted while weakening it" or "got stuck while weakening it (likely fainted)"))
             for i = 1, 400 do
-                if stop_was_requested() then
-                    print("Catch-mode: Stop requested - aborting.")
-                    return true
-                end
+                if stop_was_requested() then return stopped() end
                 press_button("B")
             end
             if not confirm_battle_ended() then
-                report_unconfirmed_battle_end(label, caughtSpeciesName, caughtSpeciesId, isShiny, caughtItemName)
-                return true
+                if stop_was_requested() then return stopped() end
+                return failed("couldn't confirm the battle ended - it may still be there")
             end
-            send_catch_notification(string.format("%s%s was not caught, most likely fainted.", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return false
-        elseif result == "stuck" then
-            -- Most likely a genuine faint - have_battle_controls only
-            -- fails to return if the battle ended entirely, which for
-            -- the weaken phase almost always means the wild Pokemon
-            -- fainted. Unfortunate (this specific shiny is lost), but
-            -- not a reason to stop the whole bot - clear the post-faint
-            -- messages and get back to hunting. "stuck" also covers
-            -- FIGHT-menu navigation failing with the target still alive,
-            -- though, so only resume once the battle is confirmed over.
-            print("Catch-mode: got stuck while weakening the enemy (likely fainted) - clearing messages and resuming the hunt.")
-            for i = 1, 400 do
-                if stop_was_requested() then
-                    print("Catch-mode: Stop requested - aborting.")
-                    return true
-                end
-                press_button("B")
+            return "continue", "it fainted"
+        elseif result == "own_fainted" then
+            -- With "send out the next Pokemon" it goes in and only throws
+            -- balls from here on - its moves could knock the target out.
+            if not (info.sendNext and send_next_pokemon()) then
+                return failed("your Pokemon fainted - the game wants the next one")
             end
-            if not confirm_battle_ended() then
-                report_unconfirmed_battle_end(label, caughtSpeciesName, caughtSpeciesId, isShiny, caughtItemName)
-                return true
-            end
-            send_catch_notification(string.format("%s%s was not caught, most likely fainted.", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return false
+            break
         elseif result == "move2_stuck" then
             -- NOT the same as "stuck" above - this means the second-move
             -- navigation itself failed (the cursor didn't land where
             -- expected), a real bug rather than a presumed faint.
             -- Resuming the hunt here would just walk back into the exact
             -- same battle and hit the identical navigation failure next
-            -- turn, looping forever - so stop the bot entirely instead.
-            print(string.format("Catch-mode: stopping bot - couldn't reliably use the second move on %s.", caughtSpeciesName))
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (second-move navigation failed).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return true
+            -- turn, looping forever.
+            return failed("couldn't reliably select the second move")
         end
     end
     end
@@ -2061,16 +2216,13 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
     local throws = 0
     local LOW_BALL_THRESHOLD = 3
     while throws < maxThrows do
-        if stop_was_requested() then
-            print("Catch-mode: Stop requested - aborting.")
-            return true
-        end
+        if stop_was_requested() then return stopped() end
         ballId = find_ball_in_bag()
         if not ballId then
+            -- With rollback, resetting gives every ball thrown back.
+            if info.retry and throws > 0 then return failed("out of balls") end
             print("Ran out of balls mid-catch - stopping so you can restock and finish manually.")
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (ran out of balls mid-catch).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return true
+            return "stop", "ran out of balls mid-catch"
         end
 
         -- Stop BEFORE using one of the last few balls (combined across
@@ -2078,20 +2230,16 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         -- thrown) - preserves them for manual catching (status
         -- effects, etc) rather than throwing straight down to zero.
         local remainingBalls = total_ball_count()
-        if remainingBalls <= LOW_BALL_THRESHOLD then
+        -- Not with rollback: the reset gives the balls back, so it throws
+        -- down to the last one and resets.
+        if not info.retry and remainingBalls <= LOW_BALL_THRESHOLD then
             print(string.format("Catch-mode: only %d ball(s) left total - stopping so you can finish manually.", remainingBalls))
-            send_catch_notification(string.format(
-                "%s%s could not be caught, bot stopped (only %d ball(s) left, preserved for manual catching).", label, caughtSpeciesName, remainingBalls),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return true
+            return "stop", string.format("only %d ball(s) left, preserved for manual catching", remainingBalls)
         end
 
         local navigated = navigate_to_pack_and_select_ball(ballId)
         if not navigated then
-            print("Catch-mode: failed to navigate to the ball - stopping so you can take over.")
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (navigation stuck).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return true
+            return failed("couldn't get to the ball in the Pack")
         end
 
         -- Use the precise, verified catch-outcome hooks
@@ -2104,19 +2252,23 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         -- determines the outcome, so no guessing is needed at all.
         catchOutcomeSucceeded = false
         catchOutcomeFailed = false
-        local waitFrames = 0
-        while not catchOutcomeSucceeded and not catchOutcomeFailed and waitFrames < 1200 do
-            if stop_was_requested() then
-                print("Catch-mode: Stop requested - aborting.")
-                return true
-            end
+        local ballWaitFrames = 0
+        while not catchOutcomeSucceeded and not catchOutcomeFailed and ballWaitFrames < 1200 do
+            if stop_was_requested() then return stopped() end
             press_button("A")
             for i = 1, 15 do
                 emu.frameadvance()
             end
-            waitFrames = waitFrames + 20
+            ballWaitFrames = ballWaitFrames + 20
         end
 
+        if catchOutcomeSucceeded or catchOutcomeFailed then
+            -- Every ball thrown at this Pokemon, across rollbacks too (they
+            -- give the balls back in-game) - for the final notification.
+            info.ballsThrown = (info.ballsThrown or 0) + 1
+            info.ballsUsed = info.ballsUsed or {}
+            info.ballsUsed[ballId] = (info.ballsUsed[ballId] or 0) + 1
+        end
         if catchOutcomeSucceeded then
             -- Battle ended - the catch succeeded. Press through the
             -- nickname prompt (declining it), the Pokedex registration
@@ -2126,22 +2278,14 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
             -- already proven for every other battle-end scenario in
             -- this project (escapes, kills, etc).
             print("Caught! Declining nickname prompt and clearing follow-up messages...")
-            if isShiny then
-                Stats.record_catch(caughtSpeciesId)
+            if info.isShiny then
+                Stats.record_catch(info.id)
             end
-            local ballsUsed = throws + 1 -- throws only counts FAILED attempts; this successful one isn't in it yet
-            send_catch_notification(string.format("%s%s caught successfully via auto-catch! (used %d Ball%s)",
-                label, caughtSpeciesName, ballsUsed, ballsUsed == 1 and "" or "s"),
-                COLOR_GREEN, caughtSpeciesId, isShiny, caughtItemName)
             for i = 1, 400 do
-                if stop_was_requested() then
-                    print("Catch-mode: Stop requested - aborting.")
-                    return true
-                end
+                if stop_was_requested() then return stopped() end
                 press_button("B")
             end
-            print("Resuming the hunt.")
-            return false
+            return "caught", throws + 1 -- throws only counts FAILED attempts; this successful one isn't in it yet
         elseif catchOutcomeFailed then
             throws = throws + 1
             print(string.format("Ball thrown (%d/%d) - it broke free, trying again.", throws, maxThrows))
@@ -2149,69 +2293,57 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
             -- but the "It broke free!" text still needs to visibly play
             -- out and the main battle menu needs to actually reload
             -- before navigating to Pack makes sense - wait for that here.
-            -- Budget raised from a flat 300 to 900, and a stop_was_requested()
-            -- check added (missing before, unlike every other wait loop in
-            -- this function): confirmed via a real user report (console log
-            -- showing "Ball thrown (1/20) - it broke free, trying again."
-            -- immediately followed by "Catch-mode: failed to navigate to
-            -- the ball") that the wild Pokemon getting its own turn here -
+            -- Budget raised from a flat 300 to 900: confirmed via a real
+            -- user report that the wild Pokemon getting its own turn here -
             -- e.g. using Thunder Wave and paralyzing the player's Pokemon -
             -- adds a SECOND message on top of "It broke free!", more
-            -- dialogue than 300 frames of A-mashing reliably clears. When
-            -- that happened, have_battle_controls was still false when this
-            -- loop gave up, and navigate_to_pack_and_select_ball() below -
-            -- whose own PACK-selection loop only runs `while have_battle_
-            -- controls`- silently skipped straight to scrolling a menu that
-            -- was never actually open, eventually failing with a confusing
-            -- "couldn't find the ball" instead of describing what actually
-            -- happened.
+            -- dialogue than 300 frames of A-mashing reliably clears.
             have_battle_controls = false
             local recoverFrames = 0
+            local ownDown = 0
             while not have_battle_controls and recoverFrames < 900 do
-                if stop_was_requested() then
-                    print("Catch-mode: Stop requested - aborting.")
-                    return true
-                end
+                if stop_was_requested() then return stopped() end
                 press_button("A")
                 recoverFrames = recoverFrames + 1
+                -- Or its turn knocked out our own Pokemon - caught here,
+                -- before the A presses walk into the "next Pokemon?" prompt.
+                ownDown = own_pokemon_down() and ownDown + 1 or 0
+                if ownDown >= 3 then
+                    if not (info.sendNext and send_next_pokemon()) then
+                        return failed("your Pokemon fainted - the game wants the next one")
+                    end
+                    ownDown = 0
+                end
             end
             if not have_battle_controls then
-                -- CORRECTION (real user report, shiny Delibird - see
-                -- wild.lua's own copy of this comment for the full
-                -- rationale): before concluding this needs manual
-                -- intervention, check whether the battle has actually
-                -- already ENDED - species_addr reading 0 means there's no
-                -- wild Pokemon left to have a battle menu for at all. The
-                -- most likely real cause: the wild Pokemon used its own
-                -- turn (after the failed throw) to flee instead of
-                -- attacking, which genuinely ends the battle outright -
-                -- a normal, harmless outcome, not an error worth stopping
-                -- the whole bot over.
+                -- CORRECTION (real user report, shiny Delibird - a
+                -- species with a notably high wild flee rate): before
+                -- concluding this needs manual intervention, check
+                -- whether the battle has actually already ENDED -
+                -- species_addr reading 0 means there's no wild Pokemon
+                -- left to have a battle menu for at all. The most likely
+                -- real cause: the wild Pokemon used its own turn (after the
+                -- failed throw) to flee instead of attacking, which
+                -- genuinely ends the battle outright - a normal outcome,
+                -- not an error.
                 if confirm_battle_ended(300) then
-                    -- Still need to rule out our own Pokemon fainting
-                    -- instead (recoil, confusion self-hit, a status
-                    -- condition, etc, on the wild Pokemon's turn) - same
-                    -- OWN_HP_ADDR check do_kill_turn/do_thief_turn already
-                    -- use for exactly this. That genuinely does need a
-                    -- replacement sent out manually, so it still stops.
+                    -- Still need to rule out the OTHER thing that ends a
+                    -- battle outright: our own Pokemon fainting (recoil,
+                    -- confusion self-hit, a status condition, etc, on the
+                    -- wild Pokemon's turn) - that genuinely does need a
+                    -- replacement sent out, so it's not a plain "gone".
                     if memory.read_u16_be(OWN_HP_ADDR) == 0 then
-                        print("Catch-mode: your own Pokemon appears to have fainted during the wild Pokemon's turn (after the failed throw) - stopping so you can send out a replacement manually.")
-                        send_catch_notification(string.format("%s%s could not be caught - your Pokemon fainted before the next throw. Bot stopped, send out a replacement.", label, caughtSpeciesName),
-                            COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-                        return true
+                        return failed("your Pokemon fainted")
                     end
-                    print("Catch-mode: the wild Pokemon appears to have fled during its own turn after the failed throw - resuming the hunt normally.")
-                    send_catch_notification(string.format("%s%s got away (likely fled) before it could be caught - continuing the hunt.", label, caughtSpeciesName),
-                        COLOR_BLUE, caughtSpeciesId, isShiny, caughtItemName)
-                    return false
+                    print("Catch-mode: the wild Pokemon appears to have fled during its own turn after the failed throw.")
+                    return "continue", "it fled"
                 end
                 -- species_addr is still nonzero - still nominally the
-                -- same battle, so this isn't a flee/faint - a real stuck
-                -- state worth stopping for.
-                print("Catch-mode: battle menu didn't reload after the failed throw within the extended timeout - stopping so you can take over.")
-                send_catch_notification(string.format("%s%s could not be caught, bot stopped (battle menu didn't return after a failed throw - possibly stuck on an unexpected prompt).", label, caughtSpeciesName),
-                    COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-                return true
+                -- same battle, so this ISN'T a flee/faint ending things
+                -- early. The menu genuinely never came back for some
+                -- other reason (an unresolved dialog/prompt this recovery
+                -- loop's A-mashing couldn't clear).
+                return failed("the battle menu didn't come back after a failed throw")
             end
         else
             -- Neither hook fired within the timeout - genuinely stuck
@@ -2226,13 +2358,117 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         end
     end
 
-    print("Ran out of throw attempts (" .. maxThrows .. ") without catching it - stopping so you can take over.")
-    send_catch_notification(string.format("%s%s could not be caught, bot stopped (ran out of throw attempts).", label, caughtSpeciesName),
-        COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-    return true
+    return failed(string.format("%d balls didn't catch it", maxThrows))
 end
 
-local function do_kill_turn()
+-- shinyEmbedFields/shinySpriteUrl (optional): the detailed fields built
+-- in M.step()'s pendingEncounterUpdate handling for THIS same shiny
+-- encounter (DVs, Hidden Power, Location, stats - see
+-- send_pending_shiny_embed). When present, the initial "found!
+-- attempting to catch" notification below uses these instead of the
+-- lean send_catch_notification fields, so the detailed info that used
+-- to arrive as its own separate embed is merged into this first message.
+-- Discord hears about a catch twice in all: that "found!", and how it
+-- ended - with the number of resets and Balls, never once per attempt.
+-- labelOverride: optional - lets a non-shiny catch still get a
+-- distinguishing prefix on both of those (e.g. "Perfect DV "), without
+-- touching isShiny itself - isShiny stays reserved for the actual
+-- shiny-specific behavior (Stats.record_catch, the shinyEmbedFields
+-- branch).
+--
+-- With frame rollback on (Auto-Catch Settings), a catch that gets away
+-- (it fled, fainted) or gets stuck (our own Pokemon down, a menu that
+-- never came back) goes back to the start of the battle - catchMenuState:
+-- the battle menu, shiny on screen, team as it was - and tries again, up
+-- to Gui.catch_retry_attempts() in all. Out of retries:
+-- gone - keep hunting, the natural way; stuck - back to the start of the
+-- battle and stop, so the player takes it from there. Off: the first
+-- attempt decides, as it always did.
+--
+-- Returns true to stop the bot, false to keep hunting.
+local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labelOverride)
+    local label = labelOverride or (isShiny and "Shiny " or "")
+    print(label .. "found! Starting auto-catch sequence...")
+
+    -- Captured here, early, while species_addr is still known-reliable
+    -- (right after confirming the encounter) - by the time the catch
+    -- succeeds and the battle has fully ended, species_addr would
+    -- already read 0, too late to use for later notifications. Same for
+    -- item_addr.
+    local caughtSpeciesId = memory.readbyte(species_addr)
+    local caughtSpeciesName = get_pokemon_name(caughtSpeciesId)
+    local caughtItemName = get_item_name(memory.readbyte(item_addr))
+    local function notify(text, color)
+        send_catch_notification(text, color, caughtSpeciesId, isShiny, caughtItemName)
+    end
+
+    if isShiny and shinyEmbedFields then
+        send_discord_embed(string.format("%s%s found! Attempting to catch it automatically.", label, caughtSpeciesName),
+            nil, shinyEmbedFields, COLOR_GOLD, shinySpriteUrl)
+    else
+        notify(string.format("%s%s found! Attempting to catch it automatically.", label, caughtSpeciesName), COLOR_GOLD)
+    end
+
+    local info = {label = label, id = caughtSpeciesId, name = caughtSpeciesName, isShiny = isShiny}
+    local retry = Gui.catch_retry_enabled(hud)
+    info.sendNext = not retry and Gui.catch_send_next_enabled(hud)
+    -- A failed attempt goes back to the start of the battle (catchMenuState).
+    info.retry = retry
+    local maxAttempts = Gui.catch_retry_attempts(hud)
+    local outcome, why = catch_attempt(info, nil, retry)
+    local attempt = 1
+    while catchMenuState and (outcome == "continue" or outcome == "failed") and attempt < maxAttempts and not stop_was_requested() do
+        attempt = attempt + 1
+        print(string.format("Catch-mode: %s - back to the start of the battle (reset %s).", why,
+            maxAttempts == math.huge and tostring(attempt - 1) or ((attempt - 1) .. " of " .. (maxAttempts - 1))))
+        memorysavestate.loadcorestate(catchMenuState)
+        moveLearnHold = nil -- from before any move-learn prompt
+        have_battle_controls = true
+        outcome, why = catch_attempt(info, attempt)
+    end
+
+    local resets, balls = attempt - 1, info.ballsThrown or 0
+    -- "3 Ultra Balls", "2 Ultra Balls and 1 Poke Ball" - by kind, best first.
+    local kinds = {}
+    for _, id in ipairs(BALL_ITEM_IDS) do
+        local n = info.ballsUsed and info.ballsUsed[id] or 0
+        if n > 0 then kinds[#kinds + 1] = string.format("%d %s%s", n, get_item_name(id), n == 1 and "" or "s") end
+    end
+    local ballText = #kinds == 0 and string.format("%d Ball%s", balls, balls == 1 and "" or "s")
+        or #kinds == 1 and kinds[1] or (table.concat(kinds, ", ", 1, #kinds - 1) .. " and " .. kinds[#kinds])
+    local tries = resets > 0 and string.format(" after %d reset%s and %s", resets, resets == 1 and "" or "s", ballText) or ""
+    local stopBot = true
+    if outcome == "caught" then
+        notify(string.format("%s%s caught successfully via auto-catch! (used %s%s)", label, caughtSpeciesName,
+            ballText, resets > 0 and string.format(" across %d reset%s", resets, resets == 1 and "" or "s") or ""),
+            COLOR_GREEN)
+        print("Resuming the hunt.")
+        stopBot = false
+    elseif outcome == "continue" then
+        notify(string.format("%s%s got away%s (%s) - continuing the hunt.", label, caughtSpeciesName, tries, why), COLOR_RED)
+        stopBot = false
+    elseif outcome == "failed" and catchMenuState then
+        -- Over to the player - from the start of the battle, not from
+        -- wherever the last attempt got stuck.
+        memorysavestate.loadcorestate(catchMenuState)
+        moveLearnHold = nil
+        have_battle_controls = true
+        notify(string.format("%s%s: auto-catch stopped%s (%s) - catch it yourself from the start of the battle.", label, caughtSpeciesName,
+            tries, why), COLOR_RED)
+    elseif why then
+        notify(string.format("%s%s could not be caught, bot stopped (%s).", label, caughtSpeciesName, why), COLOR_RED)
+    end
+    if catchMenuState then
+        memorysavestate.removestate(catchMenuState)
+        catchMenuState = nil
+    end
+    -- wild.lua's no-progress timer (fishing/headbutt have none) - the
+    -- catch itself may well have taken minutes.
+    if mark_progress then mark_progress() end
+    return stopBot
+end
+
+local function do_kill_turn(slot)
     local nav_attempts = 0
     while have_battle_controls and memory.readbyte(species_addr) ~= 0 do
         local cy = memory.readbyte(MENU_CURSOR_Y)
@@ -2309,7 +2545,23 @@ local function do_kill_turn()
     -- caveat on this). The caller already confirmed at least one of
     -- the two has PP before deciding to kill at all.
     local usedSecondMove = false
-    if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 then
+    if slot and moveSelectScreenOpen then
+        -- A move from data/move_choice.lua: straight to its row.
+        if not go_to_move_slot(slot) then
+            move2NavFailStreak = move2NavFailStreak + 1
+            if move2NavFailStreak >= 25 then
+                print(string.format("Kill-mode: couldn't get the cursor to move %d, %d times in a row - stopping so you can handle this manually.",
+                    slot, move2NavFailStreak))
+                return "stuck"
+            end
+            vprint(string.format("Couldn't get the cursor to move %d (it's on %d) - backing out and retrying.", slot, memory.readbyte(MENU_CURSOR_Y)))
+            press_button("B")
+            return
+        end
+        move2NavFailStreak = 0
+        usedSecondMove = slot ~= 1
+        vprint(string.format("Pressing A to use move %d", slot))
+    elseif move_pp(1) == 0 then
         usedSecondMove = true
         vprint("First move out of PP - using the second move instead")
         press_and_wait_for_cursor_change(navigate_to_menu_option(MOVE2_CURSOR), 30)
@@ -2461,6 +2713,10 @@ local function do_kill_turn()
     local activeSpecies = battleLevelBaselineSpecies
     local confirmedHigherLevelFrames = 0
     local lastSeenLevel = get_active_mon_level()
+    -- Backstop for the move-learn hook - see wild.lua's do_kill_turn: B
+    -- after a level-up into a move level with all 4 slots full, so the
+    -- prompt can only be answered NO even if the hook never fires.
+    local mashB = false
     while not have_battle_controls and memory.readbyte(species_addr) ~= 0 do
         -- Own Pokemon fainting mid-turn (confusion hitting itself,
         -- recoil, etc.) throws the battle into a "send out next
@@ -2481,19 +2737,12 @@ local function do_kill_turn()
             print("Kill-mode: your own Pokemon appears to have fainted mid-turn (confusion self-hit, recoil, etc.) - stopping so you can send out a replacement manually.")
             return "stuck"
         end
-        -- Check BEFORE pressing - see wild.lua's do_kill_turn() for the
-        -- full reasoning (a move can only be learned on a level-up, so
-        -- the instant level increases, a move-learn prompt could be
-        -- showing right now - stop before any further A press could
-        -- risk confirming it).
-        if learnMovePromptDetected then
-            if battleLevelBaselineMoveCount ~= nil and battleLevelBaselineMoveCount < 4 then
-                vprint("Move-learn prompt detected, but a free move slot was available at battle start - auto-fills with no risk, continuing.")
-                learnMovePromptDetected = false
-            else
-                print("Move-learn prompt detected - stopping immediately so you can decide (this Pokemon likely also just leveled up).")
-                return "stuck"
-            end
+        -- The move-learn hook caught a Pokemon that knows 4 moves starting
+        -- to learn a new one (moveLearnHold): nothing gets pressed any
+        -- more, so stop here - see wild.lua's do_kill_turn().
+        if moveLearnHold then
+            print("Move-learn prompt for a Pokemon that knows 4 moves - stopping so you can decide.")
+            return "stuck"
         end
         local currentLevel = get_active_mon_level()
         -- Require the SAME level value confirmed across 3 consecutive
@@ -2519,16 +2768,13 @@ local function do_kill_turn()
             confirmedHigherLevelFrames = (currentLevel > levelBeforeAttack and currentLevel <= 100) and 1 or 0
         end
         lastSeenLevel = currentLevel
-        if confirmedHigherLevelFrames >= 3 and learns_move_in_range(activeSpecies, levelBeforeAttack, currentLevel) then
-            if battleLevelBaselineMoveCount ~= nil and battleLevelBaselineMoveCount < 4 then
-                vprint(string.format("Level increase to %d with a move-learn possible, but a free move slot was available at battle start - auto-fills with no risk, continuing.", currentLevel))
-            else
-                print(string.format("Level increase to %d - this species learns a move somewhere in that range, a learn-prompt is likely showing. Stopping so you can decide.", currentLevel))
-                return "stuck"
-            end
+        if not mashB and confirmedHigherLevelFrames >= 3 and battleLevelBaselineMoveCount == 4
+            and learns_move_in_range(activeSpecies, levelBeforeAttack, currentLevel) then
+            vprint(string.format("Level increase to %d with a new move possible and no free slot - pressing B from here, so a move-learn prompt can only be answered NO.", currentLevel))
+            mashB = true
         end
         emu.frameadvance()
-        press_button("A")
+        press_button(mashB and "B" or "A")
         postAttackWait = postAttackWait + 1
         if postAttackWait > postAttackTimeout then
             print(string.format("Stuck after attacking for %d+ frames (likely a move-learn or evolution prompt) - stopping so you can handle it manually", postAttackTimeout))
@@ -2549,7 +2795,45 @@ local FISH_CAST_ATTEMPTS = 40 -- ~40 * 5 frames = ~200 frames (~3-4s) - first-gu
 -- every single cast, not once per reset.
 local FISHING_JITTER_RANGE = 64
 
+-- Where the player stood when fishing started (M.on_resume() forgets it).
+local fishSpotX, fishSpotY
+
+-- Fishing never moves the player, so standing one tile off the spot means
+-- a stray A answered "Want to SURF?" with YES (an A after a battle can do
+-- that - the cast itself only presses B). Step back onto the shore, which
+-- ends the surf, then face the water again. Further off (a map change, or
+-- you moved it yourself): that's the new spot.
+local function return_to_fishing_spot()
+    local x, y = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
+    if fishSpotX == nil or math.abs(x - fishSpotX) + math.abs(y - fishSpotY) > 1 then
+        fishSpotX, fishSpotY = x, y
+        return
+    end
+    local dx, dy = x - fishSpotX, y - fishSpotY
+    if dx == 0 and dy == 0 then return end
+    local back = dx == 1 and "Left" or dx == -1 and "Right" or dy == 1 and "Up" or "Down"
+    local water = dx == 1 and "Right" or dx == -1 and "Left" or dy == 1 and "Down" or "Up"
+    print("Fishing: the player ended up surfing (a stray A answered \"Want to SURF?\") - stepping back onto the shore.")
+    for _ = 1, 90 do
+        joypad.set({[back] = true})
+        emu.frameadvance()
+        if memory.readbyte(PLAYER_X_ADDR) == fishSpotX and memory.readbyte(PLAYER_Y_ADDR) == fishSpotY then break end
+    end
+    -- Let the step finish, then a short tap turns without stepping (and
+    -- the water would stop a step anyway).
+    for _ = 1, 30 do emu.frameadvance() end
+    for _ = 1, 3 do
+        joypad.set({[water] = true})
+        emu.frameadvance()
+    end
+    for _ = 1, 20 do emu.frameadvance() end
+    if memory.readbyte(PLAYER_X_ADDR) ~= fishSpotX or memory.readbyte(PLAYER_Y_ADDR) ~= fishSpotY then
+        print("Fishing: couldn't get back onto the fishing spot - check on the game.")
+    end
+end
+
 local function do_fish_cycle()
+    return_to_fishing_spot()
     -- Burns a random 1-64 idle frames before every cast so consecutive
     -- bites don't keep landing on the same frame-timing relationship
     -- between the two DV-roll reads. Safe blind here, same as wild.lua -
@@ -2560,6 +2844,11 @@ local function do_fish_cycle()
     vprint("Casting rod (Select)...")
     press_button("Select")
 
+    -- B, never A, through "Not even a nibble!" / "Oh! A bite!": once the
+    -- text is gone, an A facing water asks "Want to SURF?" (with a Surf
+    -- Pokemon in the party) and the next A says YES. B there does nothing,
+    -- and it answers NO if a stray A from elsewhere opened that question.
+    --
     -- Deliberately NOT using the shared press_button() helper for the
     -- wait-for-bite presses below. press_button() holds its button for 4
     -- straight frames via joypad.set before ever checking species_addr
@@ -2580,10 +2869,10 @@ local function do_fish_cycle()
                 encounterStarted = true
                 break
             end
-            joypad.set({A = true})
+            joypad.set({B = true})
             emu.frameadvance()
         end
-        joypad.set({A = false})
+        joypad.set({B = false})
         if encounterStarted then
             vprint("Bite! Battle starting.")
             return
@@ -2621,12 +2910,50 @@ local REQUIRED_SETTLE_FRAMES = 90
 -- module registered LAST keeps its hooks active, even after switching to
 -- a "different" module, unless that module re-registers its own. This
 -- must be called every time this module becomes active, not just once.
+-- LearnLevelMoves.learn - see wild.lua's note_move_learn().
+local function note_move_learn()
+    local slot = wram(wCurPartyMonAddr or curPartyMonAddr)
+    if slot > 5 then slot = 5 end
+    local moves, known = {}, 0
+    for i = 0, 3 do
+        moves[i + 1] = wram(party_base_addr + 0x0A + slot * 0x30 + i)
+        if moves[i + 1] ~= 0 then known = known + 1 end
+    end
+    if known < 4 then
+        vprint("LearnLevelMoves.learn entered - a free move slot takes the new move, no prompt")
+    elseif moveLearnHold == nil then
+        moveLearnHold = {slot = slot, species = wram(party_base_addr + 1 + slot), moves = moves}
+        print("Move-learn prompt coming up for a Pokemon that knows 4 moves - no more button presses until you decide.")
+    end
+end
+
+-- Stops the bot for moveLearnHold, with one Discord ping - see wild.lua's
+-- stop_for_move_learn(). Returns true (stop).
+local function stop_for_move_learn()
+    local hold = moveLearnHold
+    if not hold.notified then
+        hold.notified = true
+        local moveId = wPutativeTMHMMoveAddr and wram(wPutativeTMHMMoveAddr) or 0
+        local newMove = moveId ~= 0 and get_move_name(moveId) or "a new move"
+        local known = {}
+        for i, id in ipairs(hold.moves) do known[i] = get_move_name(id) end
+        local name = get_pokemon_name(hold.species)
+        print(string.format("Stopped: %s wants to learn %s but already knows %s. Choose in game what to forget (or not to learn it), then click Start.",
+            name, newMove, table.concat(known, ", ")))
+        send_discord_embed(string.format("%s wants to learn %s - bot stopped, your call", name, newMove),
+            "It already knows 4 moves. Choose in game which one to forget (or not to learn it), then click Start.",
+            {{name = "Knows", value = table.concat(known, ", ")}}, COLOR_GOLD, regular_sprite_url(hold.species))
+    end
+    Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount,
+        "Stopped - a new move needs your decision")
+    return true
+end
+
 local function register_hooks()
     if LearnMoveAddr then
         Mem.RegisterROMHook(LearnMoveAddr, function()
             if ActiveModuleName ~= "fishing" then return end
-            learnMovePromptDetected = true
-            vprint("LearnLevelMoves.learn entered - a move is being learned, stopping A presses")
+            note_move_learn()
         end, "Detect Move-Learn Prompt")
     end
 
@@ -2705,6 +3032,7 @@ local function register_hooks()
         print(encounterLine)
 
         sessionEncounterCount = sessionEncounterCount + 1
+        encounterSerial = encounterSerial + 1
 
         -- See data/console_log.lua for the full rationale: BizHawk's own
         -- Lua console has no cap on accumulated output and gets slower
@@ -2822,6 +3150,8 @@ function M.init(sharedForm, yOffset, existingHud)
         MENU_CURSOR_Y = 0xCEE0
         MENU_CURSOR_X = 0xCEE1
         FIRST_MOVE_PP_ADDR = 0xCB14
+        PLAYER_X_ADDR = 0xDA03
+        PLAYER_Y_ADDR = 0xDA02
         OWN_HP_ADDR = 0xCB1C
         OWN_MAX_HP_ADDR = 0xCB1E
         wCurItemAddr = 0xD002
@@ -2833,6 +3163,8 @@ function M.init(sharedForm, yOffset, existingHud)
         MENU_CURSOR_Y = 0xCFA9
         MENU_CURSOR_X = 0xCFAA
         FIRST_MOVE_PP_ADDR = 0xC634
+        PLAYER_X_ADDR = 0xDCB8
+        PLAYER_Y_ADDR = 0xDCB7
         OWN_HP_ADDR = 0xC63C
         OWN_MAX_HP_ADDR = 0xC63E
         wCurItemAddr = 0xD106
@@ -2893,15 +3225,20 @@ function M.init(sharedForm, yOffset, existingHud)
             MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x64bc)
             Mem.SetRomBankAddress("Crystal")
         elseif region == 0x4A then
-            enemy_addr = 0xd23d
-            LoadBattleMenuAddr = Mem.BankAddressToLinear(0x9, 0x4EF2)
-            EnemyWildmonInitialized = Mem.BankAddressToLinear(0xF, 0x7648)
-            LearnMoveAddr = Mem.BankAddressToLinear(0x10, 0x64c5) -- LearnLevelMoves.learn
-            -- Verified against pokecrystal.sym: PokeBallEffect.caught
-            -- and PokeBallEffect.shake_and_break_free, both bank $03.
-            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x69f5)
-            CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6bdc)
-            MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x64bc)
+            -- Japanese Crystal - data/gs_jp.lua. Other revisions stop here
+            -- and say why.
+            if not GsJp.supported(version, region) then
+                print(GsJp.unsupported_reason(version))
+                return false
+            end
+            print("Japanese Crystal detected")
+            enemy_addr = GsJp.w(0xD20C)
+            LoadBattleMenuAddr = GsJp.hook("LoadBattleMenu")
+            EnemyWildmonInitialized = GsJp.hook("SkipUnown")
+            LearnMoveAddr = GsJp.hook("LearnMove")
+            CatchSuccessAddr = GsJp.hook("Caught")
+            CatchFailAddr = GsJp.hook("BreakFree")
+            MoveSelectionAddr = GsJp.hook("MoveSelection")
             Mem.SetRomBankAddress("Crystal")
         end
     elseif version == 0x55 or version == 0x58 then
@@ -2929,23 +3266,28 @@ function M.init(sharedForm, yOffset, existingHud)
             LearnMoveAddr = Mem.BankAddressToLinear(0x10, 0x64c1) -- LearnLevelMoves.learn
             -- Verified against pokegold.sym: PokeBallEffect.caught and
             -- PokeBallEffect.shake_and_break_free, both bank $03.
-            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x6a79)
-            CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6c45)
+            -- Silver's are 2 bytes earlier than Gold's (pokesilver.sym: 03:6A77 /
+            -- 03:6C43); Gold's addresses land mid-instruction in Silver and
+            -- never fire.
+            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, version == 0x58 and 0x6a77 or 0x6a79)
+            CatchFailAddr = Mem.BankAddressToLinear(0x3, version == 0x58 and 0x6c43 or 0x6c45)
             MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x62f3)
             Mem.SetRomBankAddress("Gold")
         elseif region == 0x4A then
-            -- STILL UNVERIFIED - same enemy_addr=party_base_addr bug
-            -- pattern just confirmed and fixed for EU/US, but no
-            -- JP-specific symbol data available to correct it.
-            enemy_addr = 0xd9e8
-            LoadBattleMenuAddr = Mem.BankAddressToLinear(0x9, 0x4E62)
-            EnemyWildmonInitialized = Mem.BankAddressToLinear(0xF, 0x7400)
-            LearnMoveAddr = Mem.BankAddressToLinear(0x10, 0x64c1) -- LearnLevelMoves.learn
-            -- Verified against pokegold.sym: PokeBallEffect.caught and
-            -- PokeBallEffect.shake_and_break_free, both bank $03.
-            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x6a79)
-            CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6c45)
-            MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x62f3)
+            -- Japanese Gold (Kin) and Silver (Gin, Rev A) - data/gs_jp.lua.
+            -- Other revisions stop here and say why.
+            if not GsJp.supported(version, region) then
+                print(GsJp.unsupported_reason(version))
+                return false
+            end
+            print(GsJp.name(version) .. " detected")
+            enemy_addr = GsJp.w(0xD0F5)
+            LoadBattleMenuAddr = GsJp.hook("LoadBattleMenu")
+            EnemyWildmonInitialized = GsJp.hook("SkipUnown")
+            LearnMoveAddr = GsJp.hook("LearnMove")
+            CatchSuccessAddr = GsJp.hook("Caught")
+            CatchFailAddr = GsJp.hook("BreakFree")
+            MoveSelectionAddr = GsJp.hook("MoveSelection")
             Mem.SetRomBankAddress("Gold")
         elseif region == 0x4B then
             -- STILL UNVERIFIED - same caveat as the JP branch above.
@@ -2989,6 +3331,36 @@ function M.init(sharedForm, yOffset, existingHud)
         elseif region == 0x4B then party_base_addr = 0xDB1F
         else party_base_addr = 0xDA22 end
     end
+    -- See wCurPartyMonAddr's declaration.
+    if version == 0x54 and region ~= 0x4A then
+        wCurPartyMonAddr, wPutativeTMHMMoveAddr = 0xD109, 0xD262
+    elseif region ~= 0x4A and region ~= 0x4B then
+        wCurPartyMonAddr, wPutativeTMHMMoveAddr = 0xD005, 0xD14D
+    else
+        wCurPartyMonAddr, wPutativeTMHMMoveAddr = nil, nil
+    end
+
+    -- The Japanese versions: the English addresses set above (Gold/Silver
+    -- or Crystal), moved to where they keep them (data/gs_jp.lua). The
+    -- party is already right (party_base_addr).
+    if GsJp.japanese(version, region) then
+        local J = GsJp.w
+        curPartyMonAddr = J(curPartyMonAddr)
+        MENU_CURSOR_Y = J(MENU_CURSOR_Y)
+        MENU_CURSOR_X = J(MENU_CURSOR_X)
+        FIRST_MOVE_PP_ADDR = J(FIRST_MOVE_PP_ADDR)
+        PLAYER_X_ADDR = J(PLAYER_X_ADDR)
+        PLAYER_Y_ADDR = J(PLAYER_Y_ADDR)
+        OWN_HP_ADDR = J(OWN_HP_ADDR)
+        OWN_MAX_HP_ADDR = J(OWN_MAX_HP_ADDR)
+        wCurItemAddr = J(wCurItemAddr)
+        wItemsAddr = J(wItemsAddr)
+        wNumItemsAddr = J(wNumItemsAddr)
+        wBallsAddr = J(wBallsAddr)
+        wNumBallsAddr = J(wNumBallsAddr)
+        wCurPartyMonAddr = J(version == 0x54 and 0xD109 or 0xD005)
+        wPutativeTMHMMoveAddr = J(version == 0x54 and 0xD262 or 0xD14D)
+    end
 
     register_hooks()
 
@@ -3016,14 +3388,38 @@ function M.on_resume()
     overworldWatchdogStartTime = nil
     overworldWatchdogNextCheckTime = nil
     overworldWatchdogDiscordSent = false
-    learnMovePromptDetected = false
+    moveLearnHold = nil
     startupItemCheckPending = true
     killModeWasEnabled = false
     killModeAutosaveNextTime = nil
+    fishSpotX, fishSpotY = nil, nil
+end
+
+-- The Current Encounter panel (and Recent Encounters), once per encounter,
+-- from what the encounter hook latched: called from the battle code as
+-- soon as the DVs are in, so it shows the Pokemon while the battle is
+-- still on - the pending update at the top of M.step() often only gets
+-- there once the bot has already fled. Whichever runs first shows it; the
+-- other finds it already shown. A shiny's savestate (Auto-Catch Settings)
+-- is saved here too, while it's on screen.
+local function show_encounter()
+    if shownEncounterSerial == encounterSerial or atkdef == nil or spespc == nil or species == nil then return end
+    shownEncounterSerial = encounterSerial
+    local speciesName = get_pokemon_name(species)
+    Gui.update_last_encounter(hud, sessionEncounterCount, species, speciesName,
+        math.floor(atkdef / 16), atkdef % 16, math.floor(spespc / 16), spespc % 16,
+        shinyLatchedThisBattle, get_item_name(item))
+    if shinyLatchedThisBattle then
+        ShinySavestate.save_if_enabled(Gui, hud, speciesName)
+    end
 end
 
 -- ===== M.step =====
 function M.step()
+    -- Whatever was pressing buttons when the move-learn hook fired, nothing
+    -- gets through any more - stop here and let the player decide.
+    if moveLearnHold then return stop_for_move_learn() end
+
     -- Kill mode safety savestates - see wild.lua's own copy of this
     -- comment for the full rationale. Checked every tick (cheap - just a
     -- forms.ischecked() read) so both a mid-run checkbox toggle AND a
@@ -3072,7 +3468,7 @@ function M.step()
     -- instead of flashing garbage on the Rich Presence card. Same
     -- pattern as wild.lua's M.step().
     do
-        local mapKey = string.format("%d:%d", memory.readbyte(0xdcb5), memory.readbyte(0xdcb6))
+        local mapKey = string.format("%d:%d", memory.readbyte(GsJp.map_group_addr()), memory.readbyte(GsJp.map_group_addr() + 1))
         if LocationNames[mapKey] then
             AutocrystalCurrentLocation = LocationNames[mapKey]
         end
@@ -3135,7 +3531,7 @@ function M.step()
         -- repeated here, to avoid double-counting every encounter.
 
         Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Checking encounter...")
-        Gui.update_last_encounter(hud, sessionEncounterCount, species, speciesName, atkDV, defDV, speDV, spcDV, isShinyEncounter, itemName)
+        show_encounter()
 
         -- pendingShinyFields/pendingShinySpriteUrl (and the Stats
         -- bookkeeping that goes with them) are already built synchronously
@@ -3247,7 +3643,6 @@ function M.step()
                 battleLevelBaseline = nil
                 battleLevelBaselineSpecies = nil
                 battleLevelBaselineMoveCount = nil
-                learnMovePromptDetected = false
             end
             overworld_loaded = true
         end
@@ -3303,6 +3698,7 @@ function M.step()
         overworldWatchdogDiscordSent = false
         if battleWatchdogStartTime == nil then
             battleWatchdogStartTime = os.time()
+            waitingForEncounterHook = true
             battleWatchdogNextCheckTime = os.time() + BATTLE_WATCHDOG_SECONDS
             battleWatchdogDiscordSent = false
             -- Capture the level baseline HERE, at the very start of the
@@ -3359,7 +3755,36 @@ function M.step()
             goto continue
         end
 
+        -- The encounter hook (EnemyWildmonInitialized) only fires once the
+        -- Pokemon's DVs are rolled, after the battle transition - while
+        -- dv_flag_addr (D22D, the game's battle mode) is set before it.
+        -- Deciding before the hook goes on the previous encounter's shiny
+        -- latch: a shiny Noctowl was fled from that way (2026-10-30), and
+        -- the Current Encounter panel only caught up once the battle was
+        -- over. So the first time through each battle, wait for the hook,
+        -- then let the pending encounter update at the top of M.step()
+        -- (panel, stop conditions) run before anything is decided.
+        if waitingForEncounterHook then
+            waitingForEncounterHook = false
+            -- B through any text before it, like the dv_flag_addr wait above.
+            local hookWaitPresses = 0
+            while EnemyWildmonInitialized and encounterSerial == decidedEncounterSerial
+                and hookWaitPresses < 100 and memory.readbyte(species_addr) ~= 0 do
+                emu.frameadvance()
+                press_button("B")
+                hookWaitPresses = hookWaitPresses + 1
+            end
+            if encounterSerial == decidedEncounterSerial then
+                vprint(string.format("No encounter hook after %d B presses - deciding on what's already latched", hookWaitPresses))
+            end
+            decidedEncounterSerial = encounterSerial
+            if pendingEncounterUpdate then
+                goto continue
+            end
+        end
+
         realEncounterConfirmed = false
+        show_encounter()
 
         -- Computed once, independent of shininess - "Auto-catch on held
         -- item" should catch ANY Pokemon holding a matching item,
@@ -3578,7 +4003,30 @@ function M.step()
             -- (preferring the first, falling back to the second only if
             -- the first is depleted). Only treat this as "can't attack
             -- at all" once both are out.
-            local hasPP = memory.readbyte(FIRST_MOVE_PP_ADDR) > 0 or memory.readbyte(FIRST_MOVE_PP_ADDR + 1) > 0
+            -- Kill mode's move: data/move_choice.lua's pick of all 4. When no
+            -- move can hurt it, it flees instead; without the game's move
+            -- table (or a battle that doesn't read right), move 1 or 2.
+            local killPick, killWhy, killThreat
+            if Gui.kill_non_shiny(hud) then
+                killPick, killWhy, killThreat = MoveChoice.kill(battle_view())
+            end
+            local hasPP
+            if killPick then
+                hasPP = true
+            elseif killWhy == "none" then
+                hasPP = false
+            elseif killWhy == "risky" then
+                -- Only favourable matchups: it knows a move super effective
+                -- against yours - run instead.
+                hasPP = false
+                if Gui.kill_non_shiny(hud) and riskyLoggedFor ~= encounterSerial then
+                    riskyLoggedFor = encounterSerial
+                    print(string.format("Kill-mode: %s knows %s, super effective against yours - running instead.",
+                        get_pokemon_name(species), killThreat))
+                end
+            else
+                hasPP = move_pp(1) > 0 or move_pp(2) > 0
+            end
             local hpSafe = has_safe_hp()
 
             -- Never attack a shiny from here. The shiny branch above
@@ -3591,7 +4039,9 @@ function M.step()
 
             if Gui.kill_non_shiny(hud) and not skippingShiny and killAllowedForThisSpecies and hasPP and hpSafe then
                 Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Attacking...")
-                local killResult = do_kill_turn()
+                if killPick then print("Kill-mode: " .. MoveChoice.describe(killPick, "kill") .. ".") end
+                local killResult = do_kill_turn(killPick and killPick.slot)
+                if killResult == "stuck" and moveLearnHold then return stop_for_move_learn() end
                 if killResult == "stuck" then
                     Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount,
                         "Stopped - move-learn or evolution prompt needs your input")
@@ -3602,7 +4052,7 @@ function M.step()
                 -- Thief mode - see wild.lua's own copy of this same block
                 -- for the full rationale (identical architecture to this
                 -- file, ported verbatim).
-                local thiefHasPP = memory.readbyte(FIRST_MOVE_PP_ADDR) > 0
+                local thiefHasPP = move_pp(1) > 0
                 -- Thief-specific HP check (THIEF_LOW_HP_THRESHOLD, not
                 -- the shared hpSafe used by Kill mode above) - see
                 -- wild.lua's own copy of this comment for the rationale.
@@ -3662,6 +4112,7 @@ function M.step()
                     while true do
                         thiefAttempts = thiefAttempts + 1
                         local thiefResult = do_thief_turn()
+                        if thiefResult == "stuck" and moveLearnHold then return stop_for_move_learn() end
                         if thiefResult == "stuck" then
                             Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount,
                                 "Stopped - Thief attack didn't return to the battle menu")
@@ -3743,7 +4194,7 @@ function M.step()
                                 elseif not thief_has_safe_hp() then
                                     print("Thief: giving up further attempts this battle - HP below 20%, fleeing now")
                                     break
-                                elseif memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 then
+                                elseif move_pp(1) == 0 then
                                     vprint("Thief: out of PP for move slot 1 - can't try again this battle")
                                     break
                                 elseif thiefAttempts >= THIEF_MAX_RETRY_ATTEMPTS then

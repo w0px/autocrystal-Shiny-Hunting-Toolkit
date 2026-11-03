@@ -30,6 +30,7 @@ local script_dir = script_path:match("(.*[/\\])") or "./"
 package.path = script_dir .. "?.lua;" .. script_dir .. "?/init.lua;" .. script_dir .. "../?.lua;" .. package.path
 
 Mem = require("data.memory")
+GsJp = GsJp or require("data.gs_jp")
 Gui = require("gui_module")
 PokemonNames = require("data.pokemon_names")
 ItemNames = require("data.item_names")
@@ -43,7 +44,39 @@ SavestateBackup = require("data.savestate_backup")
 -- pret/pokecrystal disassembly, not a guess). Different static
 -- encounters live at different locations, so this feeds the Rich
 -- Presence location the same as those modules.
-local LocationNames = require("data.location_names")
+local LocationNames = require("data.gs_jp").location_names -- Crystal's or Gold/Silver's, by the loaded game
+local FrameSearch = require("data.frame_search")
+local ShinySavestate = require("data.shiny_savestate")
+local NextPokemon = require("data.next_pokemon")
+local MoveChoice = require("data.move_choice")
+-- Party, map and wScriptRunning reads go through this - WRAM bank 1 no
+-- matter which bank the game has switched in (see FrameSearch.wram).
+local wram = FrameSearch.wram
+
+-- Every other memory access in this file goes to bank 1 as well: plain
+-- reads and writes of $C000-$DFFF (the battle's species, HP and DVs, the
+-- bag) go through FrameSearch.wram/wram_write. During battle animations
+-- Crystal leaves bank 5 (palettes) switched in at frame end, which holds 0
+-- at those addresses - "the battle is over" or "the target fainted" in the
+-- middle of an auto-catch, the same misread wild.lua's own copy of this
+-- describes for kill mode.
+local memoryLib = memory
+local memory = setmetatable({
+    readbyte = function(addr, domain)
+        if domain == nil then return wram(addr) end
+        return memoryLib.readbyte(addr, domain)
+    end,
+    read_u16_be = function(addr, domain)
+        if domain == nil and addr >= 0xC000 and addr < 0xDFFF then
+            return wram(addr) * 256 + wram(addr + 1)
+        end
+        return memoryLib.read_u16_be(addr, domain)
+    end,
+    writebyte = function(addr, value, domain)
+        if domain == nil then return FrameSearch.wram_write(addr, value) end
+        return memoryLib.writebyte(addr, value, domain)
+    end,
+}, {__index = memoryLib})
 local ConsoleLog = require("data.console_log")
 
 local function get_pokemon_name(id)
@@ -156,19 +189,20 @@ local function send_discord_embed(title, description, fields, color, spriteUrl)
     end
 end
 
+-- The Pokemon in a Discord message's corner: the trimmed 72px sprite once
+-- "Download sprites..." has made it, else the public 56px one - see
+-- data/discord_sprite.lua.
+local DiscordSprite = require("data.discord_sprite")
+
 local function shiny_sprite_url(dexNumber)
-    return string.format(
-        "https://cdn.jsdelivr.net/gh/PokeAPI/sprites@master/sprites/pokemon/versions/generation-ii/crystal/animated/shiny/%d.gif",
-        dexNumber)
+    return DiscordSprite.url(dexNumber, true)
 end
 
 -- Same idea as shiny_sprite_url, but the regular (non-shiny) sprite -
 -- used for auto-catch notifications about a held-item/Perfect-DV match
 -- that isn't shiny (do_catch_sequence(false) can fire for those).
 local function regular_sprite_url(dexNumber)
-    return string.format(
-        "https://cdn.jsdelivr.net/gh/PokeAPI/sprites@master/sprites/pokemon/versions/generation-ii/crystal/animated/%d.gif",
-        dexNumber)
+    return DiscordSprite.url(dexNumber, false)
 end
 
 -- Generation II's Hidden Power type/power formula - see wild.lua for the
@@ -252,13 +286,19 @@ local catchOutcomeFailed = false
 local curPartyMonAddr
 local MENU_CURSOR_Y, MENU_CURSOR_X
 local FIRST_MOVE_PP_ADDR
+local OWN_HP_ADDR -- our active Pokemon's HP (wBattleMonHP) - same addresses wild.lua uses
 local enemy_hp_addr, enemy_max_hp_addr
 local wCurItemAddr, wItemsAddr, wNumItemsAddr
 local wBallsAddr, wNumBallsAddr
+local wScriptModeAddr -- set during a phone call too, unlike wScriptRunning (see FrameSearch.script_busy)
 -- Preference order when scanning the bag for something to throw - Poke
 -- Ball specifically preferred, falling back to other ball types only if
 -- no Poke Balls are left.
-local BALL_ITEM_IDS = {5, 4, 2, 1} -- Poke, Great, Ultra, Master
+local LEVEL_BALL, LURE_BALL = 159, 160
+-- What a Lure Ball does here (see find_ball_in_bag()).
+local LURE_MULTIPLIER = 1 -- only a rod battle counts
+-- Every kind auto-catch throws, in its order for a tie - never a Master Ball.
+local BALL_ITEM_IDS = {2, 4, 5, LEVEL_BALL, LURE_BALL} -- Ultra, Great, Poke, Level, Lure
 -- Navigate to FIGHT and use whichever move is already highlighted by
 -- default (the first move in the list).
 local FIGHT_CURSOR = {y = 1, x = 1}
@@ -735,6 +775,38 @@ local function is_open_world_style_target(name)
     return OPEN_WORLD_STYLE_TARGETS[name] == true
 end
 
+-- Targets searched with data/frame_search.lua (see new_frame_search(),
+-- right above M.step) instead of the savestate-reload + random-delay
+-- resets - every one of them; an encounter it hands over still goes
+-- through the handling further down (OPEN_WORLD_STYLE_TARGETS,
+-- BATTLE_TARGET_EXPECTED_SPECIES, the Gift path).
+-- press: what a probe does from where the player stands (frame_search.lua
+-- has the details) - "tap" A (no dialogue: one press goes straight to
+-- battle), "hold" A through dialogue, or "walk" (hold Up: Suicune's
+-- savestate is outside Tin Tower, and the cutscene inside runs by itself -
+-- see the Suicune notes above).
+-- roll: "battle" = the DV-roll battle hook fires; "gift" = the Pokemon
+-- joins the party (Eevee/Shuckle/Spearow never battle).
+local FRAME_SEARCH_TARGETS = {
+    ["Static (open world)"] = {press = "tap", roll = "battle"},
+    ["Lapras"] = {press = "tap", roll = "battle"},
+    ["Sudowoodo"] = {press = "hold", roll = "battle"},
+    ["Snorlax"] = {press = "hold", roll = "battle"},
+    ["Celebi"] = {press = "hold", roll = "battle"},
+    ["Suicune"] = {press = "walk", roll = "battle"},
+    ["Eevee"] = {press = "hold", roll = "gift"},
+    ["Shuckle"] = {press = "hold", roll = "gift"},
+    ["Spearow"] = {press = "hold", roll = "gift"},
+}
+
+-- This Start's FrameSearch (data/frame_search.lua) - made by M.step(),
+-- dropped by M.on_resume(). Declared up here since the battle hook in
+-- register_hooks() checks .probing.
+local search
+-- The battle menu of an encounter frame search handed over, shiny on
+-- screen - where catch_with_retries goes back to. Saved by catch_attempt.
+local catchMenuState
+
 -- Used to be a fixed "UNTUNED FIRST GUESS" step count (8) for how many
 -- held-Up tile-steps it takes to walk the savestate's starting position -
 -- just outside Tin Tower, confirmed via a screenshot of the player
@@ -834,14 +906,14 @@ end
 -- this is the mechanism rather than something else entirely.
 local function wait_for_reload_settle()
     local waited = 0
-    while memory.readbyte(party_base_addr) ~= partysizeBeforeReceiving and waited < 240 do
+    while wram(party_base_addr) ~= partysizeBeforeReceiving and waited < 240 do
         emu.frameadvance()
         waited = waited + 1
     end
     if waited >= 240 then
         print(string.format(
             "WARNING: reload settle timed out after %d frames - party_base_addr never returned to %d (still reads %d). State is likely stuck; a Stop/Start may be needed if resets stop progressing.",
-            waited, partysizeBeforeReceiving, memory.readbyte(party_base_addr)))
+            waited, partysizeBeforeReceiving, wram(party_base_addr)))
         return false
     end
 
@@ -919,24 +991,41 @@ local function is_ball_item(itemId)
     for _, ballId in ipairs(BALL_ITEM_IDS) do
         if itemId == ballId then return true end
     end
+    if itemId == 1 then return true end -- a Master Ball: in the Balls pocket, never thrown
     if itemId >= 157 and itemId <= 166 then return true end
     if itemId == 177 then return true end
     return false
 end
 
--- Scans the bag for the first ball type found, in BALL_ITEM_IDS
--- preference order. Returns the item ID found, or nil if no balls at all.
+-- ===== Auto-catch =====
+-- The ball with the best chance on this throw, out of the ones in the bag
+-- (item_effects.asm's BallMultiplierFunctionTable): Ultra x2, Great x1.5,
+-- Poke x1, Lure Ball x3 on a Pokemon hooked with a rod (x1 otherwise),
+-- all of those then scaled by the target's HP - (3 max - 2 now) / 3 max.
+-- A Level Ball skips that HP part: x8 when your Pokemon's level is over
+-- four times the target's, x4 over double, x2 over it, x1 otherwise. A tie
+-- goes to the one first in BALL_ITEM_IDS. Never a Master Ball. Returns the
+-- item ID, or nil if no ball it throws is left.
 local function find_ball_in_bag()
+    local have = {}
+    for i = 0, 11 do
+        local itemId = memory.readbyte(wBallsAddr + i * 2)
+        if itemId == 0xFF then break end
+        if memory.readbyte(wBallsAddr + i * 2 + 1) > 0 then have[itemId] = true end
+    end
+    local maxHP = memory.read_u16_be(enemy_max_hp_addr)
+    local hpFactor = maxHP > 0 and (3 * maxHP - 2 * memory.read_u16_be(enemy_hp_addr)) / (3 * maxHP) or 1
+    local mine, theirs = memory.readbyte(FIRST_MOVE_PP_ADDR + 5), memory.readbyte(enemy_addr + 7)
+    local levelBall = theirs >= mine and 1 or theirs >= mine // 2 and 2 or theirs >= mine // 4 and 4 or 8
+    local chance = {[2] = 2 * hpFactor, [4] = 1.5 * hpFactor, [5] = hpFactor,
+        [LURE_BALL] = LURE_MULTIPLIER * hpFactor, [LEVEL_BALL] = levelBall}
+    local best, bestChance
     for _, ballId in ipairs(BALL_ITEM_IDS) do
-        for i = 0, 11 do
-            local itemId = memory.readbyte(wBallsAddr + i * 2)
-            if itemId == 0xFF then break end
-            if itemId == ballId then
-                return ballId
-            end
+        if have[ballId] and (best == nil or chance[ballId] > bestChance) then
+            best, bestChance = ballId, chance[ballId]
         end
     end
-    return nil
+    return best
 end
 
 -- Total balls remaining across ALL ball types combined, not just
@@ -946,7 +1035,11 @@ local function total_ball_count()
     for i = 0, 11 do
         local itemId = memory.readbyte(wBallsAddr + i * 2)
         if itemId == 0xFF then break end
-        if is_ball_item(itemId) then
+        local throwable = false
+        for _, ballId in ipairs(BALL_ITEM_IDS) do
+            if itemId == ballId then throwable = true end
+        end
+        if throwable then
             total = total + memory.readbyte(wBallsAddr + i * 2 + 1)
         end
     end
@@ -1067,13 +1160,13 @@ local function navigate_to_pack_and_select_ball(ballId)
     end
 
     local scrollAttempts = 0
-    while scrollAttempts < 12 and memory.readbyte(species_addr) ~= 0 do
+    while scrollAttempts < 16 and memory.readbyte(species_addr) ~= 0 do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
             return false
         end
         local curItem = memory.readbyte(wCurItemAddr)
-        if curItem == ballId or is_ball_item(curItem) then
+        if curItem == ballId then
             press_button("A")
             -- Selecting the ball opens a Use/Quit-style submenu, already
             -- sitting on "Use" - let the caller's confirm-loop press A
@@ -1084,7 +1177,20 @@ local function navigate_to_pack_and_select_ball(ballId)
             end
             return true
         end
-        press_button("Down")
+        -- Up or Down towards it: where it sits in the Balls pocket against
+        -- where the cursor's item sits (one not in the pocket any more - a
+        -- used-up stack the menu still shows for a moment - counts as
+        -- below). Only that exact ball is ever selected: never another
+        -- kind on screen, never a Master Ball.
+        local target, here = nil, nil
+        for i = 0, 11 do
+            local itemId = memory.readbyte(wBallsAddr + i * 2)
+            if itemId == 0xFF then break end
+            if itemId == ballId then target = i end
+            if itemId == curItem then here = i end
+        end
+        if target == nil then break end
+        press_button((here == nil or here > target) and "Up" or "Down")
         scrollAttempts = scrollAttempts + 1
     end
 
@@ -1093,13 +1199,48 @@ local function navigate_to_pack_and_select_ball(ballId)
     return false
 end
 
+-- Our own Pokemon is down with the target still standing: the game asks
+-- for the next Pokemon (or whites out) - a prompt blind A-mashing can't
+-- answer. Callers want it on 3 checks in a row, like wild.lua's own copy
+-- of this check; the target's HP rules out Selfdestruct/Explosion, where
+-- both go down and the battle simply ends.
+local function own_pokemon_down()
+    return memory.read_u16_be(OWN_HP_ADDR) == 0 and memory.read_u16_be(enemy_hp_addr) > 0
+end
+
+-- PP left on move slot 1-4 of the Pokemon in battle. The PP byte's top two
+-- bits are its PP Ups, so a move with PP Ups and none left doesn't read 0.
+local function move_pp(slot)
+    return memory.readbyte(FIRST_MOVE_PP_ADDR + slot - 1) % 64
+end
+
+-- The two battle structs for data/move_choice.lua: ours starts 8 bytes
+-- before its PP, the enemy's 6 before its DVs.
+local function battle_view()
+    return {read8 = function(addr) return memory.readbyte(addr) end,
+        own = FIRST_MOVE_PP_ADDR - 8, enemy = enemy_addr - 6}
+end
+
+-- Moves the move list's cursor to slot (1-4). Only once MoveSelectionAddr's
+-- hook has confirmed the list is open: its rows 1-2 share their cursor
+-- values with FIGHT and PACK on the main battle menu.
+local function go_to_move_slot(slot)
+    for _ = 1, 6 do
+        local cy = memory.readbyte(MENU_CURSOR_Y)
+        if cy == slot then return true end
+        press_and_wait_for_cursor_change(cy < slot and "Down" or "Up", 30)
+    end
+    return memory.readbyte(MENU_CURSOR_Y) == slot
+end
+
 -- Simplified attack turn for weakening the enemy before catching -
 -- deliberately not a "kill" turn (static.lua has no kill mode, and
 -- move-learn detection doesn't apply here). Returns "fainted" if the
 -- attack accidentally faints the target, "ok" otherwise, "stuck" if
--- battle controls never came back, or "move2_stuck" if second-move
--- navigation genuinely failed.
-local function do_catch_attack_turn()
+-- battle controls never came back, "own_fainted" if our own Pokemon went
+-- down on the target's turn, or "move2_stuck" if second-move navigation
+-- genuinely failed.
+local function do_catch_attack_turn(slot)
     local nav_attempts = 0
     while have_battle_controls do
         if stop_was_requested() then
@@ -1146,7 +1287,23 @@ local function do_catch_attack_turn()
     -- out of PP. The caller already confirmed at least one of the two
     -- has PP before calling this function at all.
     local usedSecondMove = false
-    if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 then
+    if slot and moveSelectScreenOpen then
+        -- A move from data/move_choice.lua: straight to its row.
+        if not go_to_move_slot(slot) then
+            move2NavFailStreak = move2NavFailStreak + 1
+            if move2NavFailStreak >= 25 then
+                print(string.format("Catch-mode: couldn't get the cursor to move %d, %d times in a row - stopping so you can handle this manually.",
+                    slot, move2NavFailStreak))
+                return "move2_stuck"
+            end
+            vprint(string.format("Couldn't get the cursor to move %d (it's on %d) - backing out and retrying.", slot, memory.readbyte(MENU_CURSOR_Y)))
+            press_button("B")
+            return "ok"
+        end
+        move2NavFailStreak = 0
+        usedSecondMove = slot ~= 1
+        vprint(string.format("Pressing A to use move %d", slot))
+    elseif move_pp(1) == 0 then
         usedSecondMove = true
         vprint("First move out of PP - using the second move instead")
         press_and_wait_for_cursor_change(navigate_to_menu_option(MOVE2_CURSOR), 30)
@@ -1200,6 +1357,7 @@ local function do_catch_attack_turn()
     have_battle_controls = false
     local postAttackWait = 0
     local postAttackTimeout = usedSecondMove and 1800 or 600
+    local ownDown = 0
     while not have_battle_controls do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1207,6 +1365,8 @@ local function do_catch_attack_turn()
         end
         emu.frameadvance()
         press_button("A")
+        ownDown = own_pokemon_down() and ownDown + 1 or 0
+        if ownDown >= 3 then return "own_fainted" end
         postAttackWait = postAttackWait + 1
         if postAttackWait > postAttackTimeout then
             print("Catch-mode: post-attack wait timed out (enemy may have fainted, or something else is blocking)")
@@ -1242,64 +1402,63 @@ local function confirm_battle_ended(maxFrames)
     return false
 end
 
--- The caller returns "stop" right after this (no reload - the target may
--- still be there to catch by hand) - this just says why.
-local function report_unconfirmed_battle_end(label, speciesName, speciesId, isShiny, itemName)
-    if stop_was_requested() then
-        print("Catch-mode: Stop requested - aborting.")
-        return
+-- One attempt at catching the Pokemon in battle right now - see
+-- catch_with_retries (frame search section) for the whole catch and its
+-- Discord messages. info: what's being caught ({label, id, name,
+-- isShiny}, read once there - a retry can't trust species_addr this early).
+-- attempt: nil the first time; 2, 3, ... when frame search went back to
+-- the start of this battle (catchMenuState) to try again - then a random
+-- extra wait at the battle menu so the battle doesn't just go the same way
+-- again. snapshot: save catchMenuState at the battle menu (first attempt,
+-- frame rollback on). Prints what happens; returns outcome, why:
+--   "caught"   - a genuine successful catch (why = balls used). MUST NOT be
+--                followed by a savestate reload (that would rewind
+--                BizHawk's state and erase the catch, since it was never
+--                saved to the real cartridge) - the caller stops here.
+--   "continue" - the target fainted/escaped during the attempt. Nothing was
+--                kept, so it's safe (and desirable) for the caller to
+--                reload the savestate and keep going.
+--   "failed"   - this attempt couldn't finish, but the target may still be
+--                there: a menu that never came back, our own Pokemon down
+--                (the "next Pokemon?" prompt), 20 balls that didn't catch
+--                it. catch_with_retries goes back to the start of the
+--                battle and tries again; otherwise it's a "stop".
+--   "stop"     - something needs manual intervention (no balls, out of PP;
+--                why = nil when Stop was pressed). The caller stops without
+--                reloading, same as it would have without Auto-Catch at all.
+-- Auto-Catch Settings' "send out the next Pokemon" (frame rollback off):
+-- right after our own Pokemon fainted while catching - see
+-- data/next_pokemon.lua. True once the new one is out and the battle menu
+-- is back; the catch then carries on with balls only.
+local function send_next_pokemon()
+    print("Catch-mode: your Pokemon fainted - sending out the next one (balls only from here on).")
+    have_battle_controls = false
+    local ok, why = NextPokemon.send({
+        partyBase = party_base_addr,
+        read8 = function(addr) return memory.readbyte(addr) end,
+        press = press_button,
+        stop = stop_was_requested,
+        battleControls = function() return have_battle_controls end,
+        ownHP = function() return memory.read_u16_be(OWN_HP_ADDR) end,
+    })
+    if ok then
+        print(string.format("Catch-mode: sent out party slot %d - back to throwing balls.", why))
+    else
+        print("Catch-mode: didn't send out another Pokemon (" .. tostring(why) .. ").")
     end
-    print(string.format("Catch-mode: couldn't confirm the battle with %s%s actually ended - stopping instead of reloading, in case it's still there.", label, speciesName))
-    send_catch_notification(string.format("%s%s may still be in battle - bot stopped (no reload) so you can check and catch it manually.", label, speciesName),
-        COLOR_RED, speciesId, isShiny, itemName)
+    return ok
 end
 
--- shinyEmbedFields/shinySpriteUrl (optional): the detailed fields already
--- built by M.step()'s pendingEncounterUpdate handling for THIS same
--- shiny encounter - merged into the initial "found! attempting to catch"
--- notification instead of arriving as a separate embed, same as wild.lua.
---
--- Return contract is intentionally 3-way (NOT the plain true/false wild.lua
--- and fishing.lua use), because static.lua's reload-based loop needs to
--- tell these apart at the call site:
---   "caught"   - a genuine successful catch. MUST NOT be followed by a
---                savestate reload (that would rewind BizHawk's state and
---                erase the catch, since it was never saved to the real
---                cartridge) - the caller should just stop here.
---   "continue" - the target fainted/escaped during the attempt, or
---                something recoverable happened. Nothing was kept, so
---                it's safe (and desirable) for the caller to reload the
---                savestate and keep resetting for another attempt.
---   "stop"     - something needs manual intervention (no balls, timeout,
---                out of throws, navigation stuck, Stop was pressed). The
---                caller should stop without reloading, same as it would
---                have without Auto-Catch at all.
--- labelOverride: optional - lets a non-shiny catch still get a
--- distinguishing prefix on every single notification this function sends
--- (found/caught/every failure mode all read off the same `label` below),
--- without touching isShiny itself - isShiny stays reserved for the
--- actual shiny-specific behavior. Added for Perfect/Perfect Negative DV
--- catches per a real user request: those were previously only called out
--- in a console-only print right before this function ran, so the Discord
--- "found! Attempting to catch it automatically." and "caught
--- successfully" messages looked identical to any other ordinary
--- auto-catch (item match) - no way to tell from Discord alone that it
--- was a Perfect DV roll. Mirrors the identical fix in wild.lua/
--- fishing.lua/headbutt.lua.
-local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labelOverride)
-    local label = labelOverride or (isShiny and "Shiny " or "")
-    print(label .. "found! Starting auto-catch sequence...")
+local function catch_attempt(info, attempt, snapshot)
+    local label, caughtSpeciesName = info.label, info.name
+    if attempt then
+        print(string.format("Reset %d: starting the auto-catch sequence again...", attempt - 1))
+    end
 
-    local caughtSpeciesId = memory.readbyte(species_addr)
-    local caughtSpeciesName = get_pokemon_name(caughtSpeciesId)
-    local caughtItemName = get_item_name(memory.readbyte(item_addr))
-
-    if isShiny and shinyEmbedFields then
-        send_discord_embed(string.format("%s%s found! Attempting to catch it automatically.", label, caughtSpeciesName),
-            nil, shinyEmbedFields, COLOR_GOLD, shinySpriteUrl)
-    else
-        send_catch_notification(string.format("%s%s found! Attempting to catch it automatically.", label, caughtSpeciesName),
-            COLOR_GOLD, caughtSpeciesId, isShiny, caughtItemName)
+    -- See "failed" in the contract above.
+    local function failed(why)
+        print(string.format("Catch-mode: %s - giving up on this attempt.", why))
+        return "failed", why
     end
 
     -- This fires immediately and synchronously the instant the encounter
@@ -1315,33 +1474,46 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         waitFrames = waitFrames + 1
     end
     if not have_battle_controls then
-        print("Catch-mode: battle menu never loaded within the timeout - stopping so you can take over.")
-        send_catch_notification(string.format("%s%s could not be caught, bot stopped (battle menu timeout).", label, caughtSpeciesName),
-            COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-        return "stop"
+        return failed("the battle menu never loaded")
+    end
+
+    -- Frame search's catch retries come back to this very moment: the
+    -- battle menu, the shiny on screen, the team as it was.
+    if attempt == nil and snapshot and search and search.retry and catchMenuState == nil then
+        catchMenuState = memorysavestate.savecorestate()
     end
 
     -- species_addr can still be oscillating for a while even right as
     -- have_battle_controls first becomes true - give it a settling window.
-    for i = 1, 60 do
+    -- A retry waits a random bit longer: the battle's randomness depends on
+    -- exactly when each choice is made, so the whole battle shifts.
+    local settleFrames = 60
+    if attempt then settleFrames = settleFrames + math.random(0, 119) end
+    for i = 1, settleFrames do
         emu.frameadvance()
     end
 
     local ballId = find_ball_in_bag()
     if not ballId then
         print("No balls in the bag - stopping so you can restock and catch it manually.")
-        send_catch_notification(string.format("%s%s could not be caught, bot stopped (no balls left).", label, caughtSpeciesName),
-            COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-        return "stop"
+        return "stop", "no balls left"
     end
 
-    -- Weaken the enemy to a safe-but-catchable HP range first - skippable
-    -- entirely via "Don't weaken enemy Pokemon" in Auto-Catch Settings.
-    if not Gui.dont_weaken_enabled(hud) then
+    -- Weaken the enemy to a safe-but-catchable HP range first - only with
+    -- moves that can't knock it out (a crit can, with frame rollback on:
+    -- that only means a reset).
+    do
     local lastDamageDealt = nil
     local previousHP = nil
+    -- Weakening that gets nowhere - it heals it back (Rest, Recover,
+    -- Leftovers), or the hits keep missing: once WEAKEN_STALL_TURNS attacks
+    -- in a row haven't taken it below the lowest HP it's been at, or after
+    -- WEAKEN_MAX_TURNS attacks in all, the balls go at whatever HP it has.
+    local WEAKEN_STALL_TURNS, WEAKEN_MAX_TURNS = 3, 15
+    local lowestHP, stallTurns, attackTurns = nil, 0, 0
     local overrideCritSafety = Gui.crit_safety_override_enabled(hud)
     local targetPercent = overrideCritSafety and Gui.custom_catch_hp_target(hud) or CATCH_HP_TARGET_PERCENT
+    local critsOk = overrideCritSafety or info.retry
     while true do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1350,10 +1522,7 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         local curHP = memory.read_u16_be(enemy_hp_addr)
         local maxHP = memory.read_u16_be(enemy_max_hp_addr)
         if maxHP == 0 then
-            print("Catch-mode: couldn't read enemy max HP - stopping so you can catch it manually.")
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (couldn't read enemy max HP).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return "stop"
+            return failed("couldn't read the enemy's max HP")
         end
         if previousHP ~= nil and curHP < previousHP then
             lastDamageDealt = previousHP - curHP
@@ -1361,19 +1530,45 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         if curHP <= maxHP * targetPercent then
             break
         end
-        if not overrideCritSafety and lastDamageDealt ~= nil and curHP <= lastDamageDealt * 2 then
+        if lowestHP == nil or curHP < lowestHP then lowestHP, stallTurns = curHP, 0 end
+        if stallTurns >= WEAKEN_STALL_TURNS or attackTurns >= WEAKEN_MAX_TURNS then
+            print(string.format("Catch-mode: %d attack%s and %s still has %d of %d HP (lowest %d) - weakening isn't getting anywhere, throwing balls now.",
+                attackTurns, attackTurns == 1 and "" or "s", caughtSpeciesName, curHP, maxHP, lowestHP))
+            break
+        end
+        -- Which move: data/move_choice.lua's pick of all 4 - the most damage
+        -- that still can't knock it out at its highest roll (a critical hit
+        -- included, unless the crit override is on). Once no move can do
+        -- that, throw. Without the game's move table, or once a hit took
+        -- more than it worked out, the old rule below: move 1 (2 without PP)
+        -- until another hit like the last, doubled for a crit, could faint it.
+        local weakenPick, noPickWhy = MoveChoice.weaken(battle_view(), {ignoreCrits = critsOk})
+        if weakenPick then
+            print("Catch-mode: weakening with " .. MoveChoice.describe(weakenPick, critsOk and "override" or nil) .. ".")
+        elseif noPickWhy == "none" then
+            print(string.format("Catch-mode: no move can take more of %s's %d HP without risking a knockout - throwing balls now.",
+                caughtSpeciesName, curHP))
+            break
+        elseif not info.retry then
+            -- The damage can't be worked out (or a hit just took more than
+            -- worked out): without rollback a blind hit could cost the
+            -- catch, so throw from here.
+            print(string.format("Catch-mode: can't tell what a hit would do to %s - throwing balls without weakening further.",
+                caughtSpeciesName))
+            break
+        end
+        if weakenPick == nil and not overrideCritSafety and lastDamageDealt ~= nil and curHP <= lastDamageDealt * 2 then
             print(string.format("Catch-mode: another hit (possible crit) could faint the target (curHP=%d, last hit dealt %d) - stopping attacks early.",
                 curHP, lastDamageDealt))
             break
         end
-        if memory.readbyte(FIRST_MOVE_PP_ADDR) == 0 and memory.readbyte(FIRST_MOVE_PP_ADDR + 1) == 0 then
+        if weakenPick == nil and move_pp(1) == 0 and move_pp(2) == 0 then
             print(string.format("Catch-mode: out of PP on the first two moves while weakening %s - stopping so you can handle this manually.", caughtSpeciesName))
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (out of PP on first two moves).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return "stop"
+            return "stop", "out of PP on the first two moves"
         end
         previousHP = curHP
-        local result = do_catch_attack_turn()
+        attackTurns, stallTurns = attackTurns + 1, stallTurns + 1
+        local result = do_catch_attack_turn(weakenPick and weakenPick.slot)
         if result == "fainted" then
             print(string.format("%s%s fainted while weakening it for capture - it's gone. Clearing messages and resuming the hunt.", label, caughtSpeciesName))
             for i = 1, 400 do
@@ -1384,12 +1579,17 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
                 press_button("B")
             end
             if not confirm_battle_ended() then
-                report_unconfirmed_battle_end(label, caughtSpeciesName, caughtSpeciesId, isShiny, caughtItemName)
-                return "stop"
+                if stop_was_requested() then return "stop" end
+                return failed("couldn't confirm the battle ended - it may still be there")
             end
-            send_catch_notification(string.format("%s%s was not caught, most likely fainted.", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return "continue"
+            return "continue", "it fainted"
+        elseif result == "own_fainted" then
+            -- With "send out the next Pokemon" it goes in and only throws
+            -- balls from here on - its moves could knock the target out.
+            if not (info.sendNext and send_next_pokemon()) then
+                return failed("your Pokemon fainted - the game wants the next one")
+            end
+            break
         elseif result == "stuck" then
             -- "stuck" also covers FIGHT-menu navigation failing with the
             -- target still alive - only reload once the battle is
@@ -1403,17 +1603,12 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
                 press_button("B")
             end
             if not confirm_battle_ended() then
-                report_unconfirmed_battle_end(label, caughtSpeciesName, caughtSpeciesId, isShiny, caughtItemName)
-                return "stop"
+                if stop_was_requested() then return "stop" end
+                return failed("stuck after an attack, and the battle didn't end")
             end
-            send_catch_notification(string.format("%s%s was not caught, most likely fainted.", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return "continue"
+            return "continue", "it fainted"
         elseif result == "move2_stuck" then
-            print(string.format("Catch-mode: stopping bot - couldn't reliably use the second move on %s.", caughtSpeciesName))
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (second-move navigation failed).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return "stop"
+            return failed("couldn't reliably select the second move")
         end
     end
     end
@@ -1429,27 +1624,23 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         end
         ballId = find_ball_in_bag()
         if not ballId then
+            -- With rollback, resetting gives every ball thrown back.
+            if info.retry and throws > 0 then return failed("out of balls") end
             print("Ran out of balls mid-catch - stopping so you can restock and finish manually.")
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (ran out of balls mid-catch).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return "stop"
+            return "stop", "ran out of balls mid-catch"
         end
 
         local remainingBalls = total_ball_count()
-        if remainingBalls <= LOW_BALL_THRESHOLD then
+        -- Not with rollback: the reset gives the balls back, so it throws
+        -- down to the last one and resets.
+        if not info.retry and remainingBalls <= LOW_BALL_THRESHOLD then
             print(string.format("Catch-mode: only %d ball(s) left total - stopping so you can finish manually.", remainingBalls))
-            send_catch_notification(string.format(
-                "%s%s could not be caught, bot stopped (only %d ball(s) left, preserved for manual catching).", label, caughtSpeciesName, remainingBalls),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return "stop"
+            return "stop", string.format("only %d ball(s) left, preserved for manual catching", remainingBalls)
         end
 
         local navigated = navigate_to_pack_and_select_ball(ballId)
         if not navigated then
-            print("Catch-mode: failed to navigate to the ball - stopping so you can take over.")
-            send_catch_notification(string.format("%s%s could not be caught, bot stopped (navigation stuck).", label, caughtSpeciesName),
-                COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-            return "stop"
+            return failed("couldn't get to the ball in the Pack")
         end
 
         catchOutcomeSucceeded = false
@@ -1467,15 +1658,18 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
             ballWaitFrames = ballWaitFrames + 20
         end
 
+        if catchOutcomeSucceeded or catchOutcomeFailed then
+            -- Every ball thrown at this Pokemon, across rollbacks too (they
+            -- give the balls back in-game) - for the final notification.
+            info.ballsThrown = (info.ballsThrown or 0) + 1
+            info.ballsUsed = info.ballsUsed or {}
+            info.ballsUsed[ballId] = (info.ballsUsed[ballId] or 0) + 1
+        end
         if catchOutcomeSucceeded then
             print("Caught! Declining nickname prompt and clearing follow-up messages...")
-            if isShiny then
-                Stats.record_catch(caughtSpeciesId)
+            if info.isShiny then
+                Stats.record_catch(info.id)
             end
-            local ballsUsed = throws + 1 -- throws only counts FAILED attempts; this successful one isn't in it yet
-            send_catch_notification(string.format("%s%s caught successfully via auto-catch! (used %d Ball%s)",
-                label, caughtSpeciesName, ballsUsed, ballsUsed == 1 and "" or "s"),
-                COLOR_GREEN, caughtSpeciesId, isShiny, caughtItemName)
             for i = 1, 400 do
                 if stop_was_requested() then
                     print("Catch-mode: Stop requested - aborting.")
@@ -1484,7 +1678,7 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
                 press_button("B")
             end
             print("Caught - stopping here so it's preserved (reloading the savestate now would undo the catch).")
-            return "caught"
+            return "caught", throws + 1 -- throws only counts FAILED attempts; this successful one isn't in it yet
         elseif catchOutcomeFailed then
             throws = throws + 1
             print(string.format("Ball thrown (%d/%d) - it broke free, trying again.", throws, maxThrows))
@@ -1506,6 +1700,8 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
             -- happened.
             have_battle_controls = false
             local recoverFrames = 0
+            local zeroReads = 0
+            local ownDown = 0
             while not have_battle_controls and recoverFrames < 900 do
                 if stop_was_requested() then
                     print("Catch-mode: Stop requested - aborting.")
@@ -1513,16 +1709,42 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
                 end
                 press_button("A")
                 recoverFrames = recoverFrames + 1
+                -- Or the target's turn knocked out our own Pokemon - before
+                -- the A presses here walk into the "next Pokemon?" prompt.
+                ownDown = own_pokemon_down() and ownDown + 1 or 0
+                if ownDown >= 3 then
+                    if not (info.sendNext and send_next_pokemon()) then
+                        return failed("your Pokemon fainted - the game wants the next one")
+                    end
+                    ownDown = 0
+                end
+                -- The target's own turn can end the battle right here -
+                -- Selfdestruct/Explosion (seen: a shiny Electrode), or a
+                -- whiteout - and then no battle menu ever comes back. Once
+                -- species_addr has read 0 for about BATTLE_END_CONFIRM_FRAMES
+                -- (press_button() takes 5 frames), stop mashing A in the
+                -- overworld and confirm it: gone, like a faint while
+                -- weakening ("continue"), not a stuck menu ("stop").
+                if memory.readbyte(species_addr) == 0 then
+                    zeroReads = zeroReads + 1
+                else
+                    zeroReads = 0
+                end
+                if zeroReads >= BATTLE_END_CONFIRM_FRAMES / 5 then
+                    if confirm_battle_ended() then
+                        print(string.format("Catch-mode: the battle ended after a failed throw - %s%s is gone (most likely Selfdestruct/Explosion, or your team whited out).",
+                            label, caughtSpeciesName))
+                        return "continue", "the battle ended after a failed throw - most likely Selfdestruct/Explosion"
+                    end
+                    zeroReads = 0
+                end
             end
             if not have_battle_controls then
                 -- Genuinely didn't recover in time - report this specific
                 -- failure instead of falling through into
                 -- navigate_to_pack_and_select_ball() with a false premise
                 -- (see comment above).
-                print("Catch-mode: battle menu didn't reload after the failed throw within the extended timeout - stopping so you can take over.")
-                send_catch_notification(string.format("%s%s could not be caught, bot stopped (battle menu didn't return after a failed throw).", label, caughtSpeciesName),
-                    COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-                return "stop"
+                return failed("the battle menu didn't come back after a failed throw")
             end
         else
             print("Catch-mode: timed out without a determined outcome - backing out with B and retrying.")
@@ -1534,10 +1756,7 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         end
     end
 
-    print("Ran out of throw attempts (" .. maxThrows .. ") without catching it - stopping so you can take over.")
-    send_catch_notification(string.format("%s%s could not be caught, bot stopped (ran out of throw attempts).", label, caughtSpeciesName),
-        COLOR_RED, caughtSpeciesId, isShiny, caughtItemName)
-    return "stop"
+    return failed(string.format("%d balls didn't catch it", maxThrows))
 end
 
 -- Hooks get REPLACED by name every time RegisterROMHook runs - must be
@@ -1603,8 +1822,12 @@ local function register_hooks()
         -- Still meaningless for targets that don't use
         -- dribble_entropy_until_hook() at all (Eevee/Shuckle/Spearow/
         -- Celebi).
-        print(string.format("%s (#%d) | Atk: %d Def: %d Spe: %d Spc: %d | Item: %s | Splits: %d | Range: %d",
-            speciesName, species, math.floor(atkdef/16), atkdef%16, math.floor(spespc/16), spespc%16, itemName, mashSplitsFired, active_dribble_range()))
+        -- Not for frame-search probes: printing thousands of lines a minute
+        -- would slow BizHawk's Lua Console to a crawl (see data/console_log.lua).
+        if not (search and search.probing) then
+            print(string.format("%s (#%d) | Atk: %d Def: %d Spe: %d Spc: %d | Item: %s | Splits: %d | Range: %d",
+                speciesName, species, math.floor(atkdef/16), atkdef%16, math.floor(spespc/16), spespc%16, itemName, mashSplitsFired, active_dribble_range()))
+        end
 
         pendingEncounterUpdate = true
     end, "Static Encounter Battle Started")
@@ -1694,12 +1917,19 @@ function M.init(sharedForm, yOffset, existingHud)
             MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x64bc)
             Mem.SetRomBankAddress("Crystal")
         elseif region == 0x4A then
-            enemy_addr = 0xd23d
-            LoadBattleMenuAddr = Mem.BankAddressToLinear(0x9, 0x4EF2)
-            EnemyWildmonInitialized = Mem.BankAddressToLinear(0xF, 0x7648)
-            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x69f5)
-            CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6bdc)
-            MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x64bc)
+            -- Japanese Crystal - data/gs_jp.lua. Other revisions stop here
+            -- and say why.
+            if not GsJp.supported(version, region) then
+                print(GsJp.unsupported_reason(version))
+                return false
+            end
+            print("Japanese Crystal detected")
+            enemy_addr = GsJp.w(0xD20C)
+            LoadBattleMenuAddr = GsJp.hook("LoadBattleMenu")
+            EnemyWildmonInitialized = GsJp.hook("SkipUnown")
+            CatchSuccessAddr = GsJp.hook("Caught")
+            CatchFailAddr = GsJp.hook("BreakFree")
+            MoveSelectionAddr = GsJp.hook("MoveSelection")
             Mem.SetRomBankAddress("Crystal")
         else
             print("No valid ROM detected")
@@ -1719,19 +1949,28 @@ function M.init(sharedForm, yOffset, existingHud)
             -- Verified against pokegold.sym: PokeBallEffect.caught /
             -- .shake_and_break_free (bank $03), MoveSelectionScreen
             -- (bank $0F) - same addresses wild.lua/fishing.lua use.
-            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x6a79)
-            CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6c45)
+            -- English Silver's are 2 bytes earlier than Gold's
+            -- (pokesilver.sym: 03:6A77 / 03:6C43); Gold's land mid-instruction
+            -- in Silver and never fire.
+            local silverUS = version == 0x58 and region == 0x45
+            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, silverUS and 0x6a77 or 0x6a79)
+            CatchFailAddr = Mem.BankAddressToLinear(0x3, silverUS and 0x6c43 or 0x6c45)
             MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x62f3)
             Mem.SetRomBankAddress("Gold")
         elseif region == 0x4A then
-            -- STILL UNVERIFIED - same enemy_addr=party_base_addr bug
-            -- pattern, no JP-specific symbol data available.
-            enemy_addr = 0xd9e8
-            LoadBattleMenuAddr = Mem.BankAddressToLinear(0x9, 0x4E62)
-            EnemyWildmonInitialized = Mem.BankAddressToLinear(0xF, 0x7400)
-            CatchSuccessAddr = Mem.BankAddressToLinear(0x3, 0x6a79)
-            CatchFailAddr = Mem.BankAddressToLinear(0x3, 0x6c45)
-            MoveSelectionAddr = Mem.BankAddressToLinear(0xF, 0x62f3)
+            -- Japanese Gold (Kin) and Silver (Gin, Rev A) - data/gs_jp.lua.
+            -- Other revisions stop here and say why.
+            if not GsJp.supported(version, region) then
+                print(GsJp.unsupported_reason(version))
+                return false
+            end
+            print(GsJp.name(version) .. " detected")
+            enemy_addr = GsJp.w(0xD0F5)
+            LoadBattleMenuAddr = GsJp.hook("LoadBattleMenu")
+            EnemyWildmonInitialized = GsJp.hook("SkipUnown")
+            CatchSuccessAddr = GsJp.hook("Caught")
+            CatchFailAddr = GsJp.hook("BreakFree")
+            MoveSelectionAddr = GsJp.hook("MoveSelection")
             Mem.SetRomBankAddress("Gold")
         elseif region == 0x4B then
             -- STILL UNVERIFIED - same caveat as the JP branch above.
@@ -1787,6 +2026,7 @@ function M.init(sharedForm, yOffset, existingHud)
         MENU_CURSOR_Y = 0xCEE0
         MENU_CURSOR_X = 0xCEE1
         FIRST_MOVE_PP_ADDR = 0xCB14
+        OWN_HP_ADDR = 0xCB1C
         wCurItemAddr = 0xD002
         wItemsAddr = 0xD5B8
         wNumItemsAddr = 0xD5B7
@@ -1803,11 +2043,13 @@ function M.init(sharedForm, yOffset, existingHud)
         -- presses. See reroll_savestate_pool() for why this replaced
         -- that guess.
         wScriptRunningAddr = 0xD15F
+        wScriptModeAddr = 0xD15E -- pokegold1.sym/pokesilver.sym
     else
         curPartyMonAddr = 0xd0d4
         MENU_CURSOR_Y = 0xCFA9
         MENU_CURSOR_X = 0xCFAA
         FIRST_MOVE_PP_ADDR = 0xC634
+        OWN_HP_ADDR = 0xC63C
         wCurItemAddr = 0xD106
         wItemsAddr = 0xD893
         wNumItemsAddr = 0xD892
@@ -1816,6 +2058,7 @@ function M.init(sharedForm, yOffset, existingHud)
         -- Verified against pokecrystal.sym: wScriptRunning ($D438). See
         -- the Gold/Silver branch above for what this is used for.
         wScriptRunningAddr = 0xD438
+        wScriptModeAddr = 0xD437 -- pokecrystal11.sym
     end
 
     -- Gift Pokemon (Eevee, etc.) are structurally different from
@@ -1832,6 +2075,25 @@ function M.init(sharedForm, yOffset, existingHud)
         if region == 0x4A then party_base_addr = 0xD9E8
         elseif region == 0x4B then party_base_addr = 0xDB1F
         else party_base_addr = 0xDA22 end
+    end
+
+    -- The Japanese versions: the English addresses set above (Gold/Silver
+    -- or Crystal), moved to where they keep them (data/gs_jp.lua). The
+    -- party is already right (party_base_addr).
+    if GsJp.japanese(version, region) then
+        local J = GsJp.w
+        curPartyMonAddr = J(curPartyMonAddr)
+        MENU_CURSOR_Y = J(MENU_CURSOR_Y)
+        MENU_CURSOR_X = J(MENU_CURSOR_X)
+        FIRST_MOVE_PP_ADDR = J(FIRST_MOVE_PP_ADDR)
+        OWN_HP_ADDR = J(OWN_HP_ADDR)
+        wCurItemAddr = J(wCurItemAddr)
+        wItemsAddr = J(wItemsAddr)
+        wNumItemsAddr = J(wNumItemsAddr)
+        wBallsAddr = J(wBallsAddr)
+        wNumBallsAddr = J(wNumBallsAddr)
+        wScriptRunningAddr = J(wScriptRunningAddr)
+        wScriptModeAddr = J(wScriptModeAddr)
     end
 
     math.randomseed(os.time())
@@ -1887,7 +2149,8 @@ function M.on_resume()
     -- itself the first write this slot would see this session, so the
     -- backup has to happen before it, not just before the "real" capture
     -- further down.
-    SavestateBackup.backup_slot_before_first_write(SAVESTATE_SLOT, "Static")
+    SavestateBackup.backup_slot_before_write(SAVESTATE_SLOT,
+        SavestateBackup.label("Static", StaticTargetDropdown and forms.gettext(StaticTargetDropdown)))
 
     if not savestateSlotWarmedUp then
         savestate.saveslot(SAVESTATE_SLOT)
@@ -1895,13 +2158,13 @@ function M.on_resume()
         savestateSlotWarmedUp = true
     end
 
-    local baseline = memory.readbyte(party_base_addr)
+    local baseline = wram(party_base_addr)
     local stableFrames = 0
     local waited = 0
     while stableFrames < 2 and waited < 30 do
         emu.frameadvance()
         waited = waited + 1
-        local current = memory.readbyte(party_base_addr)
+        local current = wram(party_base_addr)
         if current == baseline then
             stableFrames = stableFrames + 1
         else
@@ -1924,6 +2187,10 @@ function M.on_resume()
     -- existed at the moment Start was clicked), so the next automatic
     -- one shouldn't fire until a full interval from now.
     lastRerollTime = os.time()
+    -- Every Start begins a new frame search (and a new section in its log).
+    if search then search:drop_retry() end
+    search = nil
+    AutocrystalHuntedSpecies = nil
 end
 
 -- Re-baselines the savestate with a fresh, unpredictable starting point -
@@ -1963,9 +2230,11 @@ end
 -- problem was untouched.
 --
 -- v3 (below) stops guessing at what might be open and checks directly:
--- wScriptRunningAddr (see version-detection block above) is non-zero for
--- the ENTIRE duration of any overworld script - NPC dialogue, a Pokegear
--- call prompt, a cutscene, anything - regardless of which one. Instead of
+-- script_busy() (wScriptRunningAddr and wScriptModeAddr, see the version-
+-- detection block above) is true for the ENTIRE duration of any overworld
+-- script - NPC dialogue, a phone call, a cutscene, anything - regardless of
+-- which one (wScriptRunning alone misses a phone call - see
+-- FrameSearch.script_busy). Instead of
 -- pressing a fixed number of buttons and hoping, this waits and presses
 -- B/A in a loop until that flag actually reads clear (bounded, so it
 -- can't hang forever), which is a real confirmation rather than a guess.
@@ -1986,28 +2255,37 @@ end
 -- ~35000 frames (~9.7 minutes) to REROLL_SPLIT_COUNT * ~128 frames
 -- (a few seconds) - directly fixing the "takes crazy long" complaint too.
 local REROLL_SPLIT_COUNT = 6
-local REROLL_SCRIPT_CLEAR_TIMEOUT = 180 -- frames to wait for wScriptRunning to clear
+local REROLL_SCRIPT_CLEAR_TIMEOUT = 180 -- B presses to wait for script_busy() to clear
 
--- Presses B/A until wScriptRunningAddr reads 0 (or the bounded timeout is
+local function script_busy()
+    return FrameSearch.script_busy(wScriptRunningAddr, wScriptModeAddr)
+end
+
+-- Presses B until script_busy() is false (or the bounded timeout is
 -- hit) - a real confirmation that no dialogue/call/cutscene is mid-flight,
 -- not a guess. No-op (returns immediately) if nothing is open, which is
 -- the common case on every call.
+-- Only B, never A: B moves text on just like A, but at a YES/NO box it
+-- answers NO. This used to alternate B and A - and Start pressed while
+-- already talking to the NPC (seen with Shuckle: Start at Mania's "I, I'm
+-- in shock!" and at his YES/NO) could land an A on the YES and take the
+-- gift (or start the Sudowoodo battle) before the search even began.
 local function wait_for_no_active_script(label)
     if not wScriptRunningAddr then return true end
     local waited = 0
-    while memory.readbyte(wScriptRunningAddr) ~= 0 and waited < REROLL_SCRIPT_CLEAR_TIMEOUT do
+    while script_busy() and waited < REROLL_SCRIPT_CLEAR_TIMEOUT do
         if stop_was_requested() then
             print("Stop requested during reroll script-clear wait - aborting.")
             return false
         end
-        press_button(waited % 2 == 0 and "B" or "A")
+        press_button("B")
         waited = waited + 1
     end
     if waited > 0 then
         print(string.format(
-            "reroll_savestate_pool(): wScriptRunning was active (%s) - %s after %d frame(s).",
+            "reroll_savestate_pool(): a script/phone call was running (%s) - %s after %d B press(es).",
             label or "script/dialogue/call in progress",
-            (memory.readbyte(wScriptRunningAddr) == 0) and "cleared it" or "gave up waiting for it to clear",
+            script_busy() and "gave up waiting for it to clear" or "cleared it",
             waited))
     end
     return true
@@ -2027,13 +2305,13 @@ local function reroll_savestate_pool()
         end
     end
 
-    local baseline = memory.readbyte(party_base_addr)
+    local baseline = wram(party_base_addr)
     local stableFrames = 0
     local waited = 0
     while stableFrames < 2 and waited < 30 do
         emu.frameadvance()
         waited = waited + 1
-        local current = memory.readbyte(party_base_addr)
+        local current = wram(party_base_addr)
         if current == baseline then
             stableFrames = stableFrames + 1
         else
@@ -2217,8 +2495,242 @@ local function dribble_entropy_until_hook(cap, numSteps, stepFn, range)
     end
 end
 
+-- ===== Frame search =====
+-- How every static target searches - see data/frame_search.lua for how
+-- that works. This part says how each target is triggered and read
+-- (FRAME_SEARCH_TARGETS above), what counts as a real roll and what gets
+-- handed over to the handling in M.step() - plus auto-catch retries at a
+-- handed-over encounter.
+-- Auto-catch tries at a handed-over encounter that keeps getting away or
+-- getting stuck come from Auto-Catch Settings' frame rollback
+-- (Gui.catch_retry_attempts()).
+
+-- Shiny, Perfect or Perfect Negative - a roll that gets handed over.
+local function fs_roll_is_special(roll)
+    return FrameSearch.is_shiny(roll.atkdef, roll.spespc)
+        or (roll.atkdef == 0xFF and roll.spespc == 0xFF) or (roll.atkdef == 0 and roll.spespc == 0)
+end
+
+-- The same sanity checks the normal handling applies, on the hook-time
+-- snapshot: a real roll has a real species - the target itself when it has
+-- a name - and a battle roll isn't a copy of one of the player's own party
+-- mons (seen before: leaked party data with real-looking DVs; a gift is in
+-- the party, of course). frame_search.lua also holds every roll to the
+-- first one's species.
+local function fs_reading_is_real(target, isGift)
+    return function(roll)
+        if roll.species == 0 or roll.species == 255 then return false end
+        if target ~= "Static (open world)" and get_pokemon_name(roll.species) ~= target then return false end
+        if isGift then return true end
+        local liveParty = wram(party_base_addr)
+        for i = 0, math.min(liveParty, 6) - 1 do
+            local slotDvAddr = party_base_addr + 0x1D + i * 0x30
+            if wram(party_base_addr + 1 + i) == roll.species
+                and wram(slotDvAddr) == roll.atkdef and wram(slotDvAddr + 1) == roll.spespc then
+                return false
+            end
+        end
+        return true
+    end
+end
+
+-- Records a probe's roll like any other encounter: lifetime and session
+-- stats (frame_search.lua writes the file once per batch), SESSION
+-- ENCOUNTERS, Last/Recent Encounters.
+local function fs_record_roll(roll)
+    resetCount = resetCount + 1
+    Stats.record_encounter(roll.species, roll.atkdef, roll.spespc, true)
+    Gui.update_last_encounter(hud, resetCount, roll.species, get_pokemon_name(roll.species),
+        math.floor(roll.atkdef / 16), roll.atkdef % 16, math.floor(roll.spespc / 16), roll.spespc % 16, false, get_item_name(roll.item))
+    Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount)
+end
+
+-- This Start's search for target (FRAME_SEARCH_TARGETS).
+local function new_frame_search(target)
+    local cfg = FRAME_SEARCH_TARGETS[target]
+    local isGift = cfg.roll == "gift"
+    local detect
+    if isGift then
+        detect = FrameSearch.gift_detector({party = party_base_addr, before = function() return partysizeBeforeReceiving end})
+    else
+        -- The battle hook's snapshot (register_hooks()).
+        detect = function()
+            if pendingEncounterUpdate then
+                return {species = species, atkdef = atkdef, spespc = spespc, item = item}
+            end
+        end
+    end
+    return FrameSearch.new({
+        label = "Static - " .. target,
+        press = cfg.press,
+        detect = detect,
+        before_probe = function()
+            pendingEncounterUpdate = false
+            shinyvalue = 0
+        end,
+        is_real = fs_reading_is_real(target, isGift),
+        record = fs_record_roll,
+        special = fs_roll_is_special,
+        slot = function() return SAVESTATE_SLOT end,
+        status = function(text)
+            Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount, text)
+        end,
+        script_addr = wScriptRunningAddr,
+        script_busy = script_busy,
+        clear_script = function() return wait_for_no_active_script("frame search") end,
+        on_hand_over = function()
+            firstPressPending = false
+            lastResetTime = os.time()
+        end,
+    })
+end
+
+-- Auto-catch, with more tries for an encounter the search handed over:
+-- when the target gets away ("continue" - it fainted, e.g. its own
+-- Selfdestruct/Explosion) or the attempt gets stuck ("failed" - our own
+-- Pokemon down, a menu that never came back), go back to the start of the
+-- battle - the battle menu with the shiny on screen and the team as it
+-- was (catchMenuState, saved by catch_attempt) - and catch again. On a
+-- retry catch_attempt waits a random bit at that menu, so the battle
+-- itself goes differently. Without that snapshot (the menu never loaded)
+-- it goes back to right before the press that found it and presses again:
+-- same frame, same DVs (search:replay()). Up to
+-- Gui.catch_retry_attempts() in all, whatever ended the last one - only
+-- with frame rollback on (Auto-Catch Settings); off, the first attempt
+-- decides. Then: still "continue" - the caller reloads the savestate slot and
+-- the search carries on; still "failed" - back to the start of the battle
+-- and stop, the player takes it from there.
+--
+-- Discord hears about it twice: "found!" (with shinyEmbedFields/
+-- shinySpriteUrl when given - the detailed shiny embed M.step() built)
+-- and how it ended, with the number of resets and Balls. labelOverride: a prefix
+-- for both instead of "Shiny " (e.g. "Perfect DV "). Returns the outcome.
+local function catch_with_retries(isShiny, shinyEmbedFields, shinySpriteUrl, labelOverride)
+    local label = labelOverride or (isShiny and "Shiny " or "")
+    print(label .. "found! Starting auto-catch sequence...")
+    -- Read once, now - right after the handling above confirmed the
+    -- encounter at the battle menu. A retry starts too early for it.
+    local caughtSpeciesId = memory.readbyte(species_addr)
+    local caughtSpeciesName = get_pokemon_name(caughtSpeciesId)
+    local caughtItemName = get_item_name(memory.readbyte(item_addr))
+    local function notify(text, color)
+        send_catch_notification(text, color, caughtSpeciesId, isShiny, caughtItemName)
+    end
+    if isShiny and shinyEmbedFields then
+        send_discord_embed(string.format("%s%s found! Attempting to catch it automatically.", label, caughtSpeciesName),
+            nil, shinyEmbedFields, COLOR_GOLD, shinySpriteUrl)
+    else
+        notify(string.format("%s%s found! Attempting to catch it automatically.", label, caughtSpeciesName), COLOR_GOLD)
+    end
+
+    local info = {label = label, id = caughtSpeciesId, name = caughtSpeciesName, isShiny = isShiny}
+    local retry = Gui.catch_retry_enabled(hud)
+    info.sendNext = not retry and Gui.catch_send_next_enabled(hud)
+    -- Whether a failed attempt really goes back to the start (frame search's
+    -- retries only).
+    info.retry = retry and search ~= nil and search.retry and true or false
+    local maxAttempts = Gui.catch_retry_attempts(hud)
+    -- have_battle_controls is Lua-side, so loading a savestate never clears
+    -- it: a `true` left from an earlier battle - frame search plays and
+    -- rewinds plenty - let the catch start before this battle's menu was
+    -- up ("navigation to PACK stuck", or "out of PP" with the battle mon
+    -- not loaded yet), and rollback then snapshotted that moment and reset
+    -- to it forever. Seen with Celebi (2026-11-01). The open-world targets
+    -- have just confirmed a fresh menu (see the battle-confirm wait in
+    -- M.step()); every other battle target waits for it in catch_attempt().
+    if not (StaticTargetDropdown and is_open_world_style_target(forms.gettext(StaticTargetDropdown))) then
+        have_battle_controls = false
+    end
+    local outcome, why = catch_attempt(info, nil, retry)
+    local attempt = 1
+    if search and search.retry then
+        while retry and (outcome == "continue" or outcome == "failed") and attempt < maxAttempts and not stop_was_requested() do
+            attempt = attempt + 1
+            Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
+                string.format("%s - reset %s...", outcome == "continue" and "It got away" or "Auto-catch got stuck",
+                    maxAttempts == math.huge and tostring(attempt - 1) or ((attempt - 1) .. " of " .. (maxAttempts - 1))))
+            if catchMenuState then
+                search:load_state(catchMenuState)
+                have_battle_controls = true
+                search:log(string.format("catch attempt %d: %s - back to the start of the battle", attempt, why))
+            else
+                local roll, instead = search:replay()
+                if roll == nil then
+                    search:log(string.format("catch attempt %d: pressing A on that frame again rolled %s instead - giving up on it", attempt,
+                        instead and string.format("%s %02X/%02X", get_pokemon_name(instead.species), instead.atkdef, instead.spespc) or "nothing"))
+                    break
+                end
+                have_battle_controls = false
+                search:log(string.format("catch attempt %d: %s - back to the frame it appeared on", attempt, why))
+            end
+            outcome, why = catch_attempt(info, attempt)
+        end
+        search:log(string.format("auto-catch %s after %d attempt%s", outcome == "caught" and "caught it" or outcome == "continue" and "lost it"
+            or outcome == "failed" and "gave up" or "stopped", attempt, attempt == 1 and "" or "s"))
+        search:drop_retry()
+    end
+
+    local resets, balls = attempt - 1, info.ballsThrown or 0
+    -- "3 Ultra Balls", "2 Ultra Balls and 1 Poke Ball" - by kind, best first.
+    local kinds = {}
+    for _, id in ipairs(BALL_ITEM_IDS) do
+        local n = info.ballsUsed and info.ballsUsed[id] or 0
+        if n > 0 then kinds[#kinds + 1] = string.format("%d %s%s", n, get_item_name(id), n == 1 and "" or "s") end
+    end
+    local ballText = #kinds == 0 and string.format("%d Ball%s", balls, balls == 1 and "" or "s")
+        or #kinds == 1 and kinds[1] or (table.concat(kinds, ", ", 1, #kinds - 1) .. " and " .. kinds[#kinds])
+    local tries = resets > 0 and string.format(" after %d reset%s and %s", resets, resets == 1 and "" or "s", ballText) or ""
+    if outcome == "caught" then
+        notify(string.format("%s%s caught successfully via auto-catch! (used %s%s)", label, caughtSpeciesName,
+            ballText, resets > 0 and string.format(" across %d reset%s", resets, resets == 1 and "" or "s") or ""),
+            COLOR_GREEN)
+    elseif outcome == "continue" then
+        notify(string.format("%s%s got away%s (%s) - carrying on.", label, caughtSpeciesName, tries, why), COLOR_RED)
+    elseif outcome == "failed" and catchMenuState then
+        -- Over to the player - from the start of the battle, not from
+        -- wherever the last attempt got stuck.
+        search:load_state(catchMenuState)
+        have_battle_controls = true
+        notify(string.format("%s%s: auto-catch stopped%s (%s) - catch it yourself from the start of the battle.", label, caughtSpeciesName,
+            tries, why), COLOR_RED)
+    elseif why then
+        notify(string.format("%s%s could not be caught, bot stopped (%s).", label, caughtSpeciesName, why), COLOR_RED)
+    end
+    if catchMenuState then
+        memorysavestate.removestate(catchMenuState)
+        catchMenuState = nil
+    end
+    return outcome
+end
+
+-- Feeds launcher.lua's Discord Rich Presence status line (see
+-- data/presence.lua) - cheap two-byte read, done every tick. Only
+-- updates when the (group, number) pair is a RECOGNIZED location -
+-- an unrecognized pair almost always means these two WRAM bytes got
+-- transiently repurposed for something else (e.g. a battle in
+-- progress), not an actual new location. See wild.lua's M.step()
+-- for the original fix this mirrors.
+local function note_location()
+    local mapKey = string.format("%d:%d", wram(GsJp.map_group_addr()), wram(GsJp.map_group_addr() + 1))
+    if LocationNames[mapKey] then
+        AutocrystalCurrentLocation = LocationNames[mapKey]
+    end
+end
+
 -- ===== M.step =====
 function M.step()
+    -- Frame search runs its own loop - except right after it handed an
+    -- encounter over (firstPressPending false), which the normal handling
+    -- below finishes first.
+    local target = StaticTargetDropdown and forms.gettext(StaticTargetDropdown)
+    if search == nil and FRAME_SEARCH_TARGETS[target] then search = new_frame_search(target) end
+    if search and (firstPressPending or not search.handedOver) then
+        -- Read between batches, on the real timeline (where the player stands).
+        note_location()
+        lastResetTime = os.time()
+        return search:step()
+    end
+
     check_stuck_and_force_reset()
 
     -- Only safe to re-roll right at a clean reset boundary (standing in
@@ -2230,19 +2742,7 @@ function M.step()
         reroll_savestate_pool()
     end
 
-    -- Feeds launcher.lua's Discord Rich Presence status line (see
-    -- data/presence.lua) - cheap two-byte read, done every tick. Only
-    -- updates when the (group, number) pair is a RECOGNIZED location -
-    -- an unrecognized pair almost always means these two WRAM bytes got
-    -- transiently repurposed for something else (e.g. a battle in
-    -- progress), not an actual new location. See wild.lua's M.step()
-    -- for the original fix this mirrors.
-    do
-        local mapKey = string.format("%d:%d", memory.readbyte(0xdcb5), memory.readbyte(0xdcb6))
-        if LocationNames[mapKey] then
-            AutocrystalCurrentLocation = LocationNames[mapKey]
-        end
-    end
+    note_location()
 
     -- Gift Pokemon path: party size increased without any battle ever
     -- starting - read the new slot directly (same formula as
@@ -2303,7 +2803,7 @@ function M.step()
     local staticTargetName = StaticTargetDropdown and forms.gettext(StaticTargetDropdown)
     local skipsGiftPath = staticTargetName and
         (is_open_world_style_target(staticTargetName) or BATTLE_TARGET_EXPECTED_SPECIES[staticTargetName] ~= nil)
-    local currentPartySize = memory.readbyte(party_base_addr)
+    local currentPartySize = wram(party_base_addr)
     if not skipsGiftPath and currentPartySize > partysizeBeforeReceiving then
         -- Debounce: a genuine gift-receive stays elevated; a one-frame
         -- transient/garbage read (the same class of bug the settle-frame
@@ -2317,7 +2817,7 @@ function M.step()
         -- these without weakening the real-detection path at all (costs
         -- one extra frame only on the rare tick this branch fires).
         emu.frameadvance()
-        if memory.readbyte(party_base_addr) <= partysizeBeforeReceiving then
+        if wram(party_base_addr) <= partysizeBeforeReceiving then
             return false
         end
         local newSlotIndex = partysizeBeforeReceiving
@@ -2338,18 +2838,18 @@ function M.step()
         -- anything on_resume()/reroll_savestate_pool() do. Same fix as
         -- those two: wait for species+DVs to read identically on two
         -- consecutive frames before trusting any of it.
-        local newSpecies = memory.readbyte(newSpeciesAddr)
-        local newAtkdef = memory.readbyte(newDvAddr)
-        local newSpespc = memory.readbyte(newDvAddr + 1)
+        local newSpecies = wram(newSpeciesAddr)
+        local newAtkdef = wram(newDvAddr)
+        local newSpespc = wram(newDvAddr + 1)
         do
             local stableFrames = 0
             local waited = 0
             while stableFrames < 2 and waited < 30 do
                 emu.frameadvance()
                 waited = waited + 1
-                local curSpecies = memory.readbyte(newSpeciesAddr)
-                local curAtkdef = memory.readbyte(newDvAddr)
-                local curSpespc = memory.readbyte(newDvAddr + 1)
+                local curSpecies = wram(newSpeciesAddr)
+                local curAtkdef = wram(newDvAddr)
+                local curSpespc = wram(newDvAddr + 1)
                 if curSpecies == newSpecies and curAtkdef == newAtkdef and curSpespc == newSpespc then
                     stableFrames = stableFrames + 1
                 else
@@ -2420,6 +2920,7 @@ function M.step()
         if isShiny then
             print(string.format("SHINY gift Pokemon found! %s Atk:%d Def:%d Spe:%d Spc:%d - stopping here",
                 speciesName, atkv, defv, spdv, spcv))
+            ShinySavestate.save_if_enabled(Gui, hud, speciesName)
             local encountersBeforeThisShiny = Stats.encountersSinceShiny
             Stats.record_shiny(newSpecies)
             Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
@@ -2680,12 +3181,12 @@ function M.step()
             -- real enemy.
             local isPlayerPartyLeak = false
             if is_open_world_style_target(selectedTarget) then
-                local liveParty = memory.readbyte(party_base_addr)
+                local liveParty = wram(party_base_addr)
                 for i = 0, math.min(liveParty, 6) - 1 do
-                    local slotSpecies = memory.readbyte(party_base_addr + 1 + i)
+                    local slotSpecies = wram(party_base_addr + 1 + i)
                     local slotDvAddr = party_base_addr + 0x1D + i * 0x30
-                    local slotAtkdef = memory.readbyte(slotDvAddr)
-                    local slotSpespc = memory.readbyte(slotDvAddr + 1)
+                    local slotAtkdef = wram(slotDvAddr)
+                    local slotSpespc = wram(slotDvAddr + 1)
                     if slotSpecies == species and slotAtkdef == atkdef and slotSpespc == spespc then
                         isPlayerPartyLeak = true
                         break
@@ -2707,7 +3208,7 @@ function M.step()
                     "Ignoring a bogus '%s' battle reading%s (HP %d/%d, item %s, map %d:%d%s) - reloading and retrying.",
                     get_pokemon_name(species), expectedBattleSpecies and (" (expected " .. expectedBattleSpecies .. ")") or "",
                     curHP, maxHP, get_item_name(item),
-                    memory.readbyte(0xdcb5), memory.readbyte(0xdcb6),
+                    wram(GsJp.map_group_addr()), wram(GsJp.map_group_addr() + 1),
                     isPlayerPartyLeak and ", matches a current party slot - leaked player data" or ""))
                 savestate.loadslot(SAVESTATE_SLOT)
                 wait_for_reload_settle()
@@ -2742,6 +3243,7 @@ function M.step()
         if isShiny then
             print(string.format("SHINY static encounter found! %s Atk:%d Def:%d Spe:%d Spc:%d",
                 speciesName, atkv, defv, spdv, spcv))
+            ShinySavestate.save_if_enabled(Gui, hud, speciesName)
             local encountersBeforeThisShiny = Stats.encountersSinceShiny
             Stats.record_shiny(species)
             local hpType, hpPower = hidden_power(atkv, defv, spdv, spcv)
@@ -2807,7 +3309,7 @@ function M.step()
                     and species_matches_filter(itemCatchFilterTokens, item, itemName)
 
                 if catchAllowedBySpecies or catchAllowedByItem then
-                    local outcome = do_catch_sequence(true, shinyEmbedFields, shinySpriteUrl)
+                    local outcome = catch_with_retries(true, shinyEmbedFields, shinySpriteUrl)
                     if outcome == "caught" then
                         Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
                             "SHINY caught via auto-catch! Stopped.")
@@ -2867,7 +3369,7 @@ function M.step()
                     -- messages.
                     perfectDVLabel = isPerfectDVs and "Perfect DV " or "Perfect Negative DV "
                 end
-                local outcome = do_catch_sequence(false, nil, nil, perfectDVLabel)
+                local outcome = catch_with_retries(false, nil, nil, perfectDVLabel)
                 if outcome == "caught" then
                     Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, resetCount,
                         "Caught via auto-catch! Stopped.")
@@ -2964,6 +3466,11 @@ function M.step()
         -- benefit.
         return false
     elseif StaticTargetDropdown and forms.gettext(StaticTargetDropdown) == "Static (open world)" then
+        -- Not reached any more: "Static (open world)" runs frame search
+        -- (FRAME_SEARCH_TARGETS - M.step() hands it to search:step()
+        -- whenever firstPressPending is set). The old reset flow below stays
+        -- until frame search has been run for real a while longer.
+        --
         -- v1 of this branch (found via a 43,984-encounter Electrode log)
         -- used a blind two-split design: one STATIC_SPLIT_RANGE injection
         -- before the trigger press, one after, assuming close-to-

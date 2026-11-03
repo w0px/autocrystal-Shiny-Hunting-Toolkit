@@ -27,6 +27,11 @@ param(
 #  Icon. Windows itself doesn't care who sets a window's icon, though:
 #  WM_SETICON works from any process. So this sets it from outside.
 #
+#  BizHawk's own main window gets it too, for as long as the launcher is
+#  open: that's the window the taskbar button belongs to (the launcher is
+#  owned by it, so it has none of its own). Its own icon goes back when
+#  the launcher closes.
+#
 #  It has to keep running for as long as the launcher is open - Windows
 #  destroys an icon when the process that created it exits, and the
 #  windows would go back to showing nothing. Windows' own "window shown"
@@ -59,8 +64,9 @@ public static class AutocrystalIcons {
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
     [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam, int flags, int timeoutMs, out IntPtr result);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
 
-    const uint EVENT_OBJECT_SHOW = 0x8002, WINEVENT_OUTOFCONTEXT = 0, GA_ROOT = 2, WM_TIMER = 0x0113;
+    const uint EVENT_OBJECT_SHOW = 0x8002, WINEVENT_OUTOFCONTEXT = 0, GA_ROOT = 2, WM_TIMER = 0x0113, GW_OWNER = 4;
     const int WM_SETICON = 0x0080, WM_GETICON = 0x007F;
     static readonly IntPtr ICON_SMALL = IntPtr.Zero, ICON_BIG = (IntPtr)1;
     // Don't hang on a window if BizHawk is busy - give up after 1s and try
@@ -68,6 +74,8 @@ public static class AutocrystalIcons {
     const int SMTO_ABORTIFHUNG = 0x0002, SEND_TIMEOUT_MS = 1000;
 
     static IntPtr launcher, smallIcon, bigIcon;
+    // BizHawk's main window (the taskbar button) and the icons it had.
+    static IntPtr main, mainSmall, mainBig;
     static uint pid;
     static string launcherTitleContains;
     static HashSet<string> otherTitles;
@@ -96,6 +104,18 @@ public static class AutocrystalIcons {
     // put ours back if that ever happens.
     static void Refresh(IntPtr h) {
         if (Send(h, WM_GETICON, ICON_SMALL, IntPtr.Zero) != smallIcon) Apply(h);
+    }
+
+    // The window the launcher belongs to - BizHawk's main window - or,
+    // failing that, the process's main window.
+    static IntPtr FindMain() {
+        IntPtr owner = GetWindow(launcher, GW_OWNER);
+        if (owner != IntPtr.Zero) {
+            uint p;
+            GetWindowThreadProcessId(owner, out p);
+            if (p == pid) return owner;
+        }
+        try { return System.Diagnostics.Process.GetProcessById((int)pid).MainWindowHandle; } catch { return IntPtr.Zero; }
     }
 
     static bool LauncherOpen() {
@@ -127,6 +147,13 @@ public static class AutocrystalIcons {
         if (!LauncherOpen()) return;
         GetWindowThreadProcessId(launcher, out pid);
         Apply(launcher);
+        main = FindMain();
+        if (main == launcher) main = IntPtr.Zero;
+        if (main != IntPtr.Zero) {
+            mainSmall = Send(main, WM_GETICON, ICON_SMALL, IntPtr.Zero);
+            mainBig = Send(main, WM_GETICON, ICON_BIG, IntPtr.Zero);
+            Apply(main);
+        }
 
         IntPtr hook = IntPtr.Zero;
         if (otherTitles.Count > 0) {
@@ -143,12 +170,19 @@ public static class AutocrystalIcons {
             if (msg.message != WM_TIMER) { DispatchMessage(ref msg); continue; }
             if (!LauncherOpen()) break;
             Refresh(launcher);
+            if (main != IntPtr.Zero && IsWindow(main)) Refresh(main);
             // Closed ones drop out; a handle that now belongs to some
             // unrelated window fails the title check and is left alone.
             others.RemoveWhere(h => !IsWindow(h) || !IsOther(h));
             foreach (IntPtr h in others) Refresh(h);
         }
         if (hook != IntPtr.Zero) UnhookWinEvent(hook);
+        // BizHawk keeps running without the bot: its own icon back (ours
+        // is destroyed when this exits).
+        if (main != IntPtr.Zero && IsWindow(main)) {
+            Send(main, WM_SETICON, ICON_SMALL, mainSmall);
+            Send(main, WM_SETICON, ICON_BIG, mainBig);
+        }
     }
 }
 "@

@@ -19,6 +19,10 @@
 -- If Down is blocked from where you're standing, edit DIRECTION below
 -- to "Up", "Left", or "Right" and reload.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local DIRECTION = "Down"
 local SCAN_START = 0xC000
 local SCAN_END   = 0xDFFF

@@ -15,6 +15,10 @@
 -- full loop back to FIGHT?) is something a random ticking counter almost
 -- never does by coincidence.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local SCAN_START = 0xC000
 local SCAN_END   = 0xDFFF
 

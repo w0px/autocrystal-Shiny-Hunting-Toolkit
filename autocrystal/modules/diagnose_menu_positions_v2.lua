@@ -7,6 +7,10 @@
 -- any byte that flickers due to cursor-blink animation rather than truly
 -- representing menu position (that's what caught out $CFAC last time).
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local CANDIDATES = {0xC0A3, 0xC0A4, 0xC0A5, 0xCFAC, 0xCFA9, 0xCFAA}
 
 local function read_all()

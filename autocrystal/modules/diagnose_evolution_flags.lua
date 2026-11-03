@@ -16,6 +16,10 @@
 -- exact timing/semantics aren't independently verified yet, which is
 -- exactly what this is for.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local WATCH = {
     {name = "wMonTriedToEvolve",   addr = 0xD268},
     {name = "wEvolutionCanceled",  addr = 0xD1ED},

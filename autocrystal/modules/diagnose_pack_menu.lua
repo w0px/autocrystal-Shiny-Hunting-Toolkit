@@ -26,6 +26,10 @@
 --   MENU_CURSOR_Y/X - the same address the battle menu's Fight/Pack/
 --     Pokemon/Run grid uses, in case the Pack menu reuses it too.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local script_path = debug.getinfo(1, "S").source:sub(2)
 local script_dir = script_path:match("(.*[/\\])") or "./"
 package.path = script_dir .. "?.lua;" .. script_dir .. "?/init.lua;" .. script_dir .. "../?.lua;" .. package.path

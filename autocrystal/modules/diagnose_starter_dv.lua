@@ -11,6 +11,10 @@
 -- actually exists, then load this script. It scans all 8 WRAM banks for
 -- both DV bytes simultaneously - no need to catch anything mid-action.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local SVBK_ADDR = 0xFF70
 
 -- Crystal EU/US base address (adjust if you're on a different version/region)

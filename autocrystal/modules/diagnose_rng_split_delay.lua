@@ -11,6 +11,10 @@
 -- HOW TO USE: same as before - load while sitting on a valid savestate
 -- in slot 3.
 
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local HRANDOMADD = 0xFFE1
 local HRANDOMSUB = 0xFFE2
 

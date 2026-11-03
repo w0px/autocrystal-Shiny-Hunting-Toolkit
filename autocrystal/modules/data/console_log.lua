@@ -20,6 +20,8 @@
 -- per a direct user request ("write the last 20k encounters in a
 -- different log, to reduce the bloat in the console").
 
+local Paths = require("data.paths")
+
 local M = {}
 
 -- How often (in encounters/resets) to clear the BizHawk console.
@@ -53,8 +55,8 @@ function M.maybe_clear_console(count)
     end
 end
 
--- Per-module rotating encounter log. Each module gets its own file
--- (e.g. wild_encounter_log.txt) so lines from different hunting modes
+-- Per-module rotating encounter log in autocrystal/logs/. Each module gets
+-- its own file (e.g. wild_encounter_log.txt) so lines from different hunting modes
 -- never interleave. Capped instead of growing forever: once the
 -- current file reaches LOG_ROTATE_LINES lines, it's rotated to a
 -- ".old" file (overwriting whatever was previously there) and a fresh
@@ -69,13 +71,19 @@ local LOG_ROTATE_LINES = 20000
 
 local openLogs = {} -- module_name -> {path, oldPath, file, lineCount}
 
-local function script_dir()
-    local script_path = debug.getinfo(1, "S").source:sub(2)
-    return script_path:match("(.*[/\\])") or "./"
-end
-
 local function open_current(state)
     state.file = io.open(state.path, "a")
+end
+
+-- Lines already in a log from earlier sessions, so the cap counts them too
+-- (counting from 0 at every start let the file grow without end).
+local function count_lines(path)
+    local f = io.open(path, "rb")
+    if f == nil then return 0 end
+    local text = f:read("a") or ""
+    f:close()
+    local _, n = text:gsub("\n", "")
+    return n
 end
 
 -- Call once per attempt/encounter with the same line you're already
@@ -89,12 +97,11 @@ end
 function M.log_encounter(module_name, line)
     local state = openLogs[module_name]
     if state == nil then
-        local dir = script_dir()
         state = {
-            path = dir .. module_name .. "_encounter_log.txt",
-            oldPath = dir .. module_name .. "_encounter_log.txt.old",
-            lineCount = 0,
+            path = Paths.log_path(module_name .. "_encounter_log.txt"),
+            oldPath = Paths.log_path(module_name .. "_encounter_log.txt.old"),
         }
+        state.lineCount = count_lines(state.path)
         open_current(state)
         openLogs[module_name] = state
     end

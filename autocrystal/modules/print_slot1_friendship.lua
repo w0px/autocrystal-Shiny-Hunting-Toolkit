@@ -12,6 +12,10 @@
 -- (Golbat->Crobat, Chansey->Blissey, Eevee->Espeon/Umbreon, Pichu/
 -- Cleffa/Igglybuff/Togepi's baby evolutions) trigger on the next level
 -- up once happiness reaches this value.
+-- The Lua Console even with Verbose Logging off - the launcher only shows
+-- its own output there with it on (data/debug_log.lua).
+local print = AutocrystalConsolePrint or print
+
 local FRIENDSHIP_ADDR = 0xDCFA
 local EVOLUTION_THRESHOLD = 220
 

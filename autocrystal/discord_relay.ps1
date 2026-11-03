@@ -80,7 +80,9 @@ Add-Type -AssemblyName System.Net.Http
 # would go, and that file from data\sprites gets uploaded along with the
 # message - Discord's own way of showing an attached image inside an embed.
 # Only plain file names straight from that one folder are ever read, so a
-# message can't make this relay send anything else from this PC.
+# message can't make this relay send anything else from this PC - plus the
+# Pokemon sprites made for Discord's corner (modules/data/discord_sprite.lua):
+# "shiny_101.gif" is data\sprites\animated_discord\shiny\101.gif.
 $AttachmentDir = Join-Path $PSScriptRoot "data\sprites"
 
 # The files a payload refers to that exist. Any that don't get their
@@ -91,7 +93,11 @@ function Resolve-Attachments([string]$json) {
     foreach ($m in [regex]::Matches($json, 'attachment://([A-Za-z0-9_-]+\.(png|gif))')) {
         $name = $m.Groups[1].Value
         if ($files | Where-Object { $_.Name -eq $name }) { continue }
-        $path = Join-Path $AttachmentDir $name
+        if ($name -match '^(normal|shiny)_(\d{1,3})\.gif$') {
+            $path = Join-Path $AttachmentDir ("animated_discord\{0}\{1}.gif" -f $Matches[1], $Matches[2])
+        } else {
+            $path = Join-Path $AttachmentDir $name
+        }
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             $files += [pscustomobject]@{ Name = $name; Path = $path }
         } else {
