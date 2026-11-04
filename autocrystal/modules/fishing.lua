@@ -2090,8 +2090,15 @@ local function catch_attempt(info, attempt, snapshot)
     -- Leftovers), or the hits keep missing: once WEAKEN_STALL_TURNS attacks
     -- in a row haven't taken it below the lowest HP it's been at, or after
     -- WEAKEN_MAX_TURNS attacks in all, the balls go at whatever HP it has.
+    -- Counted over every try at this Pokemon, not per try: a retry goes back
+    -- to the start of the same battle, so one that healed itself back up
+    -- (shiny Lugia's Recover) will again - later tries throw straight away
+    -- instead of attacking until their own count runs out.
     local WEAKEN_STALL_TURNS, WEAKEN_MAX_TURNS = 3, 15
-    local lowestHP, stallTurns, attackTurns = nil, 0, 0
+    local lowestHP, stallTurns, attackTurns = info.weakenLowestHP, info.weakenStallTurns or 0, info.weakenAttackTurns or 0
+    local function remember_weakening()
+        info.weakenLowestHP, info.weakenStallTurns, info.weakenAttackTurns = lowestHP, stallTurns, attackTurns
+    end
     local overrideCritSafety = Gui.crit_safety_override_enabled(hud)
     local targetPercent = overrideCritSafety and Gui.custom_catch_hp_target(hud) or CATCH_HP_TARGET_PERCENT
     local critsOk = overrideCritSafety or info.retry
@@ -2108,10 +2115,11 @@ local function catch_attempt(info, attempt, snapshot)
         if curHP <= maxHP * targetPercent then
             break
         end
-        if lowestHP == nil or curHP < lowestHP then lowestHP, stallTurns = curHP, 0 end
+        if lowestHP == nil or curHP < lowestHP then lowestHP, stallTurns = curHP, 0; remember_weakening() end
         if stallTurns >= WEAKEN_STALL_TURNS or attackTurns >= WEAKEN_MAX_TURNS then
-            print(string.format("Catch-mode: %d attack%s and %s still has %d of %d HP (lowest %d) - weakening isn't getting anywhere, throwing balls now.",
-                attackTurns, attackTurns == 1 and "" or "s", caughtSpeciesName, curHP, maxHP, lowestHP))
+            print(string.format("Catch-mode: %d attack%s%s and %s still has %d of %d HP (lowest %d) - weakening isn't getting anywhere, throwing balls now.",
+                attackTurns, attackTurns == 1 and "" or "s", attempt and " over all tries" or "",
+                caughtSpeciesName, curHP, maxHP, lowestHP))
             break
         end
         -- Which move: data/move_choice.lua's pick of all 4 - the most damage
@@ -2172,6 +2180,7 @@ local function catch_attempt(info, attempt, snapshot)
         end
         previousHP = curHP
         attackTurns, stallTurns = attackTurns + 1, stallTurns + 1
+        remember_weakening()
         local result = do_catch_attack_turn(weakenPick and weakenPick.slot)
         if result == "fainted" or result == "stuck" then
             -- "fainted": it went down to the weakening attack. "stuck":
