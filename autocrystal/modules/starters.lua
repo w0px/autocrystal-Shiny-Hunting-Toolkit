@@ -163,6 +163,7 @@ local function divider_field()
 end
 
 local COLOR_GOLD = 16766720
+local COLOR_GREEN = 3066993 -- a shiny that's already yours (gift, egg, prize, starter)
 
 local sessionResetCount = 0
 
@@ -202,15 +203,11 @@ end
 -- also greyed out - starters.lua never reads any of those Gui getters
 -- (there's no wild-battle capture flow here at all), so they'd
 -- otherwise look like live controls that silently do nothing.
--- True Randomness IS in this list now - starters.lua no longer calls
--- Gui.true_randomness_enabled() at all, since frame search (trying every
--- frame) supersedes it. Greyed out here so it's visually
--- obvious it has no effect while Starters is the active module. Verbose
--- Logging stays checkable.
+-- Verbose Logging stays checkable.
 local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
-    "chkKillMode", "txtKillFilter",
+    "chkKillMode", "txtKillFilter", "chkUsePotions",
     "chkThiefMode", "txtThiefFilter",
     "chkStopOnShiny",
     "chkAutoCatch", "txtCatchFilter",
@@ -218,7 +215,6 @@ local DISABLED_FIELDS = {
     "chkStopAutoCatchException", "txtStopAutoCatchException",
     "chkOverrideCritSafety", "txtCustomHpTarget",
     "chkCatchOnItem", "txtCatchItemFilter",
-    "chkTrueRandomness",
     "chkCatchRetry", "txtCatchRetryCount", "chkCatchRetryAlways", "chkCatchSendNext",
 }
 
@@ -528,7 +524,7 @@ function M.step()
                 {name = "Total Shinies", value = tostring(Stats.totalShinies), inline = true},
                 {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
             },
-            COLOR_GOLD,
+            COLOR_GREEN, -- already yours: green like a catch
             shiny_sprite_url(species)
         )
         return true
@@ -547,7 +543,7 @@ function M.step()
                 {name = "Total Shinies", value = tostring(Stats.totalShinies), inline = true},
                 {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
             },
-            COLOR_GOLD,
+            COLOR_GREEN, -- already yours: green like a catch
             regular_sprite_url(species)
         )
         return true
@@ -566,7 +562,7 @@ function M.step()
                 {name = "Total Shinies", value = tostring(Stats.totalShinies), inline = true},
                 {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
             },
-            COLOR_GOLD,
+            COLOR_GREEN, -- already yours: green like a catch
             regular_sprite_url(species)
         )
         return true

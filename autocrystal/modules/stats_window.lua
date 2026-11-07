@@ -59,6 +59,11 @@ Gui = Gui or require("gui_module")
 local FORM_W = 500
 local FORM_H = 660
 local ROW_H = 54
+-- Species rows are made a few at a time: the first screenful (and a bit)
+-- before the window shows, the rest ROWS_PER_TICK a frame from M.tick() -
+-- a label and a sprite picture each, and making controls is the slow part
+-- (with 100+ species, building them all up front took a second or two).
+local FIRST_ROWS, ROWS_PER_TICK = 12, 8
 local SPRITE_SIZE = 48
 local ROWS_TOP = 184
 local TAB_BUTTON_Y = 12 -- content y of the Total button = scroll reference
@@ -288,11 +293,19 @@ local function update()
     set_text(c.status, status)
 
     local shownIds = {}
+    local budget = state.rowBudget
+    state.morePending = false
     for i, row in ipairs(visible) do
         local contentY = ROWS_TOP + (i - 1) * ROW_H
-        shownIds[row.id] = true
         local slot = state.slots[row.id]
+        if slot == nil and budget ~= nil and budget <= 0 then
+            -- Made on a later tick (M.tick() keeps going until none is left).
+            state.morePending = true
+            break
+        end
+        shownIds[row.id] = true
         if slot == nil then
+            if budget ~= nil then budget = budget - 1 end
             slot = {
                 label = forms.label(state.form, "", 66, contentY + 2 + scroll_offset(), 410, 48, true),
                 y = contentY,
@@ -387,6 +400,10 @@ local function build()
     state.texts = {}
     state.slots = {}
     state.lastTick = nil
+    state.rowBudget, state.morePending = FIRST_ROWS, false
+    -- Hidden while it's built, shown once the first rows are in (a shown
+    -- window repaints for every control as it arrives).
+    pcall(forms.setproperty, form, "Visible", false)
     forms.setproperty(form, "AutoScroll", true)
     Gui.style_window(form)
     local c = state.controls
@@ -444,9 +461,11 @@ local function build()
         Gui.style_button(c.spriteButton)
     end
 
-    Gui.draw_frame(form, HEADER_FRAME_X, HEADER_FRAME_Y, HEADER_FRAME_W, HEADER_FRAME_H)
+    Gui.draw_frame_fast(form, HEADER_FRAME_X, HEADER_FRAME_Y, HEADER_FRAME_W, HEADER_FRAME_H)
 
     safe_update()
+    pcall(forms.setproperty, form, "Visible", true)
+    state.rowBudget = ROWS_PER_TICK
 end
 
 -- Entry point for the launcher's "Stats..." button. rootDir is the bot's
@@ -465,6 +484,11 @@ end
 -- box since the last update.
 function M.tick()
     if state.form == nil then return end
+    -- Rows still to make (see FIRST_ROWS): a few more every frame.
+    if state.morePending then
+        safe_update()
+        return
+    end
     local now = os.time()
     if now == state.lastTick then return end
     state.lastTick = now

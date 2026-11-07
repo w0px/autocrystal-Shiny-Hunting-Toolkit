@@ -493,14 +493,11 @@ end
 -- Stop-on-shiny, every Auto-Catch field, and crit-safety override are
 -- also greyed out here - this module never reads any of those Gui
 -- getters (no shiny to catch/weaken mid-walk), so they'd otherwise look
--- like live controls that silently do nothing. True Randomness stays
--- enabled per-module-batch convention with Starters/Static/Egg even
--- though friendship.lua doesn't currently read it either (no soft-reset
--- here) - flagged as a no-op rather than silently left disabled.
+-- like live controls that silently do nothing.
 local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
-    "chkKillMode", "txtKillFilter",
+    "chkKillMode", "txtKillFilter", "chkUsePotions",
     "chkStopOnShiny",
     "chkAutoCatch", "txtCatchFilter",
     "chkSkipAlreadyCaught",

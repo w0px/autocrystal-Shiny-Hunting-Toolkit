@@ -640,24 +640,9 @@ end
 -- gui_module.lua's draw_frame() (same rings, same colors), keeping the
 -- line labels so a section's frame can be moved and swapped.
 local function frame_lines(x, y, w, h)
-    local lines = {}
-    local function line(lx, ly, lw, lh, color)
-        local l = forms.label(ui.form, "", lx, ly, lw, lh)
-        pcall(forms.setproperty, l, "BackColor", color)
-        lines[#lines + 1] = {h = l, x = lx, y = ly}
-    end
-    local function ring(rx, ry, rw, rh, tl, br, notched)
-        local n = notched and 1 or 0
-        line(rx + rw - 2, ry + n, 2, rh - n, br)
-        line(rx + n, ry + rh - 2, rw - n, 2, br)
-        line(rx, ry, rw - n, 2, tl)
-        line(rx, ry, 2, rh - n, tl)
-    end
-    local fx, fy, fw, fh = x - 2, y - 2, w + 4, h + 4
-    ring(fx, fy, fw, fh, Gui.THEME.frameLight, Gui.THEME.frameDark, true)
-    ring(fx + 2, fy + 2, fw - 4, fh - 4, Gui.THEME.frameDark, Gui.THEME.frameLight, false)
-    ring(fx + 4, fy + 4, fw - 8, fh - 8, Gui.THEME.border, Gui.THEME.border, false)
-    return lines
+    -- Four edge pictures (gui_module.lua's draw_frame_fast()) instead of 12
+    -- line labels: same pieces list, so moving and swapping work the same.
+    return Gui.draw_frame_fast(ui.form, x, y, w, h)
 end
 
 -- The card sprite (like the launcher's Current Encounter card): the best
@@ -1646,6 +1631,9 @@ local function build()
         ui.form, ui.c, ui.texts, ui.colors, ui.cards, ui.shownCard, ui.icons = nil, {}, {}, {}, {}, false, {}
     end)
     ui.form, ui.c, ui.texts, ui.colors, ui.cards, ui.shownCard, ui.icons = form, {}, {}, {}, {}, false, {}
+    -- Hidden while it's built (a shown window repaints for every control as
+    -- it arrives); shown at the end, complete. Same as the settings popups.
+    pcall(forms.setproperty, form, "Visible", false)
     ui.map = {key = nil, stable = 0, entries = {}}
     ui.warned, ui.detached, ui.sized = false, false, false
     if ui.hereTab == nil then
@@ -1664,7 +1652,7 @@ local function build()
     c.place = label(X, 30, W - 76, 16)
     c.dock = forms.button(form, "Detach", toggle_detached, X + W - 70, 13, 70, 24)
     Gui.style_button(c.dock)
-    Gui.draw_frame(form, PX, 4, PW, 44)
+    Gui.draw_frame_fast(form, PX, 4, PW, 44)
 
     -- Every section is built open, all of them stacked; relayout() then
     -- folds and places them.
@@ -1691,6 +1679,7 @@ local function build()
     -- WinForms work out the scroll range again (and the helper hide the bar
     -- again) - the window took seconds to open.
     pcall(forms.setproperty, form, "AutoScroll", true)
+    pcall(forms.setproperty, form, "Visible", true)
 end
 
 -- A section's -/+ button: folds or opens it right there, and remembers it.
@@ -1745,6 +1734,14 @@ function M.note_encounter(species, atk, def, spe, spc)
     local mon = read_battle_mon(game.layout.enemy)
     if plausible(mon) and mon.species == species and mon.dv1 == atk * 16 + def and mon.dv2 == spe * 16 + spc then
         record(mon)
+        -- Redrawn right here: the bot handles a whole battle (flee, catch,
+        -- Kill mode) inside one step, and M.tick() only runs between steps -
+        -- so the window used to catch up once the battle was over.
+        if ui.form and game.dirty then
+            poll()
+            game.dirty = false
+            safe_update()
+        end
     end
 end
 

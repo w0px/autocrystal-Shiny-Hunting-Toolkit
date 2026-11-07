@@ -47,6 +47,7 @@ local PERSISTED_POPUP_SETTINGS = {
         {field = "_savedStopOnShiny", key = "stoponshiny", kind = "bool"},
         {field = "_savedKillModeEnabled", key = "killmode", kind = "bool"},
         {field = "_savedKillFilterText", key = "killfilter", kind = "text"},
+        {field = "_savedUsePotions", key = "usepotions", kind = "bool"},
     },
     advanced = {
         {field = "_savedStopItemEnabled", key = "stopitem", kind = "bool"},
@@ -56,7 +57,6 @@ local PERSISTED_POPUP_SETTINGS = {
         {field = "_savedVerbose", key = "verbose", kind = "bool"},
         {field = "_savedTreeOverlay", key = "treeoverlay", kind = "bool"},
         {field = "_savedDarkMode", key = "darkmode", kind = "bool"},
-        {field = "_savedTrueRandomness", key = "truerandomness", kind = "bool"},
         {field = "_savedThiefModeEnabled", key = "thiefmode", kind = "bool"},
         {field = "_savedThiefFilterText", key = "thieffilter", kind = "text"},
         {field = "_savedThiefNotifyEnabled", key = "thiefnotify", kind = "bool"},
@@ -271,13 +271,14 @@ end
 -- control is the slow part of building a window). Made after the
 -- section's controls, so it sits behind them; its inside is the window's
 -- background.
-local function popup_frame(form, x, y, w, h)
+-- The three rings of an fw x fh frame, drawn into picturebox `box` whose
+-- top-left sits at (ox, oy) inside the frame - the box shows (clips to)
+-- whatever part of the frame it covers.
+local function draw_frame_rings(box, ox, oy, fw, fh)
     local t = 2
-    local fx, fy, fw, fh = x - 2, y - 2, w + 4, h + 4
-    local box = forms.pictureBox(form, fx, fy, fw, fh)
     pcall(forms.clear, box, M.THEME.background)
     local function rect(rx, ry, rw, rh, color)
-        pcall(forms.drawRectangle, box, rx, ry, rw - 1, rh - 1, color, color)
+        pcall(forms.drawRectangle, box, rx - ox, ry - oy, rw - 1, rh - 1, color, color)
     end
     -- frame_ring()'s lines, drawn in reverse of the order it makes them
     -- (it relies on z-order, the first one on top; here the last one
@@ -293,7 +294,36 @@ local function popup_frame(form, x, y, w, h)
     ring(t, t, fw - 2 * t, fh - 2 * t, M.THEME.frameDark, M.THEME.frameLight, false)
     ring(2 * t, 2 * t, fw - 4 * t, fh - 4 * t, M.THEME.border, M.THEME.border, false)
     pcall(forms.refresh, box)
+end
+
+local function popup_frame(form, x, y, w, h)
+    local fx, fy, fw, fh = x - 2, y - 2, w + 4, h + 4
+    local box = forms.pictureBox(form, fx, fy, fw, fh)
+    draw_frame_rings(box, 0, 0, fw, fh)
     return box
+end
+
+-- M.draw_frame() as four pictures - one per edge, 6px (the three rings)
+-- thick - instead of 12 line labels: same look, a third of the controls
+-- (making a control is the slow part of opening a window). Edges only, so
+-- unlike popup_frame() it never hides anything made inside it later
+-- (later controls go behind earlier ones). Top and bottom carry the
+-- corners. Returns its pieces as {h, x, y}, like M.draw_frame().
+function M.draw_frame_fast(form, x, y, w, h)
+    local t3 = 6
+    local fx, fy, fw, fh = x - 2, y - 2, w + 4, h + 4
+    local pieces = {}
+    local function strip(sx, sy, sw, sh)
+        if sw <= 0 or sh <= 0 then return end
+        local box = forms.pictureBox(form, sx, sy, sw, sh)
+        draw_frame_rings(box, sx - fx, sy - fy, fw, fh)
+        pieces[#pieces + 1] = {h = box, x = sx, y = sy}
+    end
+    strip(fx, fy, fw, t3)                               -- top
+    strip(fx, fy + fh - t3, fw, t3)                     -- bottom
+    strip(fx, fy + t3, t3, fh - 2 * t3)                 -- left
+    strip(fx + fw - t3, fy + t3, t3, fh - 2 * t3)       -- right
+    return pieces
 end
 
 -- A section header at y (the section's top). Returns where the section's
@@ -660,9 +690,8 @@ end
 local DISABLEABLE_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
-    "chkKillMode", "txtKillFilter",
+    "chkKillMode", "txtKillFilter", "chkUsePotions",
     "chkThiefMode", "txtThiefFilter", "chkThiefNotify",
-    "chkTrueRandomness",
     "chkStopPerfect", "chkStopNegative",
     "chkAutoCatch",
     "txtCatchFilter",
@@ -773,7 +802,6 @@ local function save_advanced_settings(w)
     w._savedVerbose = forms.ischecked(w.chkVerbose)
     w._savedTreeOverlay = forms.ischecked(w.chkTreeOverlay)
     w._savedDarkMode = forms.ischecked(w.chkDarkMode)
-    w._savedTrueRandomness = forms.ischecked(w.chkTrueRandomness)
     w._savedThiefModeEnabled = forms.ischecked(w.chkThiefMode)
     w._savedThiefFilterText = forms.gettext(w.txtThiefFilter)
     w._savedThiefNotifyEnabled = forms.ischecked(w.chkThiefNotify)
@@ -886,7 +914,6 @@ function M.open_advanced_settings(w)
         w.chkVerbose = nil
         w.chkTreeOverlay = nil
         w.chkDarkMode = nil
-        w.chkTrueRandomness = nil
         w.chkThiefMode = nil
         w.txtThiefFilter = nil
         w.chkThiefNotify = nil
@@ -968,9 +995,6 @@ function M.open_advanced_settings(w)
     -- detail (data/debug_log.lua).
     help_button(advForm, help, y, "Shows everything the bot does in BizHawk's Lua Console, plus extra detail. The log in autocrystal/logs/autocrystal_log.txt is kept either way - send it along with a bug report.")
     w.chkVerbose = popup_checkbox(advForm, "Verbose Logging (for debugging)", POPUP_X, y, 390, w._savedVerbose)
-    y = y + 24
-    help_button(advForm, help, y, "Legacy: Static, Starters and Egg use frame search now, so no module uses this any more. Kept only in case a future module needs it (see rng_mechanics.md).")
-    w.chkTrueRandomness = popup_checkbox(advForm, "True Randomness (legacy)", POPUP_X, y, 390, w._savedTrueRandomness)
     top = end_section(advForm, top, y + 22)
 
     -- Save reads the controls while they're definitely still alive,
@@ -987,8 +1011,7 @@ function M.open_advanced_settings(w)
     w._advancedForm = advForm
 
     -- These widgets didn't exist the last time M.reconfigure() actually
-    -- ran (e.g. wild.lua disabling True Randomness, which only applies
-    -- to soft-reset modules) - re-apply whatever was last requested now
+    -- ran (e.g. egg.lua greying out Kill mode) - re-apply whatever was last requested now
     -- that they've actually been created.
     if w._lastDisabledFields then
         M.reconfigure(w, w._lastDisabledFields)
@@ -1197,6 +1220,7 @@ local function save_general_settings(w)
     w._savedStopOnShiny = forms.ischecked(w.chkStopOnShiny)
     w._savedKillModeEnabled = forms.ischecked(w.chkKillMode)
     w._savedKillFilterText = forms.gettext(w.txtKillFilter)
+    w._savedUsePotions = forms.ischecked(w.chkUsePotions)
     persist_popup_settings(w, "general")
 end
 
@@ -1219,6 +1243,7 @@ function M.open_general_settings(w)
         w.chkKillMode = nil
         w.lblKillFilter = nil
         w.txtKillFilter = nil
+        w.chkUsePotions = nil
     end)
     local top = 6
     local help = {}
@@ -1242,7 +1267,11 @@ function M.open_general_settings(w)
     w.lblKillFilter = forms.label(genForm, "Only kill IDs or names (comma-sep, blank=all):", POPUP_INDENT_X, y, POPUP_TEXT_W, 16)
     y = y + 18
     w.txtKillFilter = popup_textbox(genForm, w._savedKillFilterText, 320, POPUP_INDENT_X, y)
-    top = end_section(genForm, top, y + 20)
+    y = y + 26
+    -- data/potions.lua, from each battle module's Kill mode block.
+    help_button(genForm, help, y, "After a battle, if the Pokemon that fights next is at 25% HP or less, it is healed from the Items pocket: the smallest potion that heals it fully, else the biggest, then more while a whole potion is missing. Never Berries. None left: it runs at low HP.")
+    w.chkUsePotions = popup_checkbox(genForm, "Use potions after battles (HP 25% or less)", POPUP_X, y, 390, w._savedUsePotions)
+    top = end_section(genForm, top, y + 22)
 
     top = add_help_line(genForm, help, top)
     add_save_button(genForm, top, function()
@@ -1726,6 +1755,13 @@ function M.kill_non_shiny(w)
     return enabled
 end
 
+function M.use_potions(w)
+    if w.chkUsePotions == nil then return w._savedUsePotions or false end
+    local enabled = forms.ischecked(w.chkUsePotions)
+    w._savedUsePotions = enabled
+    return enabled
+end
+
 function M.auto_catch_enabled(w)
     if w.chkAutoCatch == nil then return w._savedAutoCatchEnabled or false end
     local enabled = forms.ischecked(w.chkAutoCatch)
@@ -1780,9 +1816,6 @@ function M.crit_safety_override_enabled(w)
     return enabled
 end
 
--- Returns the custom HP% as a fraction (e.g. 40 -> 0.40). Falls back to
--- 0.40 if the field is empty, non-numeric, or out of a sane 1-100 range,
--- rather than risking a bad value silently breaking the weaken-loop.
 -- Frame rollback: tries per encounter, the first one included - the Tries
 -- box (1-999; DEFAULT_CATCH_TRIES when blank or not a number), or
 -- math.huge with "Always retry". Only counts with M.catch_retry_enabled().
@@ -1819,6 +1852,9 @@ function M.shiny_savestate_enabled(w)
     return enabled
 end
 
+-- Returns the custom HP% as a fraction (e.g. 40 -> 0.40). Falls back to
+-- 0.40 if the field is empty, non-numeric, or out of a sane 1-100 range,
+-- rather than risking a bad value silently breaking the weaken-loop.
 function M.custom_catch_hp_target(w)
     if w.txtCustomHpTarget == nil then
         local savedNumber = tonumber(w._savedCustomHpTargetText)
@@ -2034,13 +2070,6 @@ function M.tree_overlay_enabled(w)
     if w.chkTreeOverlay == nil then return w._savedTreeOverlay ~= false end
     local enabled = forms.ischecked(w.chkTreeOverlay)
     w._savedTreeOverlay = enabled
-    return enabled
-end
-
-function M.true_randomness_enabled(w)
-    if w.chkTrueRandomness == nil then return w._savedTrueRandomness or false end
-    local enabled = forms.ischecked(w.chkTrueRandomness)
-    w._savedTrueRandomness = enabled
     return enabled
 end
 

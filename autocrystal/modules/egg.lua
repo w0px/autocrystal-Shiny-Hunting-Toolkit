@@ -153,6 +153,7 @@ local function divider_field()
 end
 
 local COLOR_GOLD = 16766720
+local COLOR_GREEN = 3066993 -- a shiny that's already yours (gift, egg, prize, starter)
 
 local EGG_PLACEHOLDER = 0xFD
 -- Value fixed once per run inside M.init() below, via the launcher's
@@ -346,15 +347,11 @@ end
 -- ===== M.init =====
 -- Stop-on-shiny, every Auto-Catch field, and crit-safety override are
 -- also greyed out - egg.lua never reads any of those Gui getters (no
--- wild-battle capture flow here). True Randomness IS in this list now -
--- egg.lua no longer calls Gui.true_randomness_enabled() at all, since
--- frame search (trying every frame) supersedes it. Greyed out
--- here so it's visually obvious it has no effect while Egg is the active
--- module. Verbose Logging stays checkable.
+-- wild-battle capture flow here). Verbose Logging stays checkable.
 local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
-    "chkKillMode", "txtKillFilter",
+    "chkKillMode", "txtKillFilter", "chkUsePotions",
     "chkThiefMode", "txtThiefFilter",
     "chkStopOnShiny",
     "chkAutoCatch", "txtCatchFilter",
@@ -362,7 +359,6 @@ local DISABLED_FIELDS = {
     "chkStopAutoCatchException", "txtStopAutoCatchException",
     "chkOverrideCritSafety", "txtCustomHpTarget",
     "chkCatchOnItem", "txtCatchItemFilter",
-    "chkTrueRandomness",
     "chkCatchRetry", "txtCatchRetryCount", "chkCatchRetryAlways", "chkCatchSendNext",
 }
 function M.init(sharedForm, yOffset, existingHud)
@@ -742,7 +738,7 @@ function M.step()
                     {name = "Total Shinies", value = tostring(Stats.totalShinies), inline = true},
                     {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
                 },
-                COLOR_GOLD,
+                COLOR_GREEN, -- already yours: green like a catch
                 -- The egg picture (animated) - there's no public URL for
                 -- it, so discord_relay.ps1 uploads data/sprites/
                 -- egg_discord.gif along with the message (Discord's

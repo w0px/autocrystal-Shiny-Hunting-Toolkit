@@ -342,21 +342,10 @@ local pendingEncounterUpdate = false
 -- especially for Shuckle's longer dialogue) in exchange for actually
 -- reaching a larger slice of the DV space.
 local mashSplitsFired = 0
--- REMOVED: True Randomness (a single FULL_COVERAGE_RANGE call per reset,
--- ~35000 frames average) used to be an option here, gated to fire once per
--- reset so it didn't multiply that huge wait by every dialogue tick. It's
--- now superseded by reroll_savestate_pool() below: that does the exact
--- same FULL_COVERAGE_RANGE injection, but only once per
--- REROLL_INTERVAL_SECONDS (30 min) instead of once per reset - the same
--- "reach the whole reachable-state space" job, at a small fraction of the
--- time cost. Per the Monte Carlo comparison in rng_mechanics.md, paying
--- that huge cost on every single reset (what True Randomness did) is
--- strictly worse than paying it once per 30-minute window and staying
--- fast in between, so static.lua no longer reads
--- Gui.true_randomness_enabled() at all - see DISABLED_FIELDS below, which
--- greys the checkbox out while Static is the active module so it's clear
--- it has no effect here. Starters/Egg don't have their own reroll yet, so
--- they still read and honor the shared checkbox normally.
+-- One full-coverage RNG injection per REROLL_INTERVAL_SECONDS (30 min,
+-- reroll_savestate_pool() below) instead of a huge delay on every reset:
+-- the same reach over the DV space for a fraction of the time (see
+-- rng_mechanics.md).
 local lastResetTime = nil
 local consecutiveStuckReloads = 0
 -- Companion to consecutiveStuckReloads, but counting instead of timing -
@@ -1856,20 +1845,13 @@ end
 -- caught (living dex mode), the auto-catch exception list, the crit-
 -- safety override + custom HP target, catch-on-item (+ its filter), and
 -- don't-weaken all get read by do_catch_sequence/M.step() below now.
---
--- True Randomness stays disabled - static.lua no longer calls
--- Gui.true_randomness_enabled() at all, since reroll_savestate_pool()'s
--- periodic full-coverage injection supersedes it for this module (see
--- the comment by mashSplitsFired's declaration). Greyed out here so it's
--- visually obvious it has no effect while Static is the active module,
--- instead of silently doing nothing. Verbose Logging stays checkable.
+-- Verbose Logging stays checkable.
 local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
-    "chkKillMode", "txtKillFilter",
+    "chkKillMode", "txtKillFilter", "chkUsePotions",
     "chkThiefMode", "txtThiefFilter",
     "chkStopOnShiny",
-    "chkTrueRandomness",
 }
 
 function M.init(sharedForm, yOffset, existingHud)
@@ -2950,7 +2932,7 @@ function M.step()
                     {name = "Total Shinies", value = tostring(Stats.totalShinies), inline = true},
                     {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
                 },
-                COLOR_GOLD,
+                COLOR_GREEN, -- already yours: green like a catch
                 shiny_sprite_url(newSpecies)
             )
             return true
@@ -3462,9 +3444,6 @@ function M.step()
     local isDribbleTarget = StaticTargetDropdown and is_open_world_style_target(forms.gettext(StaticTargetDropdown))
     local isLapras = StaticTargetDropdown and forms.gettext(StaticTargetDropdown) == "Lapras"
     if not firstPressPending and not isDribbleTarget and not isLapras then
-        -- Gui.true_randomness_enabled() is deliberately NOT read here
-        -- anymore - see the comment by mashSplitsFired's declaration above
-        -- for why reroll_savestate_pool() supersedes it for this module.
         RngEnabler.enable_randomness(STATIC_SPLIT_RANGE)
         mashSplitsFired = mashSplitsFired + 1
     elseif not firstPressPending and (isDribbleTarget or isLapras) then

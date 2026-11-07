@@ -230,7 +230,7 @@ Every settings window works the same way: **Save** applies and remembers your ch
 </p>
 
 - **Stop Conditions** – stop on Perfect DVs, Perfect Negative DVs, a specific species (name or ID), or on **any** shiny. "Stop on ANY shiny" is the manual mode: it overrides Auto-Catch, so the bot stops and leaves the shiny to you.
-- **Kill Mode** – battle non-shinies with the best of your Pokémon's moves instead of running, optionally only specific species. See [Kill Mode](#kill-mode-experimental).
+- **Kill Mode** – battle non-shinies with the best of your Pokémon's moves instead of running, optionally only specific species, and optionally **use potions** after battles once HP is at 25% or less. See [Kill Mode](#kill-mode-experimental).
 
 ## Auto-Catch Settings
 
@@ -288,7 +288,7 @@ Every settings window works the same way: **Save** applies and remembers your ch
 - **Discord Relays** – don't run the two small local helpers that Discord needs, if you'd rather not have them (no notifications or Rich Presence then). Saving stops or starts them immediately. See [Why Are There Local Relays?](#why-are-there-local-relays)
 - **Windows** – **Dark mode**: dark colors for the launcher and all of the bot's windows; the launcher art and the Pokémon sprites sit right on the dark background, with no white card – except the launcher's Current Encounter card, which stays white (the still sprites are made from the animated sprites' first frames, transparent around the Pokémon – made by themselves once sprites are downloaded). Every window takes its colors when it opens, so it switches the next time you start the bot.
 - **Headbutt** – show the tree overlay on the game screen: what the tree in front of you can give, and whether battles where you stand get their DVs pinned. See [Picking a Spot: The Tree Overlay](#picking-a-spot-the-tree-overlay).
-- **Debug** – Verbose Logging shows everything the bot does in BizHawk's Lua Console, plus extra detail; without it the console stays empty. Either way, everything goes to `autocrystal/logs/autocrystal_log.txt` (see [Verbose Logging](#verbose-logging)); True Randomness is a legacy option (see [below](#the-true-randomness-checkbox-legacy)).
+- **Debug** – Verbose Logging shows everything the bot does in BizHawk's Lua Console, plus extra detail; without it the console stays empty. Either way, everything goes to `autocrystal/logs/autocrystal_log.txt` (see [Verbose Logging](#verbose-logging)).
 
 ## Encounter Stats
 
@@ -360,7 +360,7 @@ Instead of damage, a move can say:
 
 The line under the moves sums it up:
 
-- **Knock out** – the move marked **>**: the best chance to knock it out this turn, or, when nothing can, the most damage. A two-turn move (Fly, Solar Beam) counts half and Hyper Beam a little less, for the turn they cost you. *no move hurts it* when none can. It's the same pick Kill Mode makes.
+- **Knock out** – the move marked **>**: the best chance to knock it out this turn, or, when nothing can, the most damage. A two-turn move (Solar Beam, Skull Bash) counts half and Hyper Beam a little less, for the turn they cost you. Fly and Dig count 0.8: they take two turns too, but you're out of reach for the first one. *no move hurts it* when none can. It's the same pick Kill Mode makes.
 - **Weaken to catch** – the move auto-catch would weaken with: the one that takes the most HP while even its **highest roll with a critical hit** can't knock it out, and that can't burn, poison, confuse or trap it. *nothing safe* means every move could knock it out (or none is fit for weakening) – throw balls instead.
 
 ### Encounter table
@@ -395,7 +395,7 @@ The egg picture comes from `autocrystal/data/sprites/normal/egg.gif` (animated) 
 
 ## Wild Encounters Module
 
-- Self-correcting movement (auto-detects safe directions)
+- Walks a loop round the edge of the encounter tiles where you start it, up to 3 steps out each way (at most a 24-step loop): tall grass, any cave floor, or the water while you're surfing. It reads the map the way the game does and never steps onto a door, stairs, a ledge, ice or into the next map. Where no loop fits, or someone keeps standing in the way, it walks a small square instead, and Right/Left where even that doesn't fit. On the English and European games (the Japanese ones walk the square). Phone calls and other text that come up while walking are pressed through with B
 - RAM-verified menu navigation, self-corrects on dropped inputs
 - Automatically handles phone calls and other interruptions (e.g. egg hatching)
 
@@ -412,11 +412,12 @@ Set in [General Settings](#general-settings) and [Advanced Settings](#advanced-s
 ### Kill Mode (experimental)
 
 - Automatically battles non-shiny Pokémon with the best of your Pokémon's four moves: the one most likely to knock it out this turn (damage and accuracy, worked out the way the game does – see [Weakening](#auto-catch-settings)), else the one doing the most damage. A move out of PP is skipped, so all four get used before it runs out
-- It never uses Explosion, one-hit KO moves or moves that lock you in (Thrash, Rollout), counts two-turn moves (Fly, Dig, Solar Beam) at half, and never uses a move the target is immune to – against a Pokémon nothing can hurt, it flees
+- It never uses Explosion, one-hit KO moves or moves that lock you in (Thrash, Rollout), counts two-turn moves (Solar Beam, Skull Bash, Razor Wind) at half – they charge out in the open – and Fly and Dig at 0.8, since their first turn is spent out of reach and only the time counts against them. It never uses a move the target is immune to – against a Pokémon nothing can hurt, it flees
 - On a game where the bot can't find the move table, it uses the move in slot 1, then slot 2 once that's out of PP, as before
 - **Only favourable matchups** – before attacking, the bot reads the wild Pokémon's own moves: if it knows one that's super effective against your Pokémon (Peck against your Bug type), it runs instead. That's the overall matchup (a Bug/Rock Pokémon takes Peck normally, so it fights), only moves with PP left count, and fixed-damage moves like Seismic Toss or Dragon Rage don't. The log says which move it ran from. Also in the **?** next to Kill mode in General Settings
 - Species allowlist on top of that – the bot only battles the Pokémon in the allowlist (ID or name)
-- Automatically flees when no move has PP left or the active Pokémon's HP is below 20%
+- Automatically flees when no move has PP left or the active Pokémon's HP is at 25% or less
+- **Use potions** (General Settings, under Kill mode, off by default) – heals up **between battles**: back in the overworld after a battle, if the Pokémon that fights next is at 25% HP or less, the bot opens Start → PACK, picks a potion from the Items pocket and uses it on that Pokémon, then carries on hunting. It takes the smallest one that heals it fully, or the biggest you have: Potion, Berry Juice (20 HP), Super Potion, Fresh Water (50), Soda Pop (60), Lemonade (80), Moomoo Milk (100), Hyper Potion (200), Max Potion, and Full Restore last (it's the most valuable). If that one isn’t enough, it keeps going while the HP still missing is at least what a potion heals (the biggest such one), so nothing is wasted: a 71 HP Pokémon at 15 HP with only Potions gets two (15 → 35 → 55) and stops, since a third would heal 20 for 16 missing. At most 6 in a row. Berries (you may want them as held items) and Energy Powder / Energy Root (they lower friendship) are never used. Every menu remembers where it was, so the bot reads where each cursor is instead of counting presses – it never lands on SAVE or walks off. With none left, Kill mode runs at low HP like before and the bot tells you once, on Discord too. Every potion goes to the log (e.g. "Use potions: used Super Potion - HP 21 -> 71/90."). Wild, Fishing and Headbutt, on the English and European games (not on the Japanese ones yet)
 - When a Pokémon that already knows 4 moves is about to learn a new one, the bot stops at the prompt without pressing anything and pings Discord with the new move and the four it knows – choose in game which move to forget (or not to learn it), then click **Start**. With a free move slot it just learns the move and carries on
 - As an extra safety net, Kill Mode saves a safety savestate (`kill_mode_safety.State`) to the `autocrystal/autosaves` folder the moment it's turned on, and refreshes a rolling backup (`kill_mode_autosave.State`) in the same folder every 5 minutes while it stays on – so you can always load one back to a recent, safe point if something goes wrong.
 
@@ -965,12 +966,6 @@ Two caveats:
 - The model hasn't been checked against the real game yet. So far, real searches look just like truly random DVs: one Shuckle search found 24,796 different DV combinations in 31,301 tries, where random DVs would give about 24,900.
 
 None of this comes from BizHawk. Its Game Boy core copies the real console's timing down to the clock cycle, so the same presses on the same frames give the same Pokémon on a real Game Boy Color.
-
----
-
-### The "True Randomness" checkbox (legacy)
-
-**Advanced Settings** still has a **True Randomness** checkbox, but no module uses it any more. It used to make each reset's random delay huge (**65,536+ frames**) so every DV combination stayed reachable—[Frame Search](#frame-search-trying-every-frame) replaced those delays in the Starters, Egg, Static and Game Corner modules.
 
 ---
 

@@ -91,7 +91,8 @@ local FLY, DIG, MINIMIZE, RAIN_DANCE, SUNNY_DAY = 19, 91, 107, 240, 241
 --     chance (those keep hurting it while the balls fly, and confusion can
 --     make it knock itself out), no two-turn move, nothing growing.
 --   kill: Kill mode's score multiplier (default 1) - two-turn moves count
---     half, a recharge turn or hurting yourself a bit less.
+--     half (Fly and Dig 0.8: you're out of reach on the first turn), a
+--     recharge turn or hurting yourself a bit less.
 --   x2: the target move that doubles this one's damage (Fly for Gust, ...).
 local EFFECTS = {
     [0x00] = {hit = "normal", weaken = true},           -- NORMAL_HIT
@@ -150,7 +151,13 @@ local EFFECTS = {
     [0x96] = {hit = "normal", weaken = true, x2 = MINIMIZE}, -- STOMP
     [0x97] = {hit = "normal", kill = 0.5},              -- SOLARBEAM
     [0x98] = {hit = "normal", weaken = true},           -- THUNDER
-    [0x9B] = {hit = "normal", kill = 0.5},              -- FLY (and Dig)
+    -- FLY (and Dig): two turns too, but the first one is spent up in the air
+    -- (or underground), where almost nothing can hit you - unlike Solar Beam,
+    -- Skull Bash or Razor Wind, which charge out in the open. So only the
+    -- lost time counts against them: 0.8 rather than half. A one-turn move
+    -- still wins when it's about as sure (Hydro Pump's 80% beats Fly's
+    -- 95% x 0.8 = 76%), but no longer against a much likelier Fly.
+    [0x9B] = {hit = "normal", kill = 0.8},
 }
 
 -- Multi-hit moves: 2 or 3 hits 3/8 of the time each, 4 or 5 hits 1/8.

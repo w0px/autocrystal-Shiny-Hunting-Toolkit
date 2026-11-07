@@ -161,6 +161,7 @@ local function divider_field()
 end
 
 local COLOR_GOLD = 16766720
+local COLOR_GREEN = 3066993 -- a shiny that's already yours (gift, egg, prize, starter)
 
 -- Value fixed once per run inside M.init() below, via the launcher's
 -- Savestate slot dropdown (falls back to 6, this module's historical
@@ -260,13 +261,10 @@ local function wait_for_no_active_script()
 end
 
 -- ===== M.init: runs ONCE =====
--- True Randomness greyed out too: frame search (trying every frame)
--- replaced the random delays it used to widen.
 local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
-    "chkKillMode", "txtKillFilter",
+    "chkKillMode", "txtKillFilter", "chkUsePotions",
     "chkThiefMode", "txtThiefFilter",
-    "chkTrueRandomness",
     "chkCatchRetry", "txtCatchRetryCount", "chkCatchRetryAlways", "chkCatchSendNext",
 }
 
@@ -567,7 +565,7 @@ function M.step()
                 {name = "Total Shinies", value = tostring(Stats.totalShinies), inline = true},
                 {name = "Total Encounters", value = tostring(Stats.totalEncounters), inline = true},
             },
-            COLOR_GOLD,
+            COLOR_GREEN, -- already yours: green like a catch
             shiny_sprite_url(species)
         )
         return true

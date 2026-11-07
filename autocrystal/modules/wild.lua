@@ -10,6 +10,8 @@ local script_dir = script_path:match("(.*[/\\])") or "./"
 package.path = script_dir .. "?.lua;" .. script_dir .. "?/init.lua;" .. script_dir .. "../?.lua;" .. package.path
 
 Mem = require("data.memory")
+-- When the game waits for A/B - battle loops press only then.
+ButtonWait = ButtonWait or require("data.button_wait")
 GsJp = GsJp or require("data.gs_jp")
 Gui = require("gui_module")
 PokemonNames = require("data.pokemon_names")
@@ -371,14 +373,22 @@ end
 
 local function attempt_unstuck_recovery()
     print("Attempting automatic recovery - alternating A/B presses for a few seconds...")
+    -- Stops as soon as a battle starts or ends (wBattleMode, set in init as
+    -- M.battleModeAddr): from there the normal battle/overworld code takes
+    -- over, and blind A/B presses would only open and close the move list.
+    local modeAddr = M.battleModeAddr
+    local mode = modeAddr and memory.readbyte(modeAddr)
+    local function changed() return modeAddr ~= nil and memory.readbyte(modeAddr) ~= mode end
     for cycle = 1, 50 do
         for i = 1, 20 do
             joypad.set({A = true})
             emu.frameadvance()
+            if changed() then joypad.set({}); print("Recovery stopped - the game moved on."); return end
         end
         for i = 1, 10 do
             joypad.set({B = true})
             emu.frameadvance()
+            if changed() then joypad.set({}); print("Recovery stopped - the game moved on."); return end
         end
     end
     joypad.set({})
@@ -809,41 +819,48 @@ local MOVEMENT_IDLE_VALUE = 0xFF
 -- counted as a real step (vs. a blocked bump against a wall/tree).
 local function attempt_step(direction)
     local startX, startY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
-
-    for i = 1, 4 do
-        -- Check BEFORE forcing input on this frame, not just after the
-        -- full 4-frame hold completes - see try_unstuck()'s matching
-        -- comment for why. EnemyWildmonInitialized can fire mid-hold,
-        -- and continuing to hold a direction through frames the game
-        -- never expected input on during a real encounter's own startup
-        -- transition is exactly the kind of window that produced a
-        -- confirmed encounter (Stats/DV print correct, M.step() in-battle
-        -- branch never ran) elsewhere in this same failure class.
-        if memory.readbyte(species_addr) ~= 0 then
-            joypad.set({[direction] = false})
-            return true
+    -- Two presses at most: from standing, a tap in a direction the player
+    -- isn't facing can end up only turning them (Gen 2 turns in place),
+    -- and a turn alone looked exactly like a wall - every pair "blocked",
+    -- the player spinning on the spot. Facing that way now, the second
+    -- press walks; a real wall still doesn't move them either time.
+    for press = 1, 2 do
+        for i = 1, 4 do
+            -- Check BEFORE forcing input on this frame, not just after the
+            -- full 4-frame hold completes - see try_unstuck()'s matching
+            -- comment for why. EnemyWildmonInitialized can fire mid-hold,
+            -- and continuing to hold a direction through frames the game
+            -- never expected input on during a real encounter's own startup
+            -- transition is exactly the kind of window that produced a
+            -- confirmed encounter (Stats/DV print correct, M.step() in-battle
+            -- branch never ran) elsewhere in this same failure class.
+            if memory.readbyte(species_addr) ~= 0 then
+                joypad.set({[direction] = false})
+                return true
+            end
+            joypad.set({[direction] = true})
+            emu.frameadvance()
         end
-        joypad.set({[direction] = true})
-        emu.frameadvance()
-    end
-    joypad.set({[direction] = false})
+        joypad.set({[direction] = false})
 
-    local n = 0
-    while memory.readbyte(MOVEMENT_FLAG_ADDR) == MOVEMENT_IDLE_VALUE and n < 20 do
-        emu.frameadvance()
-        n = n + 1
-        if memory.readbyte(species_addr) ~= 0 then return true end
-    end
+        local n = 0
+        while memory.readbyte(MOVEMENT_FLAG_ADDR) == MOVEMENT_IDLE_VALUE and n < 20 do
+            emu.frameadvance()
+            n = n + 1
+            if memory.readbyte(species_addr) ~= 0 then return true end
+        end
 
-    n = 0
-    while memory.readbyte(MOVEMENT_FLAG_ADDR) ~= MOVEMENT_IDLE_VALUE and n < 90 do
-        emu.frameadvance()
-        n = n + 1
-        if memory.readbyte(species_addr) ~= 0 then return true end
-    end
+        n = 0
+        while memory.readbyte(MOVEMENT_FLAG_ADDR) ~= MOVEMENT_IDLE_VALUE and n < 90 do
+            emu.frameadvance()
+            n = n + 1
+            if memory.readbyte(species_addr) ~= 0 then return true end
+        end
 
-    local endX, endY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
-    return (endX ~= startX or endY ~= startY)
+        local endX, endY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
+        if endX ~= startX or endY ~= startY then return true end
+    end
+    return false
 end
 
 -- Only ever commits to a direction pair verified to be a true round trip
@@ -859,6 +876,12 @@ end
 -- a pair, rather than settling for "wherever we happen to be now".
 local safe_pair = nil
 local homeX, homeY = nil, nil
+-- The walking route (data/walk_loop.lua): the outer edge of the encounter
+-- tiles around home - grass, cave floor, or water while surfing - walked as
+-- a loop. off: "map" (no loop fits / the map can't be read here) until the
+-- next Start, "blocked" (steps kept failing - someone in the way) until the
+-- next battle. While off: a small square, else Right/Left (find_safe_pair).
+local Walk = {lib = require("data.walk_loop"), addr = nil, loop = nil, off = false, blocked = 0, jitter = true}
 
 -- Attempts one step closer to home. Returns true once actually there.
 local function walk_toward_home()
@@ -880,41 +903,45 @@ local function walk_toward_home()
     return (curX == homeX and curY == homeY)
 end
 
+-- A route walked from home and back: a small square first (it looks less
+-- mechanical), else a pair - out and back. Each is tried once and kept only
+-- if every step moved and it ended on the exact tile it started on.
+local SAFE_ROUTES = {
+    {"Right", "Down", "Left", "Up"}, {"Right", "Up", "Left", "Down"},
+    {"Left", "Down", "Right", "Up"}, {"Left", "Up", "Right", "Down"},
+    {"Right", "Left"}, {"Left", "Right"}, {"Down", "Up"}, {"Up", "Down"},
+}
+local OPPOSITE = {Up = "Down", Down = "Up", Left = "Right", Right = "Left"}
+
 local function find_safe_pair(verbose)
     local anchorX, anchorY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
-    local candidates = {
-        {out = "Right", back = "Left"},
-        {out = "Left",  back = "Right"},
-        {out = "Down",  back = "Up"},
-        {out = "Up",    back = "Down"},
-    }
-
-    for _, pair in ipairs(candidates) do
-        local movedOut = attempt_step(pair.out)
-        if memory.readbyte(species_addr) ~= 0 then return nil end
-
-        if movedOut then
-            local movedBack = attempt_step(pair.back)
+    for _, dirs in ipairs(SAFE_ROUTES) do
+        local name = table.concat(dirs, "/")
+        local moved = 0
+        for _, d in ipairs(dirs) do
+            if not attempt_step(d) then break end
             if memory.readbyte(species_addr) ~= 0 then return nil end
-
-            local nowX, nowY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
-            if movedBack and nowX == anchorX and nowY == anchorY then
-                vprint(string.format("Found safe zero-drift pair: %s / %s", pair.out, pair.back))
-                return pair
-            else
-                if verbose then
-                    print(string.format("%s/%s didn't return to anchor (now X=%d Y=%d, anchor was X=%d Y=%d) - trying next pair",
-                        pair.out, pair.back, nowX, nowY, anchorX, anchorY))
-                end
-                anchorX, anchorY = nowX, nowY
-            end
-        else
-            if verbose then
-                print(string.format("%s blocked from this tile - skipping this pair", pair.out))
-            end
+            moved = moved + 1
         end
+        if memory.readbyte(species_addr) ~= 0 then return nil end
+        local nowX, nowY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
+        if moved == #dirs and nowX == anchorX and nowY == anchorY then
+            vprint(string.format("Found safe zero-drift route: %s", name))
+            return {dirs = dirs, name = name}
+        end
+        if moved < #dirs then
+            -- Blocked part way round: retrace the steps taken.
+            for k = moved, 1, -1 do
+                attempt_step(OPPOSITE[dirs[k]])
+                if memory.readbyte(species_addr) ~= 0 then return nil end
+            end
+            if verbose then print(string.format("%s blocked from this tile - skipping it", name)) end
+        elseif verbose then
+            print(string.format("%s didn't return to anchor (now X=%d Y=%d, anchor was X=%d Y=%d) - trying the next one",
+                name, nowX, nowY, anchorX, anchorY))
+        end
+        anchorX, anchorY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
     end
-
     return nil
 end
 
@@ -1044,20 +1071,109 @@ end
 -- still shows the same correlation.
 local WILD_JITTER_RANGE = 64
 
-local function do_nudge_cycle()
-    -- See WILD_JITTER_RANGE above - burns a random 1-64 idle frames
-    -- before every cycle so consecutive encounters don't keep landing on
-    -- the same frame-timing relationship between the two DV-roll reads.
-    -- Safe to do blindly here (no species_addr check needed): Gen 2 only
-    -- rolls a wild encounter on an actual step, never while idle, so
-    -- burning idle frames can't itself trigger or mask one.
-    RngEnabler.enable_randomness(WILD_JITTER_RANGE)
+-- One step of the loop (see Walk at the top). Returns true for a step taken
+-- (or an encounter), false for a blocked one, nil once the loop is off -
+-- do_nudge_cycle() then walks the square / pair instead.
+function Walk.step()
+    local lib, a = Walk.lib, Walk.addr
+    local x, y = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
+    local loop = Walk.loop
+    if loop and (memory.readbyte(a.mapGroup) ~= loop.mapGroup or memory.readbyte(a.mapNumber) ~= loop.mapNumber) then
+        loop, Walk.loop = nil, nil
+    end
+    if loop == nil then
+        local why
+        loop, why = lib.plan(memory.readbyte, function(bank, addr)
+            return memory.readbyte(bank == 0 and addr or bank * 0x4000 + addr - 0x4000, "ROM")
+        end, a, homeX, homeY, x, y)
+        if loop == nil then
+            print("Walking: " .. why .. " - walking a small square instead.")
+            Walk.off = "map"
+            return nil
+        end
+        Walk.loop = loop
+        print(string.format("Walking: a %d-step loop round the edge of %d encounter tiles here.", #loop.dirs, loop.size))
+    end
+    -- See WILD_JITTER_RANGE: once after each battle, standing still.
+    if Walk.jitter then
+        Walk.jitter = false
+        RngEnabler.enable_randomness(WILD_JITTER_RANGE)
+    end
+    local i = lib.index_of(loop, x, y)
+    local dir = i and loop.dirs[i]
+    if dir == nil then
+        local path = lib.path_to_loop(loop.set, loop, x, y)
+        if path == nil then
+            print("Walking: can't get back onto the loop from here - walking a small square instead.")
+            Walk.off = "map"
+            return nil
+        end
+        dir = path[1]
+    end
+    attempt_step(dir)
+    if memory.readbyte(species_addr) ~= 0 then return true end
+    if memory.readbyte(PLAYER_X_ADDR) ~= x or memory.readbyte(PLAYER_Y_ADDR) ~= y then
+        Walk.blocked = 0
+        return true
+    end
+    Walk.blocked = Walk.blocked + 1
+    if Walk.blocked >= 3 then
+        print("Walking: blocked 3 times in a row (someone in the way?) - a small square until the next battle.")
+        Walk.off, Walk.blocked = "blocked", 0
+        return nil
+    end
+    -- Give whoever's in the way a moment to move on.
+    for _ = 1, 30 do
+        emu.frameadvance()
+        if memory.readbyte(species_addr) ~= 0 then return true end
+    end
+    return false
+end
 
+local function do_nudge_cycle()
     local madeRealProgress = false
 
     if homeX == nil then
         homeX, homeY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
         vprint(string.format("Anchoring home tile at X=%d Y=%d", homeX, homeY))
+    end
+
+    -- A script running - a phone call, a sign, someone talking: walking
+    -- presses are ignored, which looked exactly like being blocked (the loop
+    -- gave up on itself, then the stuck recovery mashed A/B). Wait it out
+    -- instead: B only when its text waits for a button (ButtonWait), and
+    -- after 10 seconds without one (a YES/NO box) a B every second - No.
+    if Walk.addr and (memory.readbyte(Walk.addr.scriptMode) ~= 0 or ButtonWait.waiting()) then
+        if (Walk.scriptFrames or 0) == 0 then
+            vprint("Overworld: a phone call or other text is up - pressing B through it, then walking on.")
+        end
+        -- A press on its text is progress; waiting through the rest isn't
+        -- (the stuck checks stay the last resort for a script that hangs).
+        local answered = ButtonWait.waiting()
+        Walk.scriptFrames = (Walk.scriptFrames or 0) + ButtonWait.advance(press_button, "B")
+        if not ButtonWait.waiting() and Walk.scriptFrames > 600 and Walk.scriptFrames % 60 < 6 then
+            press_button("B")
+            Walk.scriptFrames = Walk.scriptFrames + 5
+        end
+        Walk.blocked = 0
+        if Walk.off == "blocked" then Walk.off = false end
+        return answered
+    end
+    Walk.scriptFrames = 0
+
+    if Walk.addr and not Walk.off then
+        local stepped = Walk.step()
+        if stepped ~= nil then
+            if stepped then
+                consecutive_movement_failures = 0
+            else
+                consecutive_movement_failures = consecutive_movement_failures + 1
+                if consecutive_movement_failures >= UNSTUCK_THRESHOLD then try_unstuck() end
+            end
+            return stepped
+        end
+        -- The loop just went off: back home for the square / pair below.
+        safe_pair = nil
     end
 
     if safe_pair == nil then
@@ -1078,6 +1194,15 @@ local function do_nudge_cycle()
         -- triggers (the game appears to briefly lock out new movement
         -- input during that transition) - print full detail occasionally
         -- rather than on every single cycle to avoid spamming the console.
+        -- See WILD_JITTER_RANGE above - a random 1-64 idle frames so
+        -- encounters don't keep landing on the same frame timing. Once here,
+        -- back on the home tile after each battle (safe_pair is cleared
+        -- then), not before every out-and-back: that's what shifts when
+        -- the next encounter's DVs are rolled, and the walking in between
+        -- stays smooth instead of stopping for up to a second each time.
+        -- Safe without a species_addr check: Gen 2 only rolls a wild
+        -- encounter on an actual step, never while idle.
+        RngEnabler.enable_randomness(WILD_JITTER_RANGE)
         local verbose = Gui.verbose_logging(hud) and (failed_pair_attempts % 20 == 0)
         safe_pair = find_safe_pair(verbose)
         if safe_pair == nil and memory.readbyte(species_addr) == 0 then
@@ -1090,19 +1215,20 @@ local function do_nudge_cycle()
         end
     else
         local startX, startY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
-        local movedOut = attempt_step(safe_pair.out)
-        if memory.readbyte(species_addr) ~= 0 then return end
-        local movedBack = attempt_step(safe_pair.back)
-        if memory.readbyte(species_addr) ~= 0 then return end
+        local allMoved = true
+        for _, d in ipairs(safe_pair.dirs) do
+            if not attempt_step(d) then allMoved = false end
+            if memory.readbyte(species_addr) ~= 0 then return end
+        end
 
         local endX, endY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
         local trulyReturned = (endX == startX and endY == startY)
-        madeRealProgress = movedOut and movedBack and trulyReturned
+        madeRealProgress = allMoved and trulyReturned
 
-        if movedOut and movedBack and not trulyReturned then
+        if not trulyReturned then
             print(string.format(
-                "WARNING: established pair (%s/%s) didn't return to start (was X=%d Y=%d, now X=%d Y=%d) - re-verifying a fresh pair",
-                safe_pair.out, safe_pair.back, startX, startY, endX, endY))
+                "WARNING: established route (%s) didn't return to start (was X=%d Y=%d, now X=%d Y=%d) - re-verifying a fresh one",
+                safe_pair.name, startX, startY, endX, endY))
             safe_pair = nil
         end
 
@@ -1110,7 +1236,7 @@ local function do_nudge_cycle()
         if cycles_since_print >= 20 then
             cycles_since_print = 0
             local x, y = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
-            vprint(string.format("Still nudging (%s/%s) at X=%d Y=%d", safe_pair and safe_pair.out or "?", safe_pair and safe_pair.back or "?", x, y))
+            vprint(string.format("Still nudging (%s) at X=%d Y=%d", safe_pair and safe_pair.name or "?", x, y))
         end
     end
 
@@ -1380,6 +1506,11 @@ end
 -- press is dropped or the bag layout isn't what was last scanned.
 local function navigate_to_pack_and_select_ball(ballId)
     local nav_attempts = 0
+    -- The Pack's item list is the only menu here that exits on Up/Down: the
+    -- joypad-filter byte of the 2D menu block, just before wMenuCursorY
+    -- (see data/potions.lua). Until it's set, the Pack isn't taking buttons.
+    local function pack_list_open() return memory.readbyte(MENU_CURSOR_Y - 1) & 0xC0 == 0xC0 end
+    local packConfirmed = false
     while have_battle_controls and memory.readbyte(species_addr) ~= 0 do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1388,7 +1519,23 @@ local function navigate_to_pack_and_select_ball(ballId)
         local cy = memory.readbyte(MENU_CURSOR_Y)
         local cx = memory.readbyte(MENU_CURSOR_X)
         if cy == PACK_CURSOR.y and cx == PACK_CURSOR.x then
-            press_button("A")
+            -- A until the Pack is open. A press made while the battle menu
+            -- isn't taking buttons yet is lost - press again only while
+            -- it's still the battle menu with the cursor on PACK.
+            for _ = 1, 4 do
+                press_button("A")
+                for _ = 1, 40 do
+                    if pack_list_open() then break end
+                    emu.frameadvance()
+                    if memory.readbyte(species_addr) == 0 then return false end
+                end
+                if pack_list_open() then break end
+                if memory.readbyte(MENU_CURSOR_Y) ~= PACK_CURSOR.y or memory.readbyte(MENU_CURSOR_X) ~= PACK_CURSOR.x then break end
+            end
+            packConfirmed = pack_list_open()
+            if not packConfirmed then
+                vprint("Catch-mode: couldn't confirm the Pack opened - going on with the fixed wait")
+            end
             break
         else
             nav_attempts = nav_attempts + 1
@@ -1405,7 +1552,7 @@ local function navigate_to_pack_and_select_ball(ballId)
     -- observed a brief (1-4 frame) window of unrelated/noisy values in
     -- this same memory region right as a menu transition happens, same
     -- class of issue as the EXP-gain animation corruption found earlier.
-    for i = 1, 30 do
+    for i = 1, packConfirmed and 10 or 30 do
         emu.frameadvance()
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1486,11 +1633,106 @@ local function navigate_to_pack_and_select_ball(ballId)
         if target == nil then break end
         press_button((here == nil or here > target) and "Up" or "Down")
         scrollAttempts = scrollAttempts + 1
+        -- Until the cursor has moved, or the next read is the old ball
+        -- again and the next press overshoots.
+        for _ = 1, 15 do
+            if memory.readbyte(wCurItemAddr) ~= curItem then break end
+            emu.frameadvance()
+            if memory.readbyte(species_addr) == 0 then return false end
+        end
     end
 
     print("Catch-mode: couldn't find the ball in the Pack menu after scrolling")
     press_button("B")
     return false
+end
+
+-- ===== Kill mode: Use potions (General Settings) =====
+-- Back in the overworld after a battle, data/potions.lua heals the Pokemon
+-- that fights next once it's at Potions.LOW_HP or less. Checked once per
+-- battle (and once after Start); "none left" is said once until a potion
+-- turns up again. One table, not separate locals: wild.lua is at Lua's
+-- 200-locals limit. The menu addresses are nil on the Japanese versions
+-- (not mapped yet), which leaves it off there.
+local PotionUse = {lib = require("data.potions"), checked = nil, noneSaid = false,
+    itemsAddr = nil, menuItemsAddr = nil}
+
+-- false once Stop is pressed or a battle has started: wBattleMode, the
+-- byte before wTempWildMonSpecies (species_addr) - 0 in the overworld.
+function PotionUse.wait(frames)
+    for _ = 1, frames do
+        emu.frameadvance()
+        if stop_was_requested() or memory.readbyte(species_addr - 1) ~= 0 then return false end
+    end
+    return true
+end
+
+function PotionUse.after_battle()
+    if PotionUse.checked == encounterSerial then return end
+    PotionUse.checked = encounterSerial
+    local Potions = PotionUse.lib
+    if PotionUse.menuItemsAddr == nil or PotionUse.itemsAddr == nil then
+        if not PotionUse.noneSaid then
+            PotionUse.noneSaid = true
+            print("Use potions: not available on this version of the game yet.")
+        end
+        return
+    end
+    local used, startHP = 0, nil
+    for _ = 1, Potions.MAX_IN_A_ROW do
+        local slot, hp, maxHP = Potions.next_fighter(memory.readbyte, memory.read_u16_be, party_base_addr)
+        if slot == nil then return end
+        startHP = startHP or hp
+        local list = Potions.items(memory.readbyte, PotionUse.itemsAddr)
+        local itemId
+        if used == 0 then
+            -- The first one only at Potions.LOW_HP or less: the smallest that
+            -- heals it fully, else the biggest there is.
+            if hp > maxHP * Potions.LOW_HP then return end
+            itemId = Potions.pick(list, maxHP - hp)
+        else
+            -- Then more while the HP still missing is at least what one
+            -- heals (the biggest such one) - none that would be wasted.
+            itemId = Potions.pick_more(list, maxHP - hp)
+            if itemId == nil then
+                print(string.format("Use potions: %d used, HP %d -> %d/%d.", used, startHP, hp, maxHP))
+                return
+            end
+        end
+        if itemId == nil then
+            if not PotionUse.noneSaid then
+                PotionUse.noneSaid = true
+                print(string.format("Use potions: HP is %d/%d and there are no potions left in the Items pocket - Kill mode runs from battles until it's healed.", hp, maxHP))
+                send_alert("\xF0\x9F\xA7\xAA Use potions: out of potions - HP is low, so Kill mode runs from battles until you heal. Still hunting.", COLOR_BLUE)
+            end
+            return
+        end
+        PotionUse.noneSaid = false
+        local name = get_item_name(itemId)
+        Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Using " .. name .. "...")
+        PotionUse.busy = true
+        local ok, result = Potions.use({
+            read8 = memory.readbyte, read16 = memory.read_u16_be,
+            press = press_button, wait = PotionUse.wait,
+            back_out = function()
+                for _ = 1, 8 do
+                    press_button("B")
+                    if not PotionUse.wait(20) then return end
+                end
+            end,
+            write8 = memory.writebyte, menuItemsAddr = PotionUse.menuItemsAddr,
+            log = function(text) print("Use potions: " .. text) end,
+            idle = function() return memory.readbyte(MOVEMENT_FLAG_ADDR) == MOVEMENT_IDLE_VALUE end,
+            cursorYAddr = MENU_CURSOR_Y, curItemAddr = wCurItemAddr, itemsAddr = PotionUse.itemsAddr,
+            partyCountAddr = party_base_addr,
+        }, itemId, slot)
+        if not ok then
+            print(string.format("Use potions: couldn't use %s (%s) - trying again after the next battle.", name, tostring(result)))
+            return
+        end
+        print(string.format("Use potions: used %s - HP %d -> %d/%d.", name, hp, result, maxHP))
+        used = used + 1
+    end
 end
 
 -- Our own Pokemon is down with the target still standing: the game asks
@@ -1579,11 +1821,30 @@ local function do_catch_attack_turn(slot)
     -- game version/region (still relies on the cursor disambiguation
     -- probe further below in that case).
     if MoveSelectionAddr then
-        local moveSelectWaitFrames = 0
-        while not moveSelectScreenOpen and moveSelectWaitFrames < 90
-          and memory.readbyte(species_addr) ~= 0 do
-            emu.frameadvance()
-            moveSelectWaitFrames = moveSelectWaitFrames + 1
+        -- The A on FIGHT can be lost (the battle menu isn't taking buttons
+        -- yet - slower with the low-HP alarm going). Then the move list
+        -- never opens, and a blind A for the move would only open it and
+        -- leave it sitting there until the watchdog. So: while the cursor
+        -- is still on FIGHT in the main menu, A on FIGHT again; if the list
+        -- still won't open, no move A at all - the next tick starts over.
+        for fightTry = 1, 8 do -- every 20 frames: the hook confirms the list opened before any move A
+            local moveSelectWaitFrames = 0
+            while not moveSelectScreenOpen and moveSelectWaitFrames < 20
+              and memory.readbyte(species_addr) ~= 0 do
+                emu.frameadvance()
+                moveSelectWaitFrames = moveSelectWaitFrames + 1
+            end
+            if moveSelectScreenOpen or memory.readbyte(species_addr) == 0 or fightTry == 8 then break end
+            if not (have_battle_controls and memory.readbyte(MENU_CURSOR_Y) == FIGHT_CURSOR.y
+                and memory.readbyte(MENU_CURSOR_X) == FIGHT_CURSOR.x) then break end
+            vprint("The move list didn't open - pressing A on FIGHT again")
+            press_button("A")
+        end
+        if not moveSelectScreenOpen then
+            if memory.readbyte(species_addr) ~= 0 then
+                vprint("The move list never opened - starting this turn over")
+            end
+            return
         end
         -- Short extra settle after the hook fires: confirmed via
         -- pokecrystal.sym that MoveSelectionScreen's cursor-reset-to-
@@ -1757,7 +2018,7 @@ local function do_catch_attack_turn(slot)
     -- significantly more room before giving up, since that's
     -- specifically where this has been observed - move 1 has been
     -- reliable every time, so its timeout is left as-is.
-    local postAttackTimeout = usedSecondMove and 1800 or 600
+    local postAttackTimeout = usedSecondMove and 10800 or 3600
     -- NOTE: a cursor-position-based backup for have_battle_controls was
     -- tried here and REMOVED after a confirmed real-world failure - see
     -- the full explanation in do_kill_turn above. MOVE2_CURSOR and
@@ -1771,11 +2032,9 @@ local function do_catch_attack_turn(slot)
             print("Catch-mode: Stop requested - aborting.")
             return "stuck"
         end
-        emu.frameadvance()
-        press_button("A")
+        postAttackWait = postAttackWait + ButtonWait.advance(press_button, "A")
         ownDown = own_pokemon_down() and ownDown + 1 or 0
         if ownDown >= 3 then return "own_fainted" end
-        postAttackWait = postAttackWait + 1
         if postAttackWait > postAttackTimeout then
             print("Catch-mode: post-attack wait timed out (enemy may have fainted, or something else is blocking)")
             return "stuck"
@@ -1867,14 +2126,12 @@ local function do_thief_turn()
         -- waiting. have_battle_controls plus a hard frame cap (below) is
         -- sufficient on its own to bound this loop safely.
         local preWaitFrames = 0
-        while not have_battle_controls and preWaitFrames < 600 do
+        while not have_battle_controls and preWaitFrames < 3600 do
             if stop_was_requested() then
                 print("Thief mode: Stop requested - aborting.")
                 return "stuck"
             end
-            emu.frameadvance()
-            press_button("B")
-            preWaitFrames = preWaitFrames + 1
+            preWaitFrames = preWaitFrames + ButtonWait.advance(press_button, "B")
         end
         vprint(string.format("Thief mode: waited %d frame(s) for the battle menu to load - have_battle_controls=%s",
             preWaitFrames, tostring(have_battle_controls)))
@@ -1921,11 +2178,30 @@ local function do_thief_turn()
     -- MoveSelectionAddr is available for this game version/region,
     -- fixed-frame fallback otherwise).
     if MoveSelectionAddr then
-        local moveSelectWaitFrames = 0
-        while not moveSelectScreenOpen and moveSelectWaitFrames < 90
-          and memory.readbyte(species_addr) ~= 0 do
-            emu.frameadvance()
-            moveSelectWaitFrames = moveSelectWaitFrames + 1
+        -- The A on FIGHT can be lost (the battle menu isn't taking buttons
+        -- yet - slower with the low-HP alarm going). Then the move list
+        -- never opens, and a blind A for the move would only open it and
+        -- leave it sitting there until the watchdog. So: while the cursor
+        -- is still on FIGHT in the main menu, A on FIGHT again; if the list
+        -- still won't open, no move A at all - the next tick starts over.
+        for fightTry = 1, 8 do -- every 20 frames: the hook confirms the list opened before any move A
+            local moveSelectWaitFrames = 0
+            while not moveSelectScreenOpen and moveSelectWaitFrames < 20
+              and memory.readbyte(species_addr) ~= 0 do
+                emu.frameadvance()
+                moveSelectWaitFrames = moveSelectWaitFrames + 1
+            end
+            if moveSelectScreenOpen or memory.readbyte(species_addr) == 0 or fightTry == 8 then break end
+            if not (have_battle_controls and memory.readbyte(MENU_CURSOR_Y) == FIGHT_CURSOR.y
+                and memory.readbyte(MENU_CURSOR_X) == FIGHT_CURSOR.x) then break end
+            vprint("The move list didn't open - pressing A on FIGHT again")
+            press_button("A")
+        end
+        if not moveSelectScreenOpen then
+            if memory.readbyte(species_addr) ~= 0 then
+                vprint("The move list never opened - starting this turn over")
+            end
+            return "skipped"
         end
         for i = 1, 15 do
             emu.frameadvance()
@@ -2092,7 +2368,7 @@ local function do_thief_turn()
     -- keeps the round-3 fix's protection intact.
     have_battle_controls = false
     local postAttackWait = 0
-    local postAttackTimeout = 600
+    local postAttackTimeout = 3600
     local enemyFainted = memory.read_u16_be(enemy_hp_addr) == 0
     if battleLevelBaseline == nil then
         battleLevelBaseline = get_active_mon_level()
@@ -2318,9 +2594,7 @@ local function do_thief_turn()
             mashB = true
         end
 
-        emu.frameadvance()
-        press_button(mashB and "B" or "A")
-        postAttackWait = postAttackWait + 1
+        postAttackWait = postAttackWait + ButtonWait.advance(press_button, mashB and "B" or "A")
         if postAttackWait > postAttackTimeout then
             if enemyFainted then
                 print(string.format("Thief mode: enemy fainted but the battle still hasn't ended after %d+ frames - likely a move-learn or evolution prompt. Stopping so you can decide.", postAttackTimeout))
@@ -2342,8 +2616,11 @@ end
 local function flee_battle()
     Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Fleeing battle...")
     -- Safety net for the wait on the encounter hook in M.step(): a shiny
-    -- whose hook only fires after the decision to run is not run from.
-    local serialAtStart = encounterSerial
+    -- whose hook fired after the decision to run is not run from - the
+    -- decision was about decidedEncounterSerial, so any newer encounter
+    -- counts, even one whose hook fired between the decision and here (the
+    -- battle menu wait and settle in M.step() run frames in between - a
+    -- shiny Krabby was fled from that way while fishing, 2026-11-05).
 
     -- Running from a wild battle in Gen 2 isn't guaranteed to
     -- succeed - there's a chance-based escape formula, and a
@@ -2367,16 +2644,14 @@ local function flee_battle()
         -- forever. Check the cursor position directly
         -- instead, which doesn't depend on any hook at all.
         local waitForControlsFrames = 0
-        while memory.readbyte(species_addr) ~= 0 and waitForControlsFrames < 300 do
+        while memory.readbyte(species_addr) ~= 0 and waitForControlsFrames < 1800 do
             local cy0 = memory.readbyte(MENU_CURSOR_Y)
             local cx0 = memory.readbyte(MENU_CURSOR_X)
             if (cy0 == FIGHT_CURSOR.y or cy0 == RUN_CURSOR.y) and (cx0 == FIGHT_CURSOR.x or cx0 == RUN_CURSOR.x) then
                 have_battle_controls = true
                 break
             end
-            emu.frameadvance()
-            press_button("B")
-            waitForControlsFrames = waitForControlsFrames + 1
+            waitForControlsFrames = waitForControlsFrames + ButtonWait.advance(press_button, "B")
         end
 
         local nav_attempts = 0
@@ -2386,7 +2661,7 @@ local function flee_battle()
             local cx = memory.readbyte(MENU_CURSOR_X)
 
             if cy == RUN_CURSOR.y and cx == RUN_CURSOR.x then
-                if shinyLatchedThisBattle and encounterSerial ~= serialAtStart then
+                if shinyLatchedThisBattle and encounterSerial ~= decidedEncounterSerial then
                     -- Leaves the latch set, so the next M.step() decides again.
                     print("A shiny turned up after the decision to run - not running from it.")
                     return
@@ -2414,15 +2689,28 @@ local function flee_battle()
 
         if ran_away then
             vprint(string.format("Ran away (attempt %d) - clearing exit text until battle actually ends", escapeAttempts))
-            local exitWaitFrames = 0
-            while memory.readbyte(species_addr) ~= 0 and exitWaitFrames < 180 do
-                emu.frameadvance()
-                press_button("B")
-                exitWaitFrames = exitWaitFrames + 1
+            -- "Can't escape!": the enemy takes its turn and the game loads
+            -- the battle menu again - the LoadBattleMenu hook sets
+            -- have_battle_controls. That's the answer, so stop clearing text
+            -- there and pick RUN again, instead of pressing B until the
+            -- timeout (about 18 seconds at 1x).
+            have_battle_controls = false
+            local exitWaitFrames, menuBack = 0, false
+            while memory.readbyte(species_addr) ~= 0 and exitWaitFrames < 1080 do
+                if have_battle_controls then menuBack = true; break end
+                exitWaitFrames = exitWaitFrames + ButtonWait.advance(press_button, "B")
             end
             if memory.readbyte(species_addr) == 0 then
                 fledSuccessfully = true
                 Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Escaped, wrapping up...")
+            elseif menuBack then
+                vprint(string.format("Couldn't escape (attempt %d) - the battle menu is back, picking RUN again", escapeAttempts))
+                -- The hook fires as the menu starts loading: give it a moment
+                -- to take buttons, or the next A on RUN is lost.
+                for _ = 1, 20 do
+                    emu.frameadvance()
+                    if memory.readbyte(species_addr) == 0 then break end
+                end
             else
                 vprint(string.format("Escape attempt %d timed out (Can't escape!, most likely) - retrying", escapeAttempts))
             end
@@ -2808,10 +3096,9 @@ local function catch_attempt(info, attempt, snapshot)
     -- despite the Pokemon genuinely still being there) rather than a
     -- real signal - so just wait for have_battle_controls and nothing else.
     local waitFrames = 0
-    while not have_battle_controls and waitFrames < 300 do
+    while not have_battle_controls and waitFrames < 1500 do
         if stop_was_requested() then return stopped() end
-        press_button("B")
-        waitFrames = waitFrames + 1
+        waitFrames = waitFrames + ButtonWait.advance(press_button, "B")
     end
     if not have_battle_controls then
         return failed("the battle menu never loaded")
@@ -3081,10 +3368,9 @@ local function catch_attempt(info, attempt, snapshot)
             have_battle_controls = false
             local recoverFrames = 0
             local ownDown = 0
-            while not have_battle_controls and recoverFrames < 900 do
+            while not have_battle_controls and recoverFrames < 4500 do
                 if stop_was_requested() then return stopped() end
-                press_button("A")
-                recoverFrames = recoverFrames + 1
+                recoverFrames = recoverFrames + ButtonWait.advance(press_button, "A")
                 -- Or its turn knocked out our own Pokemon - caught here,
                 -- before the A presses walk into the "next Pokemon?" prompt.
                 ownDown = own_pokemon_down() and ownDown + 1 or 0
@@ -3287,11 +3573,30 @@ local function do_kill_turn(slot)
     -- game version/region (still relies on the cursor disambiguation
     -- probe further below in that case).
     if MoveSelectionAddr then
-        local moveSelectWaitFrames = 0
-        while not moveSelectScreenOpen and moveSelectWaitFrames < 90
-          and memory.readbyte(species_addr) ~= 0 do
-            emu.frameadvance()
-            moveSelectWaitFrames = moveSelectWaitFrames + 1
+        -- The A on FIGHT can be lost (the battle menu isn't taking buttons
+        -- yet - slower with the low-HP alarm going). Then the move list
+        -- never opens, and a blind A for the move would only open it and
+        -- leave it sitting there until the watchdog. So: while the cursor
+        -- is still on FIGHT in the main menu, A on FIGHT again; if the list
+        -- still won't open, no move A at all - the next tick starts over.
+        for fightTry = 1, 8 do -- every 20 frames: the hook confirms the list opened before any move A
+            local moveSelectWaitFrames = 0
+            while not moveSelectScreenOpen and moveSelectWaitFrames < 20
+              and memory.readbyte(species_addr) ~= 0 do
+                emu.frameadvance()
+                moveSelectWaitFrames = moveSelectWaitFrames + 1
+            end
+            if moveSelectScreenOpen or memory.readbyte(species_addr) == 0 or fightTry == 8 then break end
+            if not (have_battle_controls and memory.readbyte(MENU_CURSOR_Y) == FIGHT_CURSOR.y
+                and memory.readbyte(MENU_CURSOR_X) == FIGHT_CURSOR.x) then break end
+            vprint("The move list didn't open - pressing A on FIGHT again")
+            press_button("A")
+        end
+        if not moveSelectScreenOpen then
+            if memory.readbyte(species_addr) ~= 0 then
+                vprint("The move list never opened - starting this turn over")
+            end
+            return
         end
         -- Short extra settle after the hook fires: confirmed via
         -- pokecrystal.sym that MoveSelectionScreen's cursor-reset-to-
@@ -3480,21 +3785,17 @@ local function do_kill_turn(slot)
     -- on the hook plus the plain timeout below is less clever but
     -- fails SAFELY (a clean stop) instead of corrupting what menu the
     -- bot thinks it's looking at.
-    -- If the enemy already fainted from this attack, this window
-    -- specifically risks a move-learn or evolution prompt appearing -
-    -- and since we press A every single frame with no way to check
-    -- what's actually being shown, that A would immediately confirm
-    -- "yes, learn this move" and pick whatever move the cursor lands
-    -- on to forget. Use a much shorter timeout in that case to
-    -- minimize the risk window, rather than the full budget used when
-    -- the enemy is still alive (where there's no such risk at all).
+    -- A is only pressed where the game waits for A/B on text
+    -- (ButtonWait), never in a YES/NO box - a move-learn prompt can't be
+    -- answered from here. Without those hooks (Japanese versions) it's
+    -- the old blind A, so the window stays short once the enemy fainted.
     local enemyFainted = memory.read_u16_be(enemy_hp_addr) == 0
     -- Confirmed via a real user report: the second-move fallback can
     -- time out at the normal budget on a confused turn. Give it
     -- significantly more room before giving up, since that's
     -- specifically where this has been observed - move 1 has been
     -- reliable every time, so its timeout is left as-is.
-    local postAttackTimeout = enemyFainted and 300 or (usedSecondMove and 1800 or 600)
+    local postAttackTimeout = enemyFainted and 1800 or (usedSecondMove and 10800 or 3600)
     if battleLevelBaseline == nil then
         battleLevelBaseline = get_active_mon_level()
         battleLevelBaselineSpecies = get_active_mon_species()
@@ -3575,9 +3876,7 @@ local function do_kill_turn(slot)
             vprint(string.format("Level increase to %d with a new move possible and no free slot - pressing B from here, so a move-learn prompt can only be answered NO.", currentLevel))
             mashB = true
         end
-        emu.frameadvance()
-        press_button(mashB and "B" or "A")
-        postAttackWait = postAttackWait + 1
+        postAttackWait = postAttackWait + ButtonWait.advance(press_button, mashB and "B" or "A")
         if postAttackWait > postAttackTimeout then
             if enemyFainted then
                 print("Enemy fainted and battle hasn't ended after a short wait - likely a move-learn or evolution prompt. Stopping so you can decide.")
@@ -3646,6 +3945,11 @@ local BATTLE_WATCHDOG_DISCORD_SECONDS = 120
 local battleWatchdogStartTime = nil
 local battleWatchdogNextCheckTime = nil
 local battleWatchdogDiscordSent = false
+-- Both sides' HP the last time the battle menu came up: a turn that changed
+-- either one is progress, and starts the watchdog's 15 seconds over (see the
+-- LoadBattleMenu hook) - it counts time without progress, not the battle's
+-- length, so a long Kill mode battle isn't taken for a stuck one.
+local battleWatchdogLastHP = nil
 
 local function watchdog_force_unstuck()
     print(string.format("WATCHDOG: no position change for %d+ seconds regardless of internal state - forcing recovery", WATCHDOG_SECONDS))
@@ -3707,6 +4011,7 @@ local function stop_for_move_learn()
 end
 
 local function register_hooks()
+    ButtonWait.register(Mem)
     if LearnMoveAddr then
         Mem.RegisterROMHook(LearnMoveAddr, function()
             if ActiveModuleName ~= "wild" then return end
@@ -3733,6 +4038,14 @@ local function register_hooks()
     Mem.RegisterROMHook(LoadBattleMenuAddr, function()
         if ActiveModuleName ~= "wild" then return end
         have_battle_controls = true
+        if battleWatchdogStartTime ~= nil then
+            local hpNow = memory.read_u16_be(enemy_hp_addr) * 65536 + memory.read_u16_be(OWN_HP_ADDR)
+            if battleWatchdogLastHP ~= nil and hpNow ~= battleWatchdogLastHP then
+                battleWatchdogStartTime = os.time()
+                battleWatchdogNextCheckTime = os.time() + BATTLE_WATCHDOG_SECONDS
+            end
+            battleWatchdogLastHP = hpNow
+        end
         if shinyNotificationPending then
             shinyNotificationBattleMenuSeen = true
         end
@@ -3915,9 +4228,10 @@ function M.init(sharedForm, yOffset, existingHud)
 
     local version = memory.readbyte(0x141)
     local region = memory.readbyte(0x142)
+    ButtonWait.setup(version, region)
 
     hud = existingHud
-    Gui.reconfigure(hud, {"chkTrueRandomness"}) -- wild uses every encounter-related field; True Randomness only applies to soft-reset modules
+    Gui.reconfigure(hud, {}) -- wild uses every encounter-related field
 
     if version == 0x54 then
         if region == 0x44 or region == 0x46 or region == 0x53 then
@@ -4075,6 +4389,7 @@ function M.init(sharedForm, yOffset, existingHud)
 
     dv_flag_addr = enemy_addr + 0x21
     species_addr = enemy_addr + 0x22
+    M.battleModeAddr = species_addr - 1
     item_addr = enemy_addr - 0x05
     -- Verified via pokecrystal.sym: wEnemyMonHP is +0x0A from the same
     -- base as enemy_addr (structurally consistent with the standard
@@ -4148,6 +4463,8 @@ function M.init(sharedForm, yOffset, existingHud)
         PLAYER_Y_ADDR = 0xDA02
         wCurItemAddr = 0xD002
         wBallsAddr = 0xD5FD
+        PotionUse.itemsAddr = 0xD5B8 -- wItems
+        Walk.addr = Walk.lib.ADDR.gs
     else
         curPartyMonAddr = 0xd0d4
         MENU_CURSOR_Y = 0xCFA9
@@ -4160,6 +4477,8 @@ function M.init(sharedForm, yOffset, existingHud)
         PLAYER_Y_ADDR = 0xDCB7
         wCurItemAddr = 0xD106
         wBallsAddr = 0xD8D8
+        PotionUse.itemsAddr = 0xD893 -- wItems
+        Walk.addr = Walk.lib.ADDR.crystal
     end
     if version == 0x54 then
         if region == 0x4A then party_base_addr = 0xDC9D
@@ -4186,10 +4505,20 @@ function M.init(sharedForm, yOffset, existingHud)
         PLAYER_Y_ADDR = J(PLAYER_Y_ADDR)
         wCurItemAddr = J(wCurItemAddr)
         wBallsAddr = J(wBallsAddr)
+        PotionUse.itemsAddr = J(PotionUse.itemsAddr)
+        Walk.addr = nil -- not mapped yet: the square / pair
         wCurPartyMonAddr = J(version == 0x54 and 0xD109 or 0xD005)
         wPutativeTMHMMoveAddr = J(version == 0x54 and 0xD262 or 0xD14D)
     end
 
+    -- Use potions' Start menu list (data/potions.lua): wMenuItemsList.
+    if GsJp.japanese(version, region) then
+        PotionUse.menuItemsAddr = nil
+    elseif version == 0x54 then
+        PotionUse.menuItemsAddr = 0xD03E
+    else
+        PotionUse.menuItemsAddr = 0xCF29
+    end
     watchdogLastX, watchdogLastY = memory.readbyte(PLAYER_X_ADDR), memory.readbyte(PLAYER_Y_ADDR)
     watchdogLastMoveTime = os.time()
 
@@ -4214,13 +4543,15 @@ end
 -- from on_resume, which is specifically about the Start button.
 function M.on_switch_to()
     register_hooks()
-    Gui.reconfigure(hud, {"chkTrueRandomness"})
+    Gui.reconfigure(hud, {})
     Gui.clear_last_encounter(hud)
 end
 
 function M.on_resume()
     safe_pair = nil
     homeX, homeY = nil, nil
+    Walk.loop, Walk.off, Walk.blocked, Walk.jitter = nil, false, 0, true
+    consecutive_movement_failures = 0
     overworld_settle_frames = 0
     overworld_loaded = false
     lastProgressTime = nil
@@ -4529,10 +4860,19 @@ function M.step()
                 -- different spot/map while the bot was stopped, and any
                 -- residual drift from the encounter that just ended.
                 safe_pair = nil
+                Walk.jitter = true
+                -- A battle that ended is progress: without this, a long one
+                -- (failed escapes, Kill mode) left the stuck checks counting
+                -- from its start, and they mashed A/B in the overworld the
+                -- moment it was over.
+                mark_progress()
+                watchdogLastMoveTime = os.time()
+                if Walk.off == "blocked" then Walk.off = false end
                 -- Reset the battle watchdog too, so the next battle
                 -- gets its own fresh start time rather than inheriting
                 -- this one's.
                 battleWatchdogStartTime = nil
+                battleWatchdogLastHP = nil
                 battleWatchdogNextCheckTime = nil
                 battleWatchdogDiscordSent = false
                 battleLevelBaseline = nil
@@ -4572,6 +4912,18 @@ function M.step()
             else
                 vprint("Startup check: Thief mode isn't enabled - leaving your lead's held item alone.")
             end
+        end
+
+        -- Use potions: heal up between battles (see PotionUse.after_battle()).
+        if Gui.kill_non_shiny(hud) and Gui.use_potions(hud) then
+            PotionUse.busy = false
+            PotionUse.after_battle()
+            -- The menus take a while at 1x: that's not being stuck.
+            if PotionUse.busy then
+                mark_progress()
+                watchdogLastMoveTime = os.time()
+            end
+            if stop_was_requested() then return false end
         end
 
         if do_nudge_cycle() then
@@ -4614,7 +4966,7 @@ function M.step()
                     COLOR_RED)
                 return true
             else
-                print(string.format("BATTLE WATCHDOG: still in the same battle after %d+ seconds - attempting automatic recovery", stalledFor))
+                print(string.format("BATTLE WATCHDOG: no progress in this battle for %d+ seconds - attempting automatic recovery", stalledFor))
                 attempt_unstuck_recovery()
                 -- Keep retrying quietly (console-only) on this cadence
                 -- rather than giving up after one attempt - only the
@@ -4632,13 +4984,11 @@ function M.step()
         Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "In battle...")
 
         local dvWaitFrames = 0
-        while memory.readbyte(dv_flag_addr) ~= 0x01 and dvWaitFrames < 120 do
+        while memory.readbyte(dv_flag_addr) ~= 0x01 and dvWaitFrames < 720 do
             if memory.readbyte(species_addr) == 0 and not realEncounterConfirmed then
                 break
             end
-            emu.frameadvance()
-            press_button("B")
-            dvWaitFrames = dvWaitFrames + 1
+            dvWaitFrames = dvWaitFrames + ButtonWait.advance(press_button, "B")
         end
 
         if memory.readbyte(dv_flag_addr) ~= 0x01 then
@@ -4661,15 +5011,18 @@ function M.step()
         if waitingForEncounterHook then
             waitingForEncounterHook = false
             -- B through any text before it, like the dv_flag_addr wait above.
-            local hookWaitPresses = 0
+            -- Given up only once the species has read 0 for 8 checks in a
+            -- row: it blips to 0 for a frame right at battle start, and
+            -- giving up on that blip decided on the previous Pokemon - a
+            -- shiny Krabby was fled from that way while fishing (2026-11-05).
+            local hookWaitPresses, speciesGoneFrames = 0, 0
             while EnemyWildmonInitialized and encounterSerial == decidedEncounterSerial
-                and hookWaitPresses < 100 and memory.readbyte(species_addr) ~= 0 do
-                emu.frameadvance()
-                press_button("B")
-                hookWaitPresses = hookWaitPresses + 1
+                and hookWaitPresses < 600 and speciesGoneFrames < 8 do
+                hookWaitPresses = hookWaitPresses + ButtonWait.advance(press_button, "B")
+                speciesGoneFrames = memory.readbyte(species_addr) == 0 and speciesGoneFrames + 1 or 0
             end
             if encounterSerial == decidedEncounterSerial then
-                vprint(string.format("No encounter hook after %d B presses - deciding on what's already latched", hookWaitPresses))
+                print(string.format("No encounter hook after %d frames - deciding on what's already latched (a late shiny is still never run from)", hookWaitPresses))
             end
             decidedEncounterSerial = encounterSerial
             if pendingEncounterUpdate then
@@ -4679,6 +5032,9 @@ function M.step()
 
         realEncounterConfirmed = false
         show_encounter()
+        -- What's decided below is about this encounter: flee_battle() won't
+        -- run if a newer one's hook (a shiny) has fired since.
+        decidedEncounterSerial = encounterSerial
 
         -- Computed once, independent of shininess - "Auto-catch on held
         -- item" should catch ANY Pokemon holding a matching item,
@@ -4935,10 +5291,8 @@ function M.step()
             -- here would prevent the watchdog from ever getting a
             -- chance to fire at all.
             local initialWaitFrames = 0
-            while not have_battle_controls and memory.readbyte(species_addr) ~= 0 and initialWaitFrames < 300 do
-                emu.frameadvance()
-                press_button("B")
-                initialWaitFrames = initialWaitFrames + 1
+            while not have_battle_controls and memory.readbyte(species_addr) ~= 0 and initialWaitFrames < 1800 do
+                initialWaitFrames = initialWaitFrames + ButtonWait.advance(press_button, "B")
             end
 
             -- PP reads as stale for a couple of frames immediately after
