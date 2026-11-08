@@ -820,7 +820,7 @@ That limitation belongs to the exact instant the save state was captured.
 
 ---
 
-## The real fix: Re-rolling the save state
+## Re-rolling the save state
 
 Since the limitation belongs to the save state rather than the delay strategy, the only way to move beyond it is to periodically stop reusing the same save state.
 
@@ -881,7 +881,7 @@ That distinction is empirically testable, even if complete coverage is not.
 
 ---
 
-## Frame Search: Trying Every Frame
+## The real fix: Frame Search: Trying Every Frame
 
 The **Starters**, **Egg**, **Static** and **Game Corner** modules drop random delays altogether. Instead of resetting and *sampling* random timings, they **try every frame in order, exactly once**:
 
