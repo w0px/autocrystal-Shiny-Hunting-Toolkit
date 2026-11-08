@@ -52,7 +52,7 @@
   - [Savestate Slot Usage](#savestate-slot-usage)
   - [Logs and Autosaves](#logs-and-autosaves)
   - [Simulating Randomness: RNG Manipulation in Deterministic Emulation](#simulating-randomness-rng-manipulation-in-deterministic-emulation)
-    - [Frame Search: Trying Every Frame](#frame-search-trying-every-frame)
+    - [Frame Search: Trying Every Frame](#[frame-search-trying-every-frame])
   - [How Headbutt Trees Work in Gen 2](#how-headbutt-trees-work-in-gen-2)
     - [Rigged Spots: The Speckle Transition](#rigged-spots-the-speckle-transition)
     - [Picking a Spot: The Tree Overlay](#picking-a-spot-the-tree-overlay)
