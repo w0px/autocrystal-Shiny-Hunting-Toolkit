@@ -1,0 +1,35 @@
+# Keeps the Discord server's #readme forum in step with docs/README.md: every
+# push that changes the README (or its pictures) edits the forum's posts - one
+# post per section, only the messages that changed, no pings.
+# Needs two repository secrets (Settings > Secrets and variables > Actions):
+#   DISCORD_README_WEBHOOK  the #readme forum's webhook link
+#   DISCORD_BOT_TOKEN       the server bot's token (reads the forum)
+name: README to Discord
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/README.md
+      - docs/images/**
+      - .github/discord/**
+      - .github/workflows/readme-to-discord.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: readme-to-discord
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Post the README to #readme
+        run: python3 .github/discord/sync_readme.py docs/README.md
+        env:
+          DISCORD_README_WEBHOOK: ${{ secrets.DISCORD_README_WEBHOOK }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
