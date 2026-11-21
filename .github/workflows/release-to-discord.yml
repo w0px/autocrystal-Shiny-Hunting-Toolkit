@@ -1,0 +1,33 @@
+# Posts every published release's notes to the Discord server's #releases
+# channel, pinging the Release Ping role. Run it by hand (Actions > Release to
+# Discord > Run workflow) to post an existing release again.
+# Needs one repository secret (Settings > Secrets and variables > Actions):
+#   DISCORD_RELEASES_WEBHOOK  the #releases channel's webhook link
+name: Release to Discord
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to post (e.g. v1.3.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the release
+        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,url,body > release.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      - name: Post it to #releases
+        run: python3 .github/discord/release_to_discord.py release.json
+        env:
+          DISCORD_RELEASES_WEBHOOK: ${{ secrets.DISCORD_RELEASES_WEBHOOK }}
