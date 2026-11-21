@@ -96,7 +96,9 @@ local function pick_slot(ctx)
             healthy[#healthy + 1] = slot
         end
     end
-    if #healthy < 2 then return nil end
+    -- (allowLast: with Frame Rollback the last one goes out too - the
+    -- whole party down is what resets; the user, 2026-11-21)
+    if #healthy < (M.allowLast and 1 or 2) then return nil end
     return healthy[1]
 end
 
@@ -135,6 +137,11 @@ end
 -- else false and why - nothing was answered YES then, unless it says so.
 function M.send(ctx)
     if not M.available() then return false, "this game isn't supported for it" end
+    -- (nobody left to send: say so now - pressing B for a "Use next
+    -- POKeMON?" that never comes would walk through a whiteout)
+    if pick_slot(ctx) == nil then
+        return false, M.allowLast and "the whole party is down" or "no healthy Pokemon left except your last one - not risking it"
+    end
     useNextSeen, pickSeen = 0, 0
 
     -- The "fainted" text, until "Use next POKeMON?" is up. B is safe even
@@ -200,6 +207,11 @@ function M.send(ctx)
         while not ctx.battleControls() and pickSeen == picks do
             if ctx.stop() then return false, "Stop was pressed" end
             if frames > 1500 then return false, "the battle menu didn't come back after sending it out" end
+            -- (v1.3.0: a text box after it comes out can wait for a button -
+            -- B through it once things stall; B never picks anything on the
+            -- battle menu or this party menu. The stress test, 2026-11-21: Static,
+            -- Suicune, Espeon out at 91 HP and the battle menu never back)
+            if frames >= 120 and frames % 40 == 0 then ctx.press("B") end
             emu.frameadvance()
             frames = frames + 1
         end

@@ -965,6 +965,29 @@ local function navigate_to_pack_and_select_ball(ballId)
     -- already there.
     if moveSelectScreenOpen then return back_out("the move list opened instead of the Pack") end
     if not packConfirmed and not pack_list_open() and battle_menu_up() then return back_out("the Pack didn't open") end
+    -- (v1.3.0: the Pack opens on the pocket it was last on - after a switch
+    -- it was the TM/HM pocket, with wCurItem still holding an old value, so
+    -- "is it a ball?" passed or failed at random and Right went past Balls;
+    -- the stress test, 2026-11-21, Static Suicune. The game's own pocket
+    -- number, wCurPocket, on the English games: Right until it's Balls (1),
+    -- then Down and Up so the game writes wCurItem for the ball under the
+    -- cursor. Other games: as before.)
+    local pocketAddr = (wCurItemAddr == 0xD106 and 0xCF65) or (wCurItemAddr == 0xD002 and 0xCE65) or nil
+    if pocketAddr and pack_list_open() then
+        for _ = 1, 4 do
+            if memory.readbyte(pocketAddr) == 1 then break end
+            press_button("Right")
+            for _ = 1, 30 do emu.frameadvance() end
+            if memory.readbyte(species_addr) == 0 then return false end
+        end
+        if memory.readbyte(pocketAddr) == 1 then
+            press_button("Down")
+            for _ = 1, 15 do emu.frameadvance() end
+            press_button("Up")
+            for _ = 1, 15 do emu.frameadvance() end
+        end
+    end
+
     local landedOnBalls = is_ball_item(memory.readbyte(wCurItemAddr))
     for presses = 1, 3 do
         if landedOnBalls then break end
@@ -987,6 +1010,10 @@ local function navigate_to_pack_and_select_ball(ballId)
     end
 
     local scrollAttempts = 0
+
+    local nudges = 0
+
+    local pocketMoves = 0
     while scrollAttempts < 16 and memory.readbyte(species_addr) ~= 0 do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1025,7 +1052,27 @@ local function navigate_to_pack_and_select_ball(ballId)
             if itemId == curItem then here = i end
         end
         if target == nil then break end
-        press_button((here == nil or here > target) and "Up" or "Down")
+        if here == nil and nudges < 1 then
+            -- (v1.3.0: wCurItem can still hold an item from before the Pack
+            -- opened - after a switch it read 1 with only Great Balls in the
+            -- pocket, and Up on the one ball changed nothing; the stress test,
+            -- 2026-11-21, Static Suicune. Down and back makes the game write it.)
+            nudges = nudges + 1
+            press_button("Down")
+            for _ = 1, 15 do emu.frameadvance() end
+            press_button("Up")
+            for _ = 1, 15 do emu.frameadvance() end
+        elseif here == nil and not is_ball_item(curItem) and pocketMoves < 3 then
+            -- (still not a ball: the Pack is on another pocket - a stale
+            -- read made it look like the Ball pocket at the start)
+            pocketMoves = pocketMoves + 1
+            press_button("Right")
+            -- (a fixed wait: the pocket redraw flickers wCurItem, so "it changed"
+            -- ends the wait below at once and the next press lands mid-redraw)
+            for _ = 1, 30 do emu.frameadvance() end
+        else
+            press_button((here == nil or here > target) and "Up" or "Down")
+        end
         scrollAttempts = scrollAttempts + 1
         -- Until the cursor has moved, or the next read is the old ball
         -- again and the next press overshoots.
@@ -2280,6 +2327,9 @@ end
 -- waits at the menu for as long as it takes.)
 CatchSetup.LAST_ONE_LOW = 0.30
 function CatchSetup.last_one_low()
+    -- (not with Frame Rollback: a faint there sends out the next one and the
+    -- whole party down just resets)
+    if NextPokemon.allowLast then return nil end
     local party, active = CatchSetup.party()
     local me = party[active]
     if not me then return nil end
@@ -2562,6 +2612,13 @@ local function catch_attempt(info, attempt, snapshot)
     -- (this try's setups - a retry starts over from the battle menu)
     local st = {}
     info.setup = st
+    -- (Frame Rollback: balls only - no sleep, trap, switch or weakening
+    -- turns; a faint sends out the next one and a reset is the next try.
+    -- The user, 2026-11-21: "Balls only with rollback")
+    if info.retry then
+        st.ballsOnly = true
+        st.ballsWhy = "Frame Rollback is on - balls only, a reset is the next try"
+    end
     while true do
         if stop_was_requested() then return stopped() end
         local curHP = memory.read_u16_be(enemy_hp_addr)
@@ -2946,7 +3003,11 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
 
     local info = {label = label, id = caughtSpeciesId, name = caughtSpeciesName, isShiny = isShiny}
     local retry = Gui.catch_retry_enabled(hud)
-    info.sendNext = not retry and Gui.catch_send_next_enabled(hud)
+    -- (v1.3.0, the user's rule 2026-11-21: with Frame Rollback a faint sends
+    -- out the next one - the last one too - and only the whole party down
+    -- resets: balls, faint, next, ..., party down, reset, balls...)
+    info.sendNext = retry or Gui.catch_send_next_enabled(hud)
+    NextPokemon.allowLast = retry and true or false
     -- A failed attempt goes back to the start of the battle (catchMenuState).
     info.retry = retry
     local maxAttempts = Gui.catch_retry_attempts(hud)

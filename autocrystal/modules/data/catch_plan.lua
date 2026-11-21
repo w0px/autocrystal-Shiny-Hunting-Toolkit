@@ -181,8 +181,10 @@ end
 -- (255 at most); caught when a random byte is under it. 0-1.
 M.BALL_MULT = {[2] = 2, [4] = 1.5, [5] = 1}       -- Ultra, Great, Poke
 M.LEVEL_BALL, M.LURE_BALL = 159, 160
--- On a tie (both catch it every time, say) the one that's easiest to replace.
-M.TIE_ORDER = {[5] = 1, [4] = 2, [160] = 3, [159] = 4, [2] = 5}
+-- On a tie (both catch it every time, say) the better ball: Ultra, Great,
+-- Poke, then Level and Lure (the user, 2026-11-21: "it should always use the
+-- highest quality ball" - as 1.2.0 did).
+M.TIE_ORDER = {[2] = 1, [4] = 2, [5] = 3, [159] = 4, [160] = 5}
 function M.ball_chance(id, rate, hp, maxhp, status, ownLevel, enemyLevel, lureMult)
     local mult
     if id == M.LEVEL_BALL then
@@ -202,7 +204,7 @@ function M.ball_chance(id, rate, hp, maxhp, status, ownLevel, enemyLevel, lureMu
     return (a + 1) / 256
 end
 -- balls: {{id, count}, ...}. The ball with the best chance; ties to the
--- easiest to replace. Never a Master Ball (it isn't in M.BALL_MULT).
+-- better ball. Never a Master Ball (it isn't in M.BALL_MULT).
 function M.best_ball(balls, rate, hp, maxhp, status, ownLevel, enemyLevel, lureMult)
     local best, bestChance
     for _, b in ipairs(balls) do
