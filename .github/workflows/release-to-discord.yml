@@ -13,6 +13,10 @@ on:
       tag:
         description: "Release tag to post (e.g. v1.3.0)"
         required: true
+      ping:
+        description: "Ping the Release Ping role"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -23,11 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Read the release
-        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,url,body > release.json
+        run: gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json name,tagName,url,body,assets,publishedAt > release.json
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
       - name: Post it to #releases
-        run: python3 .github/discord/release_to_discord.py release.json
+        run: python3 .github/discord/release_to_discord.py release.json $NO_PING
         env:
+          NO_PING: ${{ (github.event_name == 'workflow_dispatch' && !inputs.ping) && '--no-ping' || '' }}
           DISCORD_RELEASES_WEBHOOK: ${{ secrets.DISCORD_RELEASES_WEBHOOK }}
