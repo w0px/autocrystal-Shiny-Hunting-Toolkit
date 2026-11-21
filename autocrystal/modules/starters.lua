@@ -61,6 +61,8 @@ local wScriptModeAddr -- set during a phone call too; frame search clears any sc
 local atkdef, spespc
 
 local DISCORD_RELAY_URL = "http://127.0.0.1:5000/"
+-- (messages as files for the relay, never a wait on Discord - data/discord_queue.lua)
+local DiscordQueue = require("data.discord_queue")
 
 -- Escapes a value for safe inclusion inside a JSON string. Backslashes
 -- MUST be escaped first, before quotes - see wild.lua for the original
@@ -115,7 +117,7 @@ local function send_discord_embed(title, description, fields, color, spriteUrl)
         payload = string.format('{"embeds": [%s]}', embedJson)
     end
 
-    local ok, response = pcall(comm.httpPost, DISCORD_RELAY_URL, payload)
+    local ok, response = DiscordQueue.post(DISCORD_RELAY_URL, payload)
     if ok then
         print("Discord embed sent, response: " .. tostring(response))
     else
@@ -207,7 +209,7 @@ end
 local DISABLED_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
-    "chkKillMode", "txtKillFilter", "chkUsePotions",
+    "chkKillMode", "txtKillFilter", "chkUsePotions", "chkSwitchTrain", "chkAutoLearn",
     "chkThiefMode", "txtThiefFilter",
     "chkStopOnShiny",
     "chkAutoCatch", "txtCatchFilter",

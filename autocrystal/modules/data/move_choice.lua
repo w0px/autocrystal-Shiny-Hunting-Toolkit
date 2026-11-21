@@ -246,7 +246,7 @@ local function read_side(view, base)
         dvs = {view.read8(base + 6), view.read8(base + 7)},
         happiness = view.read8(base + 12), level = view.read8(base + 13),
         hp = read16(view, base + 16), maxHP = read16(view, base + 18),
-        atk = read16(view, base + 20), def = read16(view, base + 22),
+        atk = read16(view, base + 20), def = read16(view, base + 22), spd = read16(view, base + 24),
         spAtk = read16(view, base + 26), spDef = read16(view, base + 28),
         type1 = view.read8(base + 30), type2 = view.read8(base + 31),
     }
@@ -594,13 +594,57 @@ function M.weaken(view, opts)
     return best
 end
 
+-- The weakening pick without touching what M.weaken() remembers between
+-- turns (the catch's helper search looks at party members that aren't out
+-- yet - data/catch_plan.lua). Their stats are read as they are now (a
+-- party member has no stat changes). Returns the pick, or nil and why:
+-- "none" (no move can safely take more) or "unknown" (it doesn't read right).
+function M.weaken_check(view, opts)
+    if not M.available() then return nil, "unknown" end
+    local user = read_side(view, view.own)
+    local target = read_side(view, view.enemy)
+    if not (plausible(user) and plausible(target)) then return nil, "unknown" end
+    local best = pick_weaken(user, target, user, first_look(target, "check enemy"), opts and opts.ignoreCrits)
+    if best == nil then return nil, "none" end
+    return best
+end
+
+-- A view of a party member (not the one out) as if it were in battle: its
+-- party_struct read through the battle_struct's offsets, its types from
+-- data/species_data.lua (a party_struct has none). partyBase: wPartyCount;
+-- slot: 0-5; enemy: the enemy's battle_struct (wEnemyMon).
+local PARTY_MON_SIZE = 0x30
+local BATTLE_TO_PARTY = {[0] = 0, 1, 2, 3, 4, 5, 21, 22, 23, 24, 25, 26, 27, 31, 32, 33,
+    34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47}
+function M.party_view(read8, partyBase, slot, enemy, types)
+    local base = partyBase + 8 + slot * PARTY_MON_SIZE
+    local VIRTUAL = 0x20000
+    local species = read8(base)
+    local t = types and types[species] or {0, 0}
+    return {
+        own = VIRTUAL, enemy = enemy,
+        read8 = function(addr)
+            local off = addr - VIRTUAL
+            if off >= 0 and off < 32 then
+                if off == 30 then return t[1] elseif off == 31 then return t[2] end
+                return read8(base + BATTLE_TO_PARTY[off])
+            end
+            return read8(addr)
+        end,
+    }
+end
+
 -- The target's first move, with PP left, that's super effective against the
 -- user overall (x2 or x4 - a resistance in the user's other type can cancel
 -- it out), or nil: Kill mode only fights matchups that favour it. Moves of
 -- fixed damage (Seismic Toss, SonicBoom, Super Fang) don't count - type
 -- doesn't change what they do.
 local FIXED_DAMAGE = {level = true, static = true, super_fang = true, psywave = true}
-local function super_effective_threat(target, user)
+-- v1.3.0: only a super effective move that really hurts counts - expected to
+-- take M.THREAT_SHARE of the user's HP or more (a Lv 2 Spearow's Peck on a
+-- Butterfree is super effective for 1-2 HP: no reason to run).
+M.THREAT_SHARE = 0.25
+local function super_effective_threat(target, user, targetFirst, userFirst)
     for slot = 1, 4 do
         local id = target.moves[slot]
         local move = id and id >= 1 and id <= NUM_MOVES and moves[id] or nil
@@ -608,27 +652,79 @@ local function super_effective_threat(target, user)
         if how and not FIXED_DAMAGE[how.hit] and target.pp[slot] > 0 then
             local x = 1
             for _, step in ipairs(matchup_steps(move_type_of(how.hit, move, target), user)) do x = x * step / 10 end
-            if x > 1 then return id end
+            if x > 1 then
+                local r = work_out(slot, target, user, targetFirst or target, userFirst or user, true)
+                if r == nil or r.expected >= M.THREAT_SHARE * math.max(1, user.maxHP) then return id end
+            end
         end
     end
     return nil
 end
+-- Moves that poison, put to sleep or paralyze - a sure one or a chance on a
+-- hit (move_effect_constants.asm). Burn isn't here: rare enough to risk.
+local STATUS_EFFECTS = {[0x01] = "put yours to sleep", [0x02] = "poison yours", [0x21] = "poison yours",
+    [0x42] = "poison yours", [0x4D] = "poison yours", [0x43] = "paralyze yours", [0x06] = "paralyze yours",
+    [0x98] = "paralyze yours", [0x24] = "paralyze yours"}
+local function status_threat(target)
+    for slot = 1, 4 do
+        local id = target.moves[slot]
+        local move = id and id >= 1 and id <= NUM_MOVES and moves[id] or nil
+        if move and target.pp[slot] > 0 and STATUS_EFFECTS[move.effect] then return id, STATUS_EFFECTS[move.effect] end
+    end
+    return nil
+end
+-- It's knocked out before it moves: ours is faster and the pick does it even
+-- at the lowest roll, 90% sure or more.
+local function one_shot(pick, user, target)
+    return pick ~= nil and (user.spd or 0) > (target.spd or 0) and pick.low ~= nil and pick.low >= target.hp
+        and (pick.accuracy or 0) >= 0.9
+end
 
 -- See the top of the file. Returns the pick, or nil and why: "none" (no
--- move can hurt it), "risky" (it knows a move super effective against
--- yours - its name comes third) or "unknown" (no move table, or the battle
--- doesn't read right - go by move 1 and 2 as before).
+-- move can hurt it), "risky" (third: what it knows, as words - a super
+-- effective move that really hurts, or a poison / sleep / paralysis move it
+-- isn't knocked out before using) or "unknown" (no move table, or the
+-- battle doesn't read right - go by move 1 and 2 as before).
+local function kill_pick(user, target, userFirst, targetFirst)
+    local threat = super_effective_threat(target, user, targetFirst, userFirst)
+    if threat then return nil, "risky", move_name(threat) .. ", super effective against yours" end
+    local best = pick_kill(user, target, userFirst, targetFirst)
+    local sid, what = status_threat(target)
+    if sid and not one_shot(best, user, target) then
+        return nil, "risky", string.format("%s, which can %s (and it can't be knocked out first)", move_name(sid), what)
+    end
+    if best == nil then return nil, "none" end
+    return best
+end
 function M.kill(view)
     if not M.available() then return nil, "unknown" end
     local user, target, userFirst, targetFirst = look(view)
     if user == nil then return nil, "unknown" end
-    local threat = super_effective_threat(target, user)
-    if threat then return nil, "risky", move_name(threat) end
     check_last_hit(target, false)
-    local best = pick_kill(user, target, userFirst, targetFirst)
-    if best == nil then return nil, "none" end
+    local best, why, threat = kill_pick(user, target, userFirst, targetFirst)
+    if best == nil then return nil, why, threat end
     lastPick = {key = target.key, hp = target.hp, pick = best}
     return best
+end
+-- The same, without touching what M.kill() remembers (switch-training's
+-- partner search - party members that aren't out, data/train.lua).
+function M.kill_check(view)
+    if not M.available() then return nil, "unknown" end
+    local user = read_side(view, view.own)
+    local target = read_side(view, view.enemy)
+    if not (plausible(user) and plausible(target)) then return nil, "unknown" end
+    return kill_pick(user, target, user, first_look(target, "check enemy"))
+end
+-- A move's raw entry from the game's table: {effect, power, type, accuracy
+-- (out of 255)}, or nil (data/move_learn.lua).
+function M.move_data(id)
+    if not M.available() or id == nil or id < 1 or id > NUM_MOVES then return nil end
+    return moves[id]
+end
+-- Whether an effect is one M.kill would ever attack with (not a status move).
+function M.is_attack(id)
+    local m = M.move_data(id)
+    return m ~= nil and EFFECTS[m.effect] ~= nil and m.power > 0 or false
 end
 
 local TYPE_NAMES = {[NORMAL] = "Normal", [FIGHTING] = "Fighting", [FLYING] = "Flying", [POISON] = "Poison",

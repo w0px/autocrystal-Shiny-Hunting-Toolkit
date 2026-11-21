@@ -123,6 +123,8 @@ end
 -- will never accept that shape directly. The relay always runs on this
 -- fixed local address, so it's a constant rather than a GUI field.
 local DISCORD_RELAY_URL = "http://127.0.0.1:5000/"
+-- (messages as files for the relay, never a wait on Discord - data/discord_queue.lua)
+local DiscordQueue = require("data.discord_queue")
 
 -- Checks the global flag set by launcher.lua's Stop button. Needed
 -- specifically for the auto-catch sequence, which runs long, blocking
@@ -211,7 +213,7 @@ local function send_discord_embed(title, description, fields, color, spriteUrl)
         payload = string.format('{"embeds": [%s]}', embedJson)
     end
 
-    local ok, response = pcall(comm.httpPost, DISCORD_RELAY_URL, payload)
+    local ok, response = DiscordQueue.post(DISCORD_RELAY_URL, payload)
     if ok then
         print("Discord embed sent, response: " .. tostring(response))
     else
@@ -1098,6 +1100,14 @@ function Walk.step()
     if Walk.jitter then
         Walk.jitter = false
         RngEnabler.enable_randomness(WILD_JITTER_RANGE)
+        -- (v1.3.0: a new round after each battle - another loop on a big
+        -- patch, either way round; data/walk_loop.lua's round)
+        if lib.round then
+            local okR, again = pcall(lib.round, memory.readbyte, function(bank, addr)
+                return memory.readbyte(bank == 0 and addr or bank * 0x4000 + addr - 0x4000, "ROM")
+            end, a, homeX, homeY, x, y)
+            if okR and again then loop, Walk.loop = again, again end
+        end
     end
     local i = lib.index_of(loop, x, y)
     local dir = i and loop.dirs[i]
@@ -1459,19 +1469,18 @@ local function find_ball_in_bag()
         if itemId == 0xFF then break end
         if memory.readbyte(wBallsAddr + i * 2 + 1) > 0 then have[itemId] = true end
     end
-    local maxHP = memory.read_u16_be(enemy_max_hp_addr)
-    local hpFactor = maxHP > 0 and (3 * maxHP - 2 * memory.read_u16_be(enemy_hp_addr)) / (3 * maxHP) or 1
-    local mine, theirs = memory.readbyte(FIRST_MOVE_PP_ADDR + 5), memory.readbyte(enemy_addr + 7)
-    local levelBall = theirs >= mine and 1 or theirs >= mine // 2 and 2 or theirs >= mine // 4 and 4 or 8
-    local chance = {[2] = 2 * hpFactor, [4] = 1.5 * hpFactor, [5] = hpFactor,
-        [LURE_BALL] = LURE_MULTIPLIER * hpFactor, [LEVEL_BALL] = levelBall}
-    local best, bestChance
+    -- (v1.3.0: the real chance - the species' catch rate, the 255 cap and
+    -- the +10 asleep - so a sure catch takes a Poke Ball, not an Ultra Ball;
+    -- data/catch_plan.lua's best_ball)
+    local list = {}
     for _, ballId in ipairs(BALL_ITEM_IDS) do
-        if have[ballId] and (best == nil or chance[ballId] > bestChance) then
-            best, bestChance = ballId, chance[ballId]
-        end
+        if have[ballId] then list[#list + 1] = {ballId, 1} end
     end
-    return best
+    local Plan = require("data.catch_plan")
+    local species = memory.readbyte(enemy_addr - 6)
+    local rate = require("data.species_data").catch_rate[species] or 255
+    return (Plan.best_ball(list, rate, memory.read_u16_be(enemy_hp_addr), memory.read_u16_be(enemy_max_hp_addr),
+        memory.readbyte(enemy_addr + 8), memory.readbyte(FIRST_MOVE_PP_ADDR + 5), memory.readbyte(enemy_addr + 7), LURE_MULTIPLIER))
 end
 
 -- Total balls remaining across ALL ball types combined (Poke + Great +
@@ -1511,6 +1520,48 @@ local function navigate_to_pack_and_select_ball(ballId)
     -- (see data/potions.lua). Until it's set, the Pack isn't taking buttons.
     local function pack_list_open() return memory.readbyte(MENU_CURSOR_Y - 1) & 0xC0 == 0xC0 end
     local packConfirmed = false
+    -- (v1.3.0: the battle menu's cursor is only real once its 2x2 menu is
+    -- up and steady - right after a turn it can still hold the move list's
+    -- numbers, and an A "on PACK" then opened FIGHT, and the A meant for
+    -- the ball used a move; the stress test, 2026-11-21: a Headbutt used by
+    -- accident while throwing a ball. engine/battle/menu.asm: 2 rows, 2
+    -- columns.)
+    local function battle_menu_up()
+        local y, x = memory.readbyte(MENU_CURSOR_Y), memory.readbyte(MENU_CURSOR_X)
+        return memory.readbyte(MENU_CURSOR_Y - 6) == 2 and memory.readbyte(MENU_CURSOR_Y - 5) == 2
+            and y >= 1 and y <= 2 and x >= 1 and x <= 2
+    end
+    local function back_out(why)
+        print("Catch-mode: " .. why .. " - backing out to the battle menu and trying again.")
+        -- (B only while not on the battle menu - B does nothing there, and
+        -- its hook doesn't fire again; the stress test, 2026-11-21)
+        for _ = 1, 20 do
+            if battle_menu_up() and not pack_list_open() then
+                local steady = 0
+                for _ = 1, 10 do
+                    steady = battle_menu_up() and steady + 1 or 0
+                    emu.frameadvance()
+                end
+                if steady >= 5 then
+                    moveSelectScreenOpen = false
+                    have_battle_controls = true
+                    return "retry"
+                end
+            end
+            press_button("B")
+            for _ = 1, 10 do emu.frameadvance() end
+            if memory.readbyte(species_addr) == 0 then return false end
+        end
+        return false
+    end
+    local steady = 0
+    for _ = 1, 90 do
+        steady = battle_menu_up() and steady + 1 or 0
+        if steady >= 3 then break end
+        emu.frameadvance()
+    end
+    if steady < 3 then vprint("Catch-mode: couldn't confirm the battle menu is up - going on") end
+    moveSelectScreenOpen = false
     while have_battle_controls and memory.readbyte(species_addr) ~= 0 do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1533,6 +1584,7 @@ local function navigate_to_pack_and_select_ball(ballId)
                 if memory.readbyte(MENU_CURSOR_Y) ~= PACK_CURSOR.y or memory.readbyte(MENU_CURSOR_X) ~= PACK_CURSOR.x then break end
             end
             packConfirmed = pack_list_open()
+            if moveSelectScreenOpen then return back_out("the move list opened instead of the Pack") end
             if not packConfirmed then
                 vprint("Catch-mode: couldn't confirm the Pack opened - going on with the fixed wait")
             end
@@ -1572,6 +1624,8 @@ local function navigate_to_pack_and_select_ball(ballId)
     -- Balls into Key Items and even a third pocket (TM/Battle Items)
     -- beyond that. Check first, and only switch pockets if we're not
     -- already there.
+    if moveSelectScreenOpen then return back_out("the move list opened instead of the Pack") end
+    if not packConfirmed and not pack_list_open() and battle_menu_up() then return back_out("the Pack didn't open") end
     local landedOnBalls = is_ball_item(memory.readbyte(wCurItemAddr))
     for presses = 1, 3 do
         if landedOnBalls then break end
@@ -1599,6 +1653,7 @@ local function navigate_to_pack_and_select_ball(ballId)
             print("Catch-mode: Stop requested - aborting.")
             return false
         end
+        if moveSelectScreenOpen then return back_out("the move list opened instead of the Pack") end
         local curItem = memory.readbyte(wCurItemAddr)
         if curItem == ballId then
             press_button("A")
@@ -1681,6 +1736,11 @@ function PotionUse.after_battle()
     local used, startHP = 0, nil
     for _ = 1, Potions.MAX_IN_A_ROW do
         local slot, hp, maxHP = Potions.next_fighter(memory.readbyte, memory.read_u16_be, party_base_addr)
+        -- (switch-training: whoever is lowest - the partners fight too)
+        if Gui.switch_train and Gui.switch_train(hud) then
+            local s2, h2, m2 = Potions.low_member(memory.readbyte, memory.read_u16_be, party_base_addr)
+            if s2 then slot, hp, maxHP = s2, h2, m2 end
+        end
         if slot == nil then return end
         startHP = startHP or hp
         local list = Potions.items(memory.readbyte, PotionUse.itemsAddr)
@@ -3071,6 +3131,236 @@ local function send_next_pokemon()
     return ok
 end
 
+-- v1.3.0 auto-catch setups (data/catch_plan.lua): Mean Look for a runner,
+-- a sleep move, a safe weakening move - from whoever in the party has one,
+-- switching to it (data/battle_switch.lua). A party without them just
+-- throws balls, as before. One table, not more file-level locals (Lua's
+-- 200-locals limit - see PotionUse).
+local CatchSetup = {plan = require("data.catch_plan"), switch = require("data.battle_switch"),
+    species = require("data.species_data")}
+-- The party as catch_plan sees it: {[slot0] = {species, hp, egg, moves, pp}},
+-- the one out read from the battle struct (its PP drops there in battle).
+function CatchSetup.party()
+    local count = memory.readbyte(party_base_addr)
+    local active = memory.readbyte(curPartyMonAddr)
+    local party = {}
+    for slot0 = 0, math.min(count, 6) - 1 do
+        local base = party_base_addr + 8 + slot0 * 0x30
+        local mon = {species = memory.readbyte(base), egg = memory.readbyte(party_base_addr + 1 + slot0) == 0xFD,
+            hp = memory.read_u16_be(base + 0x22), maxhp = memory.read_u16_be(base + 0x24), moves = {}, pp = {}}
+        for i = 1, 4 do
+            mon.moves[i] = memory.readbyte(base + 1 + i)
+            mon.pp[i] = memory.readbyte(base + 0x16 + i) % 64
+        end
+        party[slot0] = mon
+    end
+    local me = party[active]
+    if me then
+        me.hp = memory.read_u16_be(OWN_HP_ADDR)
+        me.status = memory.readbyte(FIRST_MOVE_PP_ADDR + 6)     -- (wBattleMonStatus: asleep, frozen...)
+        for i = 1, 4 do
+            me.moves[i] = memory.readbyte(FIRST_MOVE_PP_ADDR - 7 + i)
+            me.pp[i] = memory.readbyte(FIRST_MOVE_PP_ADDR - 1 + i) % 64
+        end
+    end
+    return party, active
+end
+-- (v1.3.0, the user's rule 2026-11-21: the one out is the last that can
+-- still fight and it's under 30% - stop at the battle menu and tell the
+-- player; a faint there is a whiteout and the shiny is gone. The game
+-- waits at the menu for as long as it takes.)
+CatchSetup.LAST_ONE_LOW = 0.30
+function CatchSetup.last_one_low()
+    local party, active = CatchSetup.party()
+    local me = party[active]
+    if not me then return nil end
+    for slot0, mon in pairs(party) do
+        if slot0 ~= active and not mon.egg and (mon.hp or 0) > 0 then return nil end
+    end
+    local hp, maxhp = me.hp or 0, memory.read_u16_be(OWN_HP_ADDR + 2)
+    if hp > 0 and maxhp > 0 and hp < maxhp * CatchSetup.LAST_ONE_LOW then
+        return string.format("your last Pokemon that can still fight is down to %d/%d HP (under %d%%) - the bot stopped at the battle menu so it can't faint; finish the catch yourself, the battle is waiting",
+            hp, maxhp, math.floor(CatchSetup.LAST_ONE_LOW * 100 + 0.5))
+    end
+    return nil
+end
+function CatchSetup.enemy()
+    local base = enemy_addr - 6
+    local e = {species = memory.readbyte(base), level = memory.readbyte(base + 13), status = memory.readbyte(base + 14),
+        hp = memory.read_u16_be(enemy_hp_addr), maxhp = memory.read_u16_be(enemy_max_hp_addr), moves = {}, pp = {}}
+    for i = 1, 4 do
+        e.moves[i] = memory.readbyte(base + 1 + i)
+        e.pp[i] = memory.readbyte(base + 7 + i) % 64
+    end
+    return e
+end
+function CatchSetup.switch_ctx()
+    return {
+        read8 = function(a) return memory.readbyte(a) end,
+        read16 = function(a) return memory.read_u16_be(a) end,
+        press = press_button, frame = emu.frameadvance,
+        cursorY = MENU_CURSOR_Y, curBattleMon = curPartyMonAddr, partyCount = party_base_addr, ownHP = OWN_HP_ADDR,
+        menuOption = function(y, x)
+            for _ = 1, 12 do
+                local btn = navigate_to_menu_option({y = y, x = x})
+                if btn == "A" then return true end
+                press_and_wait_for_cursor_change(btn, 30)
+            end
+            return false
+        end,
+        battleControls = function() return have_battle_controls end,
+        clearBattleControls = function() have_battle_controls = false end,
+        advance = function() ButtonWait.advance(press_button, "A") end,
+        stop = stop_was_requested,
+        log = function(text) print("Catch-mode: " .. text) end,
+    }
+end
+-- One setup turn, if the party has something for this one: "acted" (a turn
+-- was used - look again), "weaken" (go on with the weakening move),
+-- "balls", or "own_fainted"/"fainted"/"stuck"/"move2_stuck" from the turn.
+-- st: this try's state; critsOk / targetPercent as the weakening uses them.
+function CatchSetup.turn(st, critsOk, targetPercent, caughtSpeciesName)
+    -- (a move other than 1 or 2 needs the move list's hook - a game without
+    -- it catches the 1.2.0 way)
+    if not MoveSelectionAddr or not curPartyMonAddr or not party_base_addr then return "weaken" end
+    -- (the battle over - it ran or Teleported while ours came in: nothing to
+    -- set up any more; the caller confirms it's gone - the stress test,
+    -- 2026-11-21: "Sing" eight times at a Hoothoot that had Teleported away)
+    if CatchSetup.over() then return "stuck" end
+    local party, active = CatchSetup.party()
+    local enemy = CatchSetup.enemy()
+    if st.trapper ~= nil and st.trapper ~= active then st.trapped = false end
+    local types = CatchSetup.species.types
+    local enemyView = enemy_addr - 6
+    local plan = CatchSetup.plan.decide(party, active, enemy, st, {
+        targetHP = targetPercent,
+        weaken = function(slot0)
+            local view = slot0 == active and battle_view()
+                or MoveChoice.party_view(function(a) return memory.readbyte(a) end, party_base_addr, slot0, enemyView, types)
+            return (MoveChoice.weaken_check(view, {ignoreCrits = critsOk}))
+        end,
+    })
+    if plan.kind == "weaken" then return "weaken" end
+    -- (no move table: the weakening's own old rule decides, as in 1.2.0)
+    if plan.kind == "balls" then
+        st.ballsWhy = plan.roar and string.format("%s knows Roar or Whirlwind - no weakening, it could end the battle", caughtSpeciesName) or nil
+        -- (Roar / Whirlwind: balls even without the game's move table)
+        if plan.roar then return "balls" end
+        return MoveChoice.available() and "balls" or "weaken"
+    end
+    local names = PokemonNames or {}
+    if plan.kind == "switch" then
+        local who = names[party[plan.to].species] or ("party slot " .. (plan.to + 1))
+        print(string.format("Catch-mode: switching to %s to %s %s.", who,
+            plan.why == "trap" and "trap" or plan.why == "sleep" and "put to sleep" or "safely weaken", caughtSpeciesName))
+        st.switches = (st.switches or 0) + 1
+        local ok, why = CatchSetup.switch.to(CatchSetup.switch_ctx(), plan.to)
+        if why == "fainted" then return "own_fainted" end
+        if not ok then
+            if CatchSetup.over() then
+                print("Catch-mode: the battle ended while switching - " .. caughtSpeciesName .. " got away.")
+                return "stuck"
+            end
+            print("Catch-mode: the switch didn't work (" .. tostring(why) .. ") - going on without switching.")
+            st.noSwitch = true
+        end
+        return "acted"
+    end
+    -- a trap or sleep move from the one out
+    local moveName = (MoveNames and MoveNames[plan.id]) or ("move " .. plan.slot)
+    if plan.kind == "trap" then
+        st.trapTries = (st.trapTries or 0) + 1
+        print(string.format("Catch-mode: %s can get away by itself - %s first.", caughtSpeciesName, moveName))
+    else
+        st.sleepTries = (st.sleepTries or 0) + 1
+        print(string.format("Catch-mode: putting %s to sleep with %s.", caughtSpeciesName, moveName))
+    end
+    local result = do_catch_attack_turn(plan.slot)
+    if result == "ok" and plan.kind == "trap" then st.trapped, st.trapper = true, active end
+    if result == "ok" and plan.kind == "sleep" and not CatchSetup.over() then
+        local s = memory.readbyte(enemy_addr + 8)
+        print(string.format("Catch-mode: %s is %s.", caughtSpeciesName,
+            (s & 0x07) ~= 0 and string.format("asleep (%d turns)", s & 0x07) or "still awake (it missed, or it woke straight up)"))
+    end
+    if result == "ok" or result == nil then return "acted" end
+    return result
+end
+-- The battle is over: no wild one (wTempEnemyMonSpecies 0) and wBattleMode 0
+-- - both, so the species' flicker during an animation never passes for it.
+function CatchSetup.over()
+    return memory.readbyte(species_addr) == 0 and memory.readbyte(species_addr - 1) == 0
+end
+
+-- v1.3.0 Kill mode: switch-training (data/train.lua) and learning better
+-- moves by itself (data/move_learn.lua) - both General Settings options.
+CatchSetup.train = require("data.train")
+CatchSetup.learn = require("data.move_learn")
+CatchSetup.trainee = nil      -- {serial, slot}: this battle's trainee (the one out when it started)
+-- Before a Kill-mode attack: nil (go on as before), "acted" (a partner was
+-- switched in - decide again next step), "depleted" (nobody left who can
+-- fight for the trainee - stop). killPick/killWhy: MoveChoice.kill's answer.
+function CatchSetup.train_turn(killPick, killWhy, serial)
+    if not (Gui.switch_train and Gui.switch_train(hud)) then return nil end
+    if not MoveSelectionAddr or not curPartyMonAddr or not party_base_addr then return nil end
+    local party, active = CatchSetup.party()
+    if CatchSetup.trainee == nil or CatchSetup.trainee.serial ~= serial then
+        CatchSetup.trainee = {serial = serial, slot = active}
+    end
+    if active ~= CatchSetup.trainee.slot then return nil end      -- (a partner is out: it fights)
+    local me = party[active]
+    local enemyHP = memory.read_u16_be(enemy_hp_addr)
+    if CatchSetup.train.solo(killPick, killPick == nil and killWhy or nil, me, enemyHP) then return nil end
+    local types = CatchSetup.species.types
+    local enemyView = enemy_addr - 6
+    local to = CatchSetup.train.partner(party, active, function(slot0)
+        local view = MoveChoice.party_view(function(a) return memory.readbyte(a) end, party_base_addr, slot0, enemyView, types)
+        return (MoveChoice.kill_check(view))
+    end)
+    if to == nil then
+        -- (anyone still able to fight at all? none: depleted)
+        local able = false
+        for slot0, mon in pairs(party) do
+            if slot0 ~= active and not mon.egg and mon.hp > CatchSetup.train.FIT_HP * math.max(1, mon.maxhp) then
+                for i = 1, 4 do if mon.pp[i] > 0 and MoveChoice.is_attack(mon.moves[i]) then able = true end end
+            end
+        end
+        if not able then return "depleted" end
+        return nil
+    end
+    local names = PokemonNames or {}
+    print(string.format("Switch-training: %s comes in to finish it for %s.", names[party[to].species] or ("party slot " .. (to + 1)),
+        names[me.species] or "the lead"))
+    local ok, why = CatchSetup.switch.to(CatchSetup.switch_ctx(), to)
+    if not ok then print("Switch-training: the switch didn't work (" .. tostring(why) .. ").") end
+    return "acted"
+end
+-- A move to learn with four known (moveLearnHold set): true once it's been
+-- answered by itself (learned or skipped), false to stop and ask as before.
+function CatchSetup.learn_move(hold)
+    if not (Gui.auto_learn and Gui.auto_learn(hud)) or not hold or not wPutativeTMHMMoveAddr then return false end
+    if not MoveChoice.available() then return false end
+    local newMove = wram(wPutativeTMHMMoveAddr)
+    local types = CatchSetup.species.types[hold.species]
+    local slot, why = CatchSetup.learn.choose(hold.moves, newMove, MoveChoice.move_data, types, MoveChoice.is_attack)
+    local names, moveNames = PokemonNames or {}, MoveNames or {}
+    local who, what = names[hold.species] or "Your Pokemon", moveNames[newMove] or ("move #" .. tostring(newMove))
+    if slot then
+        print(string.format("Move learning: %s learns %s instead of %s.", who, what, moveNames[hold.moves[slot]] or ("move " .. slot)))
+    else
+        print(string.format("Move learning: %s doesn't learn %s (%s).", who, what, why))
+    end
+    moveLearnHold = nil       -- (the joypad wrapper lets presses through again)
+    local ctx = CatchSetup.switch_ctx()
+    ctx.log = function(text) print("Move learning: " .. text) end
+    local ok, err = CatchSetup.learn.answer(ctx, slot)
+    if not ok then
+        print("Move learning: " .. tostring(err) .. " - stopping so you can answer it.")
+        moveLearnHold = hold
+        return false
+    end
+    return true
+end
+
 local function catch_attempt(info, attempt, snapshot)
     local label, caughtSpeciesName = info.label, info.name
     local function failed(why)
@@ -3160,6 +3450,9 @@ local function catch_attempt(info, attempt, snapshot)
     local overrideCritSafety = Gui.crit_safety_override_enabled(hud)
     local targetPercent = overrideCritSafety and Gui.custom_catch_hp_target(hud) or CATCH_HP_TARGET_PERCENT
     local critsOk = overrideCritSafety or info.retry
+    -- (this try's setups - a retry starts over from the battle menu)
+    local st = {}
+    info.setup = st
     while true do
         if stop_was_requested() then return stopped() end
         local curHP = memory.read_u16_be(enemy_hp_addr)
@@ -3169,6 +3462,37 @@ local function catch_attempt(info, attempt, snapshot)
         end
         if previousHP ~= nil and curHP < previousHP then
             lastDamageDealt = previousHP - curHP
+        end
+        do local low = have_battle_controls and CatchSetup.last_one_low(); if low then info.lowStop = true; print("Catch-mode: " .. low .. "."); return "stop", low end end
+        -- Mean Look / a sleep move / a switch to whoever has one first
+        -- (data/catch_plan.lua) - turns that don't count as weakening ones.
+        local setup = (not st.ballsOnly) and CatchSetup.turn(st, critsOk, targetPercent, caughtSpeciesName) or "balls"
+        if setup == "acted" then
+            previousHP = nil
+            goto next_turn
+        elseif setup == "own_fainted" then
+            if not (info.sendNext and send_next_pokemon()) then
+                return failed("your Pokemon fainted - the game wants the next one")
+            end
+            st.ballsOnly = true
+            break
+        elseif setup == "fainted" or setup == "stuck" or setup == "move2_stuck" then
+            if setup == "move2_stuck" then return failed("couldn't reliably select the move") end
+            print(string.format("Catch-mode: %s%s got stuck during a setup move (likely gone) - clearing messages.", label, caughtSpeciesName))
+            for i = 1, 400 do
+                if stop_was_requested() then return stopped() end
+                press_button("B")
+            end
+            if not confirm_battle_ended() then
+                if stop_was_requested() then return stopped() end
+                return failed("couldn't confirm the battle ended - it may still be there")
+            end
+            return "continue", "it's gone"
+        elseif setup == "balls" and curHP > maxHP * targetPercent then
+            if st.ballsWhy then print("Catch-mode: " .. st.ballsWhy .. " - throwing balls now.") else
+            print(string.format("Catch-mode: no move in the party can take more of %s's %d HP without risking a knockout - throwing balls now.",
+                caughtSpeciesName, curHP)) end
+            break
         end
         if curHP <= maxHP * targetPercent then
             break
@@ -3248,8 +3572,11 @@ local function catch_attempt(info, attempt, snapshot)
             -- but it also covers FIGHT-menu navigation failing with the
             -- target still alive, so only call it gone once the battle is
             -- confirmed over.
+            -- (v1.3.0: HP left when it got stuck = it left by itself - Teleport, Roar,
+            -- Whirlwind - not a knockout; the stress test, 2026-11-21)
+            local hpLeft = result == "stuck" and memory.read_u16_be(enemy_hp_addr) or 0
             print(string.format("Catch-mode: %s%s %s - clearing messages.", label, caughtSpeciesName,
-                result == "fainted" and "fainted while weakening it" or "got stuck while weakening it (likely fainted)"))
+                result == "fainted" and "fainted while weakening it" or (hpLeft > 0 and string.format("left the battle by itself while being weakened (%d HP left - Teleport, Roar or Whirlwind)", hpLeft) or "got stuck while weakening it (likely fainted)")))
             for i = 1, 400 do
                 if stop_was_requested() then return stopped() end
                 press_button("B")
@@ -3258,7 +3585,7 @@ local function catch_attempt(info, attempt, snapshot)
                 if stop_was_requested() then return stopped() end
                 return failed("couldn't confirm the battle ended - it may still be there")
             end
-            return "continue", "it fainted"
+            return "continue", hpLeft > 0 and "it left the battle by itself" or "it fainted"
         elseif result == "own_fainted" then
             -- With "send out the next Pokemon" it goes in and only throws
             -- balls from here on - its moves could knock the target out.
@@ -3275,6 +3602,7 @@ local function catch_attempt(info, attempt, snapshot)
             -- turn, looping forever.
             return failed("couldn't reliably select the second move")
         end
+        ::next_turn::
     end
     end
 
@@ -3284,6 +3612,22 @@ local function catch_attempt(info, attempt, snapshot)
     local LOW_BALL_THRESHOLD = 3
     while throws < maxThrows do
         if stop_was_requested() then return stopped() end
+        -- (woke up between balls: back to sleep first - a target of 2 keeps
+        -- the weakening out of it, only trap / sleep / a switch to a sleeper)
+        do local low = have_battle_controls and CatchSetup.last_one_low(); if low then info.lowStop = true; print("Catch-mode: " .. low .. "."); return "stop", low end end
+        local st = info.setup or {}
+        if not st.ballsOnly and have_battle_controls then
+            local again = CatchSetup.turn(st, false, 2, caughtSpeciesName)
+            if again == "acted" then goto next_throw end
+            if again == "own_fainted" then
+                if not (info.sendNext and send_next_pokemon()) then
+                    return failed("your Pokemon fainted - the game wants the next one")
+                end
+                st.ballsOnly = true
+            elseif again == "fainted" or again == "stuck" or again == "move2_stuck" then
+                return failed("a setup move between balls didn't finish")
+            end
+        end
         ballId = find_ball_in_bag()
         if not ballId then
             -- With rollback, resetting gives every ball thrown back.
@@ -3305,6 +3649,11 @@ local function catch_attempt(info, attempt, snapshot)
         end
 
         local navigated = navigate_to_pack_and_select_ball(ballId)
+        for _ = 1, 3 do
+            if navigated ~= "retry" then break end
+            navigated = navigate_to_pack_and_select_ball(ballId)
+        end
+        if navigated == "retry" then navigated = false end
         if not navigated then
             return failed("couldn't get to the ball in the Pack")
         end
@@ -3320,7 +3669,17 @@ local function catch_attempt(info, attempt, snapshot)
         catchOutcomeSucceeded = false
         catchOutcomeFailed = false
         local ballWaitFrames = 0
+        -- (v1.3.0: the battle menu back with no ball thrown - the Pack closed:
+        -- never A into it, A there is FIGHT and a move could knock it out;
+        -- the stress test, 2026-11-21: a shiny Geodude at 8 HP)
+        local menuBack = false
+        have_battle_controls = false
         while not catchOutcomeSucceeded and not catchOutcomeFailed and ballWaitFrames < 1200 do
+            if have_battle_controls then
+                print("Catch-mode: back at the battle menu without a throw - not pressing A there (that is FIGHT), trying the Pack again.")
+                menuBack = true
+                break
+            end
             if stop_was_requested() then return stopped() end
             press_button("A")
             for i = 1, 15 do
@@ -3420,8 +3779,9 @@ local function catch_attempt(info, attempt, snapshot)
                 press_button("B")
                 if have_battle_controls then break end
             end
-            throws = throws + 1
+            if not menuBack then throws = throws + 1 end
         end
+        ::next_throw::
     end
 
     return failed(string.format("%d balls didn't catch it", maxThrows))
@@ -3521,6 +3881,8 @@ local function do_catch_sequence(isShiny, shinyEmbedFields, shinySpriteUrl, labe
         have_battle_controls = true
         notify(string.format("%s%s: auto-catch stopped%s (%s) - catch it yourself from the start of the battle.", label, caughtSpeciesName,
             tries, why), COLOR_RED)
+    elseif outcome == "stop" and info.lowStop then
+        notify(string.format("%s%s: auto-catch stopped - %s.", label, caughtSpeciesName, why), COLOR_RED)
     elseif why then
         notify(string.format("%s%s could not be caught, bot stopped (%s).", label, caughtSpeciesName, why), COLOR_RED)
     end
@@ -4589,7 +4951,7 @@ end
 function M.step()
     -- Whatever was pressing buttons when the move-learn hook fired, nothing
     -- gets through any more - stop here and let the player decide.
-    if moveLearnHold then return stop_for_move_learn() end
+    if moveLearnHold and not CatchSetup.learn_move(moveLearnHold) then return stop_for_move_learn() end
 
     check_stuck_and_notify()
 
@@ -4815,7 +5177,12 @@ function M.step()
     if rawSpecies == 0 then
         have_battle_controls = false
         overworld_settle_frames = overworld_settle_frames + 1
-        if overworld_settle_frames >= REQUIRED_SETTLE_FRAMES then
+        -- (v1.3.0: back sooner once the game says the battle is over -
+        -- wBattleMode 0 - instead of always the full 90 frames; at the start of
+        -- a battle wBattleMode is set before the species flickers, so that
+        -- flicker never passes for this)
+        if overworld_settle_frames >= REQUIRED_SETTLE_FRAMES
+                or (overworld_settle_frames >= 20 and M.battleModeAddr and memory.readbyte(M.battleModeAddr) == 0) then
             if not overworld_loaded then
                 vprint("Overworld loaded - movement enabled")
 
@@ -5336,11 +5703,23 @@ function M.step()
                 hasPP = false
                 if Gui.kill_non_shiny(hud) and riskyLoggedFor ~= encounterSerial then
                     riskyLoggedFor = encounterSerial
-                    print(string.format("Kill-mode: %s knows %s, super effective against yours - running instead.",
+                    print(string.format("Kill-mode: %s knows %s - running instead.",
                         get_pokemon_name(species), killThreat))
                 end
             else
                 hasPP = move_pp(1) > 0 or move_pp(2) > 0
+            end
+            -- (v1.3.0 switch-training: a partner finishes it for the lead -
+            -- data/train.lua)
+            if Gui.kill_non_shiny(hud) and not shinyLatchedThisBattle and killAllowedForThisSpecies then
+                local trainAct = CatchSetup.train_turn(killPick, killWhy, encounterSerial)
+                if trainAct == "acted" then return end
+                if trainAct == "depleted" then
+                    Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount,
+                        "Stopped - nobody left with HP or PP to switch-train")
+                    send_alert("⚠️ Switch-training stopped: nobody in the party has HP or PP left to fight for the lead. Heal up, then resume.", COLOR_RED)
+                    return true
+                end
             end
             local hpSafe = has_safe_hp()
 
@@ -5356,7 +5735,7 @@ function M.step()
                 Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount, "Attacking...")
                 if killPick then print("Kill-mode: " .. MoveChoice.describe(killPick, "kill") .. ".") end
                 local killResult = do_kill_turn(killPick and killPick.slot)
-                if killResult == "stuck" and moveLearnHold then return stop_for_move_learn() end
+                if killResult == "stuck" and moveLearnHold then if CatchSetup.learn_move(moveLearnHold) then return end; return stop_for_move_learn() end
                 if killResult == "stuck" then
                     Gui.update_counts(hud, Stats.totalEncounters, Stats.totalShinies, Stats.encountersSinceShiny, sessionEncounterCount,
                         "Stopped - move-learn or evolution prompt needs your input")

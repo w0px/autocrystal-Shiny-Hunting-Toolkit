@@ -18,19 +18,24 @@ local M = {}
 local script_path = debug.getinfo(1, "S").source:sub(2)
 local script_dir = script_path:match("(.*[/\\])") or "./"
 local SETTINGS_FILE_PATH = script_dir .. "gui_settings.txt"
+-- (the file in use: a test points it at a copy of its own)
+M.FILE = SETTINGS_FILE_PATH
 
 -- key -> raw string value, exactly as stored on disk. Keys missing here
 -- were never saved, so callers keep their own defaults for them.
 M.values = {}
 
 function M.load()
-    local f = io.open(SETTINGS_FILE_PATH, "r")
+    local f = io.open(M.FILE, "r")
     if f == nil then return end
     for line in f:lines() do
         -- Same trailing-"\r" tolerance as data/stats.lua's parser (a copy
         -- of the file edited/saved elsewhere with CRLF line endings).
         line = line:gsub("\r$", "")
-        local key, value = line:match("^(%a+)=(.*)$")
+        -- (letters, digits and _: the playthrough's settings are "play_<name>"
+        -- - letters only skipped them all, so they came back as the
+        -- defaults after every restart; the user saw it, 2026-11-08)
+        local key, value = line:match("^([%w_]+)=(.*)$")
         if key then
             M.values[key] = value
         end
@@ -66,6 +71,17 @@ function M.set(key, value)
 end
 
 function M.save()
+    -- (a key in the file this copy never loaded - written since by someone
+    -- else, or by a newer launcher - is kept, not wiped: an older launcher
+    -- window's save dropped the #daily-log webhook, 2026-11-20)
+    local f0 = io.open(M.FILE, "r")
+    if f0 then
+        for line in f0:lines() do
+            local key, value = line:gsub("\r$", ""):match("^([%w_]+)=(.*)$")
+            if key and M.values[key] == nil then M.values[key] = value end
+        end
+        f0:close()
+    end
     local keys = {}
     for key, _ in pairs(M.values) do
         table.insert(keys, key)
@@ -76,9 +92,9 @@ function M.save()
         table.insert(lines, key .. "=" .. M.values[key] .. "\n")
     end
 
-    local f = io.open(SETTINGS_FILE_PATH, "w")
+    local f = io.open(M.FILE, "w")
     if f == nil then
-        print("WARNING: couldn't write " .. SETTINGS_FILE_PATH .. " - GUI settings won't be remembered next time")
+        print("WARNING: couldn't write " .. M.FILE .. " - GUI settings won't be remembered next time")
         return
     end
     f:write(table.concat(lines))

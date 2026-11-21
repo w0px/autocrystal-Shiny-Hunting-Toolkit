@@ -526,9 +526,21 @@ end
 local function window_args()
     return string.format("-Hwnd %d", shell)
 end
+-- The notification relay takes the bot's messages as files (data/
+-- discord_queue.lua: no web call the emulator waits on), writes a heartbeat
+-- every couple of seconds, and takes the port over from an older copy still
+-- holding it (BizHawk not restarted, or a hung one). A relay that dies,
+-- hangs or is an old version is started again - see relays_heal below.
+local DiscordQueue = require("data.discord_queue")
+local RelayWatch = require("data.relay_watch")
+local DISCORD_RELAY = {name = "Discord notification relay", file = Paths.log_path("discord_relay.alive"), version = 2}
+local function discord_relay_args()
+    return relay_args("discord_relay_log.txt") .. string.format(' -SpoolDir "%s" -HeartbeatFile "%s" -Takeover',
+        Paths.log_path(""), DISCORD_RELAY.file)
+end
 local RELAY_HELPERS = {
     {file = "discord_presence_relay.ps1", args = relay_args("presence_relay_log.txt"), name = "Discord Rich Presence relay"},
-    {file = "discord_relay.ps1", args = relay_args("discord_relay_log.txt"), name = "Discord notification relay"},
+    {file = "discord_relay.ps1", args = discord_relay_args, name = "Discord notification relay"},
 }
 
 -- Starts the given helpers (see above), all with one os.execute.
@@ -562,6 +574,8 @@ do
         print("Discord relays are turned off in Advanced Settings - not starting them.")
     else
         for _, relay in ipairs(RELAY_HELPERS) do table.insert(helpers, relay) end
+        DiscordQueue.DIR = Paths.log_path("")
+        DISCORD_RELAY.startedAt = os.time()
     end
     table.insert(helpers, {file = "set_window_icon.ps1", args = function()
         return string.format('-Hwnd %d -ImagePath "%s" -AlsoTitles "%s"', shell,
@@ -586,7 +600,50 @@ end
 -- quit by themselves within a couple of seconds.) Runs from that Save
 -- button's click callback, which is fine for os.execute.
 Gui.on_relays_toggled = function(disabled)
-    if not disabled then start_helpers(RELAY_HELPERS) end
+    if not disabled then
+        start_helpers(RELAY_HELPERS)
+        DiscordQueue.DIR = Paths.log_path("")
+        DISCORD_RELAY.startedAt = os.time()
+    else
+        DiscordQueue.DIR = nil
+    end
+end
+
+-- Lua that never lets a frame pass would freeze BizHawk: stopped with an
+-- error and a Discord message instead (data/hang_guard.lua).
+local HangGuard = require("data.hang_guard")
+HangGuard.on(function(text)
+    print("autocrystal: " .. text .. ".")
+    if Gui.discord_enabled(sharedHud) then
+        DiscordQueue.post("http://127.0.0.1:5000/", string.format(
+            '{"embeds":[{"title":"autocrystal stopped","description":"%s. Restart the bot from the launcher.","color":15548997}]}',
+            (text:gsub('["\\]', ""))))
+    end
+end)
+
+-- Every 15 s: the notification relay dead (no heartbeat for 45 s), hung or
+-- an older version - started again (it takes the port over itself). At
+-- most once every 2 minutes, so a relay that can't start isn't hammered.
+local relayHealNext = os.time() + 15
+local function read_small_file(p)
+    local f = io.open(p, "rb")
+    if not f then return nil end
+    local t = f:read("a")
+    f:close()
+    return t
+end
+local function relays_heal()
+    local now = os.time()
+    if now < relayHealNext then return end
+    relayHealNext = now + 15
+    if Gui.relays_disabled(sharedHud) then return end
+    local why = RelayWatch.why(now, DISCORD_RELAY, read_small_file)
+    if why then
+        print(string.format("Discord notification relay: %s - starting it again.", why))
+        start_helpers({RELAY_HELPERS[2]})
+        DiscordQueue.DIR = Paths.log_path("")
+        DISCORD_RELAY.startedAt = now
+    end
 end
 
 -- For the debug log's Start line: the module plus whatever its pickers in
@@ -606,6 +663,7 @@ end
 
 while true do
     emu.frameadvance()
+    pcall(relays_heal)
 
     -- Live-preview the artwork for whatever's currently selected in the
     -- dropdown, even before Start is clicked. Polled each frame - cheap,

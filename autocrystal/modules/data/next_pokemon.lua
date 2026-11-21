@@ -154,7 +154,13 @@ function M.send(ctx)
 
     -- YES, then the party menu. Should the box come up again (the press
     -- missed it), YES again.
+    -- (a YES the game took starts the party pick at once - the pick hook:
+    -- none within 60 frames, nor the box shown again, and the cursor still
+    -- on YES - the A was lost (the box still drawing, a lag frame): A again,
+    -- up to 4 in all - the audit, 2026-11-15: one A, trusted, and the box
+    -- sat there 15 s till "the party menu never came up")
     local answered, pickBefore = 0, pickSeen
+    local presses, sinceA = 0, nil
     frames = 0
     while pickSeen == pickBefore do
         if ctx.stop() then return false, "Stop was pressed (at the party menu - pick one yourself)" end
@@ -166,10 +172,20 @@ function M.send(ctx)
             end
             ctx.press("A")
             answered = useNextSeen
+            presses, sinceA = 1, 0
             frames = frames + 13
+        elseif sinceA and sinceA >= 60 then
+            if presses >= 4 then return false, "YES didn't take A (the box is still up - answer it yourself)" end
+            if ctx.read8(cursorAddr) ~= 1 then
+                return false, "the cursor wasn't on YES - left it for you"
+            end
+            ctx.press("A")
+            presses, sinceA = presses + 1, 0
+            frames = frames + 5
         else
             emu.frameadvance()
             frames = frames + 1
+            if sinceA then sinceA = sinceA + 1 end
         end
     end
 

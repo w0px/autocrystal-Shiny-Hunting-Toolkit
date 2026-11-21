@@ -98,6 +98,24 @@ function M.next_fighter(read8, read16, partyCountAddr)
     return nil
 end
 
+-- v1.3.0 switch-training: the partners fight too - the party member (not an
+-- egg, not fainted) lowest on HP, if it's at M.LOW_HP or less: slot, hp, max.
+function M.low_member(read8, read16, partyCountAddr)
+    local count = read8(partyCountAddr)
+    if count < 1 or count > 6 then return nil end
+    local best, bestHp, bestMax, bestShare
+    for slot = 0, count - 1 do
+        if read8(partyCountAddr + 1 + slot) ~= EGG then
+            local mon = partyCountAddr + 8 + slot * PARTY_MON_SIZE
+            local hp, maxHP = read16(mon + MON_HP), read16(mon + MON_MAXHP)
+            if hp > 0 and maxHP > 0 and hp <= M.LOW_HP * maxHP and (bestShare == nil or hp / maxHP < bestShare) then
+                best, bestHp, bestMax, bestShare = slot, hp, maxHP, hp / maxHP
+            end
+        end
+    end
+    return best, bestHp, bestMax
+end
+
 function M.hp_addr(partyCountAddr, slot)
     return partyCountAddr + 8 + slot * PARTY_MON_SIZE + MON_HP
 end
@@ -136,6 +154,12 @@ end
 --                            party screen all use it)
 --   curItemAddr, itemsAddr   wCurItem, wItems
 --   partyCountAddr           wPartyCount
+--   give                     optional (dev, 2026-11-14): GIVE it to the
+--                            Pokemon to hold instead of USE - the box is
+--                            GIVE/TOSS/QUIT (3 rows) for an item that can't
+--                            be used, USE/GIVE/TOSS/QUIT for one that can
+--   yes_no(), answer_yes()   optional: a YES/NO up ("...is already holding
+--                            X. Switch items?") and answering it YES
 -- Returns true, the HP after; or false, why. Every menu is closed again
 -- either way.
 function M.use(ctx, itemId, slot)
@@ -196,20 +220,29 @@ function M.use(ctx, itemId, slot)
     -- moving a cursor). The list shares its bytes only with script scratch
     -- (a trainer spotting you, fruit trees, item balls), set fresh before
     -- every use.
+    -- (Start again while the list never came - a Start sent before the
+    -- overworld takes input again, just after a battle, is lost: pc.lua's
+    -- and item_farm's lesson. Never again once the list reads as there: a
+    -- second Start would close the menu. The count is cleared once only -
+    -- a lost Start leaves it cleared. The audit, 2026-11-15)
     ctx.write8(ctx.menuItemsAddr, 0)
-    ctx.press("Start")
     local packRow, count
-    for _ = 1, 24 do
-        if not ctx.wait(5) then return fail("a battle started") end
-        count = ctx.read8(ctx.menuItemsAddr)
-        if count >= 1 and count <= 10 then
-            for i = 1, count do
-                if ctx.read8(ctx.menuItemsAddr + i) == STARTMENU_PACK then packRow = i end
+    for _ = 1, 5 do
+        ctx.press("Start")
+        for _ = 1, 24 do
+            if not ctx.wait(5) then return fail("a battle started") end
+            count = ctx.read8(ctx.menuItemsAddr)
+            if count >= 1 and count <= 10 then
+                for i = 1, count do
+                    if ctx.read8(ctx.menuItemsAddr + i) == STARTMENU_PACK then packRow = i end
+                end
+                local cy = ctx.read8(ctx.cursorYAddr)
+                if packRow and cy >= 1 and cy <= count and menu_x() ~= 0 and menu_buttons() & SCROLL_BUTTONS == 0 then break end
+                packRow = nil
             end
-            local cy = ctx.read8(ctx.cursorYAddr)
-            if packRow and cy >= 1 and cy <= count and menu_x() ~= 0 and menu_buttons() & SCROLL_BUTTONS == 0 then break end
-            packRow = nil
         end
+        if packRow or (count >= 1 and count <= 10) then break end
+        if not ctx.wait(10) then return fail("a battle started") end
     end
     if packRow == nil then return fail("the Start menu didn't open") end
     if not ctx.wait(10) then return fail("a battle started") end
@@ -231,19 +264,32 @@ function M.use(ctx, itemId, slot)
     -- The Pack remembers its pocket: Items is the one whose highlighted
     -- item is in wItems. The cursor can sit on CANCEL under the list, so
     -- one Up on each pocket before moving Right to the next.
+    -- (with ctx.curPocketAddr - wCurPocket, 0 = Items - the pocket itself
+    -- too: in the TM/HM pocket wCurItem is the TM's number, and TM09-20/38/39
+    -- read as ANTIDOTE..REPEL, FULL HEAL, REVIVE - the old TM pocket passed
+    -- for Items. Then no Up outside Items and no Right out of it; the audit,
+    -- 2026-11-15)
+    local function in_items_pocket()
+        return not ctx.curPocketAddr or ctx.read8(ctx.curPocketAddr) == 0
+    end
     local function on_items()
+        if not in_items_pocket() then return false end
         return index_of(M.items(ctx.read8, ctx.itemsAddr), ctx.read8(ctx.curItemAddr)) ~= nil
     end
     local found = on_items()
     for _ = 1, 5 do
         if found then break end
-        ctx.press("Up")
-        if not ctx.wait(10) then return fail("a battle started") end
-        found = on_items()
-        if found then break end
-        ctx.press("Right")
-        if not ctx.wait(20) then return fail("a battle started") end
-        found = on_items()
+        if in_items_pocket() then
+            ctx.press("Up")
+            if not ctx.wait(10) then return fail("a battle started") end
+            found = on_items()
+            if found then break end
+        end
+        if not (ctx.curPocketAddr and in_items_pocket()) then
+            ctx.press("Right")
+            if not ctx.wait(20) then return fail("a battle started") end
+            found = on_items()
+        end
     end
     if not found then return fail("couldn't find the Items pocket") end
     log(string.format("Items pocket open, cursor on item %d", ctx.read8(ctx.curItemAddr)))
@@ -269,15 +315,17 @@ function M.use(ctx, itemId, slot)
     local packX = menu_x()
     local function box_open()
         local x = menu_x()
-        return menu_rows() == 4 and x ~= packX and x ~= 0 and menu_buttons() & SCROLL_BUTTONS == 0
+        return (menu_rows() == 4 or (ctx.give and menu_rows() == 3)) and x ~= packX and x ~= 0 and menu_buttons() & SCROLL_BUTTONS == 0
     end
     ok, why = press_until("A", box_open, function()
         return menu_x() == packX and ctx.read8(ctx.curItemAddr) == itemId
     end, "the USE box didn't open")
     if not ok then return fail(why) end
     if not ctx.wait(10) then return fail("a battle started") end
-    if not to_row(ctx, 1) then return fail(string.format("couldn't get to USE (cursor on row %d)", ctx.read8(ctx.cursorYAddr))) end
-    log("on USE")
+    local wantRow, wantName = 1, "USE"
+    if ctx.give then wantRow, wantName = (menu_rows() == 4) and 2 or 1, "GIVE" end
+    if not to_row(ctx, wantRow) then return fail(string.format("couldn't get to %s (cursor on row %d)", wantName, ctx.read8(ctx.cursorYAddr))) end
+    log("on " .. wantName)
 
     -- USE -> the party screen. It loads its graphics and redraws everything
     -- before it takes a button. It's set up once InitPartyMenuWithCancel has
@@ -287,8 +335,10 @@ function M.use(ctx, itemId, slot)
     local function on_party_screen()
         return menu_x() == 0 and menu_rows() == partyCount + 1 and menu_buttons() == A_OR_B
     end
+    -- (the row it went to: GIVE is row 2 in the 4-row box - with 1 here a
+    -- missed A on GIVE was never pressed again; the audit, 2026-11-15)
     ok, why = press_until("A", on_party_screen, function()
-        return menu_x() == boxX and ctx.read8(ctx.cursorYAddr) == 1
+        return menu_x() == boxX and ctx.read8(ctx.cursorYAddr) == wantRow
     end, "the party screen didn't open")
     if not ok then return fail(why) end
     if not ctx.wait(30) then return fail("a battle started") end
@@ -305,9 +355,33 @@ function M.use(ctx, itemId, slot)
         return fail(string.format("couldn't put the party cursor on row %d (it's on row %d)", row, ctx.read8(ctx.cursorYAddr)))
     end
     log(string.format("party screen, cursor on row %d, HP %d", row, before))
-    ok, why = press_until("A", function() return ctx.read16(hpAddr) > before end, function()
+    -- (dev, 2026-11-08: ctx.worked() for items that don't give HP - a cure
+    -- clears the status instead; HP going up is the sign for potions)
+    local worked0 = ctx.worked or function() return ctx.read16(hpAddr) > before end
+    -- (giving to one that holds something: "Switch items?" - YES. GIVE:
+    -- the game writes the held item only once "Made X hold Y." - or the
+    -- switch question's para and "Took X's Y and made it hold Z." - is
+    -- closed (TryGiveItemToPartymon); the party screen's menu stays up
+    -- under the text, so the 4 presses ran out while it printed (the s3
+    -- replays, 2026-11-16: Quick Claw never given). A only while the game
+    -- waits for a button - never a party pick.)
+    local function worked()
+        if ctx.yes_no and ctx.yes_no() then ctx.answer_yes() end
+        if ctx.text_waiting and ctx.text_waiting() then ctx.press("A") end
+        return worked0()
+    end
+    ok, why = press_until("A", worked, function()
         return on_party_screen() and ctx.read8(ctx.cursorYAddr) == row
-    end, string.format("its HP didn't go up (still %d)", before))
+    end, ctx.worked and "it didn't take" or string.format("its HP didn't go up (still %d)", before))
+    -- (GIVE's texts can outlast press_until's windows - slow text, the
+    -- switch path: more frames, still only A on a waiting text and YES on
+    -- the question, nothing on a menu; bounded)
+    if not ok and ctx.give and why ~= "a battle started" then
+        for _ = 1, 150 do
+            if not ctx.wait(5) then return fail("a battle started") end
+            if worked() then ok = true; break end
+        end
+    end
     if not ok then return fail(why) end
     -- The bar fills and "...HP was restored" waits for a button; back_out's
     -- B answers it and closes the Pack and the Start menu.

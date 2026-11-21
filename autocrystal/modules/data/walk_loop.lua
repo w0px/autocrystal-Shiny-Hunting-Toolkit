@@ -245,4 +245,54 @@ function M.plan(read8, rom, a, homeX, homeY, playerX, playerY, radius)
     return loop
 end
 
+-- ---------------------------------------------- v1.3.0: a new round each battle
+-- The same loop forever looks like a bot and walks the same few tiles. After
+-- each battle M.round() picks a new one: on a patch with more grass than the
+-- one loop covers, a loop round a random tile within M.WANDER steps of home
+-- (radius 2 or 3); either way round, at random. Every step is still on an
+-- encounter tile (the way to it goes through the patch), so nothing is lost.
+M.WANDER = 3
+local OPPOSITE = {Up = "Down", Down = "Up", Left = "Right", Right = "Left"}
+
+-- The loop walked the other way round.
+function M.reverse(loop)
+    local n = #loop.x
+    local r = {x = {}, y = {}, dirs = {}, set = loop.set, size = loop.size, mapGroup = loop.mapGroup, mapNumber = loop.mapNumber}
+    for k = 1, n do
+        r.x[k], r.y[k] = loop.x[n - k + 1], loop.y[n - k + 1]
+        r.dirs[k] = OPPOSITE[loop.dirs[k < n and (n - k) or n]]
+    end
+    return r
+end
+
+-- A new round: the loop to walk, or nil and why (then plan() as before).
+-- rand(n) -> 1..n.
+function M.round(read8, rom, a, homeX, homeY, playerX, playerY, rand)
+    rand = rand or math.random
+    local base, why = M.plan(read8, rom, a, homeX, homeY, playerX, playerY)
+    if not base then return nil, why end
+    local coll = M.collision_reader(read8, rom, a)
+    local big, n = M.region(coll, homeX, homeY, read8(a.environment), read8(a.mapWidth), read8(a.mapHeight), M.RADIUS + M.WANDER)
+    local loop = base
+    if n > base.size * 1.5 then
+        local tiles = {}
+        for k in pairs(big) do
+            local x, y = k % 1024, k // 1024
+            if math.abs(x - homeX) <= M.WANDER and math.abs(y - homeY) <= M.WANDER then tiles[#tiles + 1] = {x, y} end
+        end
+        table.sort(tiles, function(p, q) return p[2] * 1024 + p[1] < q[2] * 1024 + q[1] end)
+        if #tiles > 0 then
+            local t = tiles[rand(#tiles)]
+            local other = M.plan(read8, rom, a, t[1], t[2], playerX, playerY, 1 + rand(2))
+            if other then
+                -- (the way onto it: anywhere in the big patch)
+                other.set, other.size = big, n
+                loop = other
+            end
+        end
+    end
+    if rand(2) == 2 then loop = M.reverse(loop) end
+    return loop
+end
+
 return M

@@ -48,6 +48,9 @@ local PERSISTED_POPUP_SETTINGS = {
         {field = "_savedKillModeEnabled", key = "killmode", kind = "bool"},
         {field = "_savedKillFilterText", key = "killfilter", kind = "text"},
         {field = "_savedUsePotions", key = "usepotions", kind = "bool"},
+        -- v1.3.0 (data/train.lua, data/move_learn.lua)
+        {field = "_savedSwitchTrain", key = "switchtrain", kind = "bool"},
+        {field = "_savedAutoLearn", key = "autolearn", kind = "bool"},
     },
     advanced = {
         {field = "_savedStopItemEnabled", key = "stopitem", kind = "bool"},
@@ -690,7 +693,7 @@ end
 local DISABLEABLE_FIELDS = {
     "chkStopSpecies", "txtSpeciesId",
     "chkStopItem", "txtItemFilter",
-    "chkKillMode", "txtKillFilter", "chkUsePotions",
+    "chkKillMode", "txtKillFilter", "chkUsePotions", "chkSwitchTrain", "chkAutoLearn",
     "chkThiefMode", "txtThiefFilter", "chkThiefNotify",
     "chkStopPerfect", "chkStopNegative",
     "chkAutoCatch",
@@ -1221,6 +1224,8 @@ local function save_general_settings(w)
     w._savedKillModeEnabled = forms.ischecked(w.chkKillMode)
     w._savedKillFilterText = forms.gettext(w.txtKillFilter)
     w._savedUsePotions = forms.ischecked(w.chkUsePotions)
+    w._savedSwitchTrain = forms.ischecked(w.chkSwitchTrain)
+    w._savedAutoLearn = forms.ischecked(w.chkAutoLearn)
     persist_popup_settings(w, "general")
 end
 
@@ -1244,6 +1249,8 @@ function M.open_general_settings(w)
         w.lblKillFilter = nil
         w.txtKillFilter = nil
         w.chkUsePotions = nil
+        w.chkSwitchTrain = nil
+        w.chkAutoLearn = nil
     end)
     local top = 6
     local help = {}
@@ -1271,6 +1278,12 @@ function M.open_general_settings(w)
     -- data/potions.lua, from each battle module's Kill mode block.
     help_button(genForm, help, y, "After a battle, if the Pokemon that fights next is at 25% HP or less, it is healed from the Items pocket: the smallest potion that heals it fully, else the biggest, then more while a whole potion is missing. Never Berries. None left: it runs at low HP.")
     w.chkUsePotions = popup_checkbox(genForm, "Use potions after battles (HP 25% or less)", POPUP_X, y, 390, w._savedUsePotions)
+    y = y + 23
+    help_button(genForm, help, y, "Your lead gets the EXP without having to win alone: when it can't safely knock the wild one out by itself, the best of the others in your party comes in and finishes it (both share the EXP). When it can win alone, it fights alone (all the EXP). Once nobody has HP or PP left for it, the bot stops.")
+    w.chkSwitchTrain = popup_checkbox(genForm, "Switch-training (the others finish for your lead)", POPUP_X, y, 390, w._savedSwitchTrain)
+    y = y + 23
+    help_button(genForm, help, y, "When a Pokemon wants to learn a move with 4 already known: it's learned only if it hits harder than the weakest attack it would replace - never over an HM move or a move that isn't an attack. Otherwise it's skipped. Unticked: the bot stops and asks you, as before.")
+    w.chkAutoLearn = popup_checkbox(genForm, "Learn better moves by itself (else stop and ask)", POPUP_X, y, 390, w._savedAutoLearn)
     top = end_section(genForm, top, y + 22)
 
     top = add_help_line(genForm, help, top)
@@ -1759,6 +1772,20 @@ function M.use_potions(w)
     if w.chkUsePotions == nil then return w._savedUsePotions or false end
     local enabled = forms.ischecked(w.chkUsePotions)
     w._savedUsePotions = enabled
+    return enabled
+end
+
+-- v1.3.0 Kill mode options (General Settings).
+function M.switch_train(w)
+    if w.chkSwitchTrain == nil then return w._savedSwitchTrain or false end
+    local enabled = forms.ischecked(w.chkSwitchTrain)
+    w._savedSwitchTrain = enabled
+    return enabled
+end
+function M.auto_learn(w)
+    if w.chkAutoLearn == nil then return w._savedAutoLearn or false end
+    local enabled = forms.ischecked(w.chkAutoLearn)
+    w._savedAutoLearn = enabled
     return enabled
 end
 
