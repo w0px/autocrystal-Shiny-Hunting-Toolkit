@@ -80,6 +80,7 @@ local PERSISTED_POPUP_SETTINGS = {
         {field = "_savedCatchRetryCountText", key = "catchretrycount", kind = "text"},
         {field = "_savedCatchRetryAlways", key = "catchretryalways", kind = "bool"},
         {field = "_savedCatchSendNext", key = "catchsendnext", kind = "bool"},
+        {field = "_savedSmartCatch", key = "smartcatch", kind = "bool"},
         {field = "_savedShinySavestate", key = "shinysavestate", kind = "bool"},
     },
     discord = {
@@ -705,7 +706,7 @@ local DISABLEABLE_FIELDS = {
     "chkStopOnShiny",
     "chkCatchOnPerfect", "chkCatchOnPerfectNegative",
     "chkCatchRetry", "txtCatchRetryCount", "chkCatchRetryAlways",
-    "chkCatchSendNext", "chkShinySavestate",
+    "chkCatchSendNext", "chkShinySavestate", "chkSmartCatch",
 }
 
 -- Frame rollback's options that only mean something one way: Tries and
@@ -731,6 +732,8 @@ local function update_rollback_controls(w)
     enable("lblCatchRetryCount", rollback and not always)
     enable("txtCatchRetryCount", rollback and not always)
     enable("chkCatchSendNext", not rollback)
+    -- (Smart catching means nothing with rollback on: that is balls only)
+    enable("chkSmartCatch", not rollback)
 end
 
 -- Re-enables everything, then disables only the given list. Call this
@@ -838,6 +841,7 @@ local function save_autocatch_settings(w)
     w._savedCatchRetryCountText = forms.gettext(w.txtCatchRetryCount)
     w._savedCatchRetryAlways = forms.ischecked(w.chkCatchRetryAlways)
     w._savedCatchSendNext = forms.ischecked(w.chkCatchSendNext)
+    if w.chkSmartCatch then w._savedSmartCatch = forms.ischecked(w.chkSmartCatch) end
     w._savedShinySavestate = forms.ischecked(w.chkShinySavestate)
     persist_popup_settings(w, "autocatch")
 end
@@ -1050,6 +1054,7 @@ function M.open_autocatch_settings(w)
         w.txtCatchRetryCount = nil
         w.chkCatchRetryAlways = nil
         w.chkCatchSendNext = nil
+        w.chkSmartCatch = nil
         w.chkShinySavestate = nil
     end)
     local top = 6
@@ -1089,6 +1094,12 @@ function M.open_autocatch_settings(w)
     top = end_section(acForm, top, y + 22)
 
     y = begin_section(acForm, top, "WEAKENING")
+
+    -- v1.3.1+: the team-aware catch (data/catch_plan.lua) or the plain one.
+    -- On by default (a settings file without the key: on).
+    help_button(acForm, help, y, "On: the bot uses what your team has - sleep moves, Mean Look, switching to the right Pokemon - and where a Teleport user turns up it puts a Mean Look Pokemon in front. Off: the one out weakens it (only with moves that can't knock it out), then it throws the best balls. Frame Rollback overrides both: balls only.")
+    w.chkSmartCatch = popup_checkbox(acForm, "Smart catching (sleep, Mean Look, switching)", POPUP_X, y, 390, w._savedSmartCatch ~= false)
+    y = y + 24
 
     -- No setting: the catch code only attacks with a move that can't knock
     -- the target out (data/move_choice.lua) - a crit allowed with frame
@@ -1130,7 +1141,7 @@ function M.open_autocatch_settings(w)
 
     w._autoCatchForm = acForm
 
-    for _, key in ipairs({"chkCatchRetry", "chkCatchRetryAlways", "chkCatchSendNext"}) do
+    for _, key in ipairs({"chkCatchRetry", "chkCatchRetryAlways", "chkCatchSendNext", "chkSmartCatch"}) do
         pcall(forms.addclick, w[key], function() update_rollback_controls(w) end)
     end
     if w._lastDisabledFields then
@@ -1869,6 +1880,14 @@ function M.catch_send_next_enabled(w)
     if w.chkCatchSendNext == nil then return w._savedCatchSendNext or false end
     local enabled = forms.ischecked(w.chkCatchSendNext)
     w._savedCatchSendNext = enabled
+    return enabled
+end
+
+-- Smart catching: on unless switched off (an old settings file has no key: on).
+function M.smart_catch_enabled(w)
+    if w.chkSmartCatch == nil then return w._savedSmartCatch ~= false end
+    local enabled = forms.ischecked(w.chkSmartCatch)
+    w._savedSmartCatch = enabled
     return enabled
 end
 

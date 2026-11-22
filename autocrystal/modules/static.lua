@@ -1382,6 +1382,22 @@ local function do_catch_attack_turn(slot)
     -- Prefer the first move, but fall back to the second if the first is
     -- out of PP. The caller already confirmed at least one of the two
     -- has PP before calling this function at all.
+    -- A chosen move needs the move list confirmed open first: pressing A
+    -- without it used whatever the cursor was on. Stress test, 2026-11-22:
+    -- the list opened ~110 frames in (after the 90-frame wait above), so
+    -- Razor Leaf went out instead of Hypnosis and KO'd a weakened Celebi.
+    if slot and MoveSelectionAddr and not moveSelectScreenOpen then
+        for _ = 1, 150 do
+            if moveSelectScreenOpen then break end
+            emu.frameadvance()
+        end
+        if not moveSelectScreenOpen then
+            vprint(string.format("The move list never opened for move %d - backing out and retrying.", slot))
+            press_button("B")
+            return "ok"
+        end
+        for _ = 1, 15 do emu.frameadvance() end
+    end
     local usedSecondMove = false
     if slot and moveSelectScreenOpen then
         -- A move from data/move_choice.lua: straight to its row.
@@ -1453,7 +1469,7 @@ local function do_catch_attack_turn(slot)
     have_battle_controls = false
     local postAttackWait = 0
     local postAttackTimeout = usedSecondMove and 1800 or 600
-    local ownDown = 0
+    local ownDown, overFrames = 0, 0
     while not have_battle_controls do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1463,6 +1479,15 @@ local function do_catch_attack_turn(slot)
         press_button("A")
         ownDown = own_pokemon_down() and ownDown + 1 or 0
         if ownDown >= 3 then return "own_fainted" end
+        -- (the battle already over - it ran, Teleported, Roared or fainted:
+        -- wBattleMode and the wild one both 0 for a moment; the stress test,
+        -- 2026-11-22: a Teleporting static target left during the attack and
+        -- this waited out the whole timeout, minutes in Static, every try)
+        overFrames = (memory.readbyte(species_addr) == 0 and memory.readbyte(species_addr - 1) == 0) and overFrames + 1 or 0
+        if overFrames >= 10 then
+            print("Catch-mode: the battle ended during the attack (it got away or fainted) - back to the hunt.")
+            return "stuck"
+        end
         postAttackWait = postAttackWait + 1
         if postAttackWait > postAttackTimeout then
             print("Catch-mode: post-attack wait timed out (enemy may have fainted, or something else is blocking)")
@@ -1561,7 +1586,7 @@ function CatchSetup.party()
     for slot0 = 0, math.min(count, 6) - 1 do
         local base = party_base_addr + 8 + slot0 * 0x30
         local mon = {species = memory.readbyte(base), egg = memory.readbyte(party_base_addr + 1 + slot0) == 0xFD,
-            hp = memory.read_u16_be(base + 0x22), maxhp = memory.read_u16_be(base + 0x24), moves = {}, pp = {}}
+            hp = memory.read_u16_be(base + 0x22), maxhp = memory.read_u16_be(base + 0x24), status = memory.readbyte(base + 0x20), moves = {}, pp = {}}
         for i = 1, 4 do
             mon.moves[i] = memory.readbyte(base + 1 + i)
             mon.pp[i] = memory.readbyte(base + 0x16 + i) % 64
@@ -1594,10 +1619,13 @@ function CatchSetup.last_one_low()
     for slot0, mon in pairs(party) do
         if slot0 ~= active and not mon.egg and (mon.hp or 0) > 0 then return nil end
     end
+    -- (the user, 2026-11-22: stop as soon as only one can still fight,
+    -- whatever its HP - a Lv 2 at full HP was knocked out in one hit; the
+    -- 30% line is gone)
     local hp, maxhp = me.hp or 0, memory.read_u16_be(OWN_HP_ADDR + 2)
-    if hp > 0 and maxhp > 0 and hp < maxhp * CatchSetup.LAST_ONE_LOW then
-        return string.format("your last Pokemon that can still fight is down to %d/%d HP (under %d%%) - the bot stopped at the battle menu so it can't faint; finish the catch yourself, the battle is waiting",
-            hp, maxhp, math.floor(CatchSetup.LAST_ONE_LOW * 100 + 0.5))
+    if hp > 0 then
+        return string.format("only one Pokemon in your party can still fight (%d/%d HP) - the bot stopped at the battle menu so it can't faint; finish the catch yourself, the battle is waiting",
+            hp, maxhp)
     end
     return nil
 end
@@ -1650,6 +1678,8 @@ function CatchSetup.turn(st, critsOk, targetPercent, caughtSpeciesName)
     local types = CatchSetup.species.types
     local enemyView = enemy_addr - 6
     local plan = CatchSetup.plan.decide(party, active, enemy, st, {
+        -- (Smart catching off in the Auto-Catch settings: weaken, then balls)
+        simple = Gui.smart_catch_enabled ~= nil and not Gui.smart_catch_enabled(hud),
         targetHP = targetPercent,
         weaken = function(slot0)
             local view = slot0 == active and battle_view()

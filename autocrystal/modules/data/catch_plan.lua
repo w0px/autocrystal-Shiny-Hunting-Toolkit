@@ -65,13 +65,19 @@ local function find_move(mon, kind)
 end
 
 local function can_fight(mon) return mon and not mon.egg and (mon.hp or 0) > 0 end
+-- Can use a move once switched in: not asleep or frozen - the status stays
+-- on a Pokemon that's switched out (the stress test, 2026-11-22: a wild
+-- Poliwag's Hypnosis put the sleeper to sleep, the bot switched to the
+-- weakener, then straight back to the sleeping sleeper, and back, till one
+-- fainted).
+local function can_act(mon) return can_fight(mon) and not asleep(mon.status) end
 
 -- The party member (not the one out) with the best move of kind: slot0, acc.
 local function find_member(party, active, kind)
     local best, bestAcc
     for slot0 = 0, 5 do
         local mon = party[slot0]
-        if slot0 ~= active and can_fight(mon) then
+        if slot0 ~= active and can_act(mon) then
             local _, _, acc = find_move(mon, kind)
             if acc and (bestAcc == nil or acc > bestAcc) then best, bestAcc = slot0, acc end
         end
@@ -119,7 +125,11 @@ function M.decide(party, active, enemy, st, opts)
         local base = opts
         opts = setmetatable({weaken = function(slot0) if slot0 == active then return nil end return base.weaken and base.weaken(slot0) end}, {__index = base})
     end
-    local mayswitch = not st.noSwitch and (st.switches or 0) < M.MAX_SWITCHES and not st.trapped
+    -- (Smart catching off - opts.simple, the user 2026-11-22: no trap, no
+    -- sleep, no switching; the one out weakens with a move that can't knock
+    -- it out, then balls - as 1.2.0 did)
+    local smart = not opts.simple
+    local mayswitch = smart and not st.noSwitch and (st.switches or 0) < M.MAX_SWITCHES and not st.trapped
     -- (awake and able to end the battle with its own move - Teleport while
     -- not trapped, Roar or Whirlwind always: a switch hands it that turn for
     -- free, a ball at least gets a chance; asleep it can't use it, so a
@@ -128,7 +138,7 @@ function M.decide(party, active, enemy, st, opts)
     -- woke and Roared during a switch back to the sleeper)
     if mayswitch and not asleep(enemy.status) and M.ender(enemy, st.trapped) then mayswitch = false end
     -- 1. trap a runner
-    if M.runner(enemy) and not st.trapped and (st.trapTries or 0) < M.MAX_TRAP_TRIES then
+    if smart and M.runner(enemy) and not st.trapped and (st.trapTries or 0) < M.MAX_TRAP_TRIES then
         local slot, id = find_move(me, "trap")
         if slot then return {kind = "trap", slot = slot, id = id} end
         if mayswitch then
@@ -138,7 +148,7 @@ function M.decide(party, active, enemy, st, opts)
     end
     -- 2. sleep
     local status = enemy.status or 0
-    if status == 0 and (st.sleepTries or 0) < M.MAX_SLEEP_TRIES then
+    if smart and status == 0 and (st.sleepTries or 0) < M.MAX_SLEEP_TRIES then
         local slot, id, acc = find_move(me, "sleep")
         if slot then return {kind = "sleep", slot = slot, id = id, acc = acc} end
         if mayswitch then
@@ -164,7 +174,7 @@ function M.decide(party, active, enemy, st, opts)
         local shortSleep = sleepLeft ~= 0 and sleepLeft < M.MIN_SLEEP_TO_SWITCH
         if mayswitch and opts.weaken and not shortSleep then
             for slot0 = 0, 5 do
-                if slot0 ~= active and can_fight(party[slot0]) and opts.weaken(slot0) then
+                if slot0 ~= active and can_act(party[slot0]) and opts.weaken(slot0) then
                     return {kind = "switch", to = slot0, why = "weaken"}
                 end
             end

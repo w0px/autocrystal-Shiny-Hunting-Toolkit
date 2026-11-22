@@ -1108,6 +1108,51 @@ function PotionUse.wait(frames)
     return true
 end
 
+-- Smart catching (the user, 2026-11-22): where a wild Teleport user turns
+-- up, a Mean Look / Spider Web Pokemon goes in front between battles - an
+-- awake Teleport user gets no switch (data/catch_plan.lua), so the trapper
+-- has to be out from the start. Not in Kill mode (the trainee leads), Thief
+-- mode (the lead's item), with Frame Rollback (balls only) or Smart catching
+-- off. Once per battle; the Japanese versions: not mapped, off.
+PotionUse.trapper = require("data.lead_trapper")
+function PotionUse.trap_lead()
+    if PotionUse.trapChecked == encounterSerial then return end
+    PotionUse.trapChecked = encounterSerial
+    local LT = PotionUse.trapper
+    if PotionUse.menuItemsAddr == nil or PotionUse.submenuAddr == nil then return end
+    local mapKey = string.format("%d:%d", memory.readbyte(GsJp.map_group_addr()), memory.readbyte(GsJp.map_group_addr() + 1))
+    if species and LT.note(memory.readbyte, enemy_addr - 6, species, mapKey) then
+        print(string.format("Smart catching: %s knows Teleport - Teleport users live here (map %s).", get_pokemon_name(species), mapKey))
+    end
+    if not (Gui.smart_catch_enabled and Gui.smart_catch_enabled(hud)) or not Gui.auto_catch_enabled(hud)
+        or Gui.kill_non_shiny(hud) or Gui.thief_mode_enabled(hud) or Gui.catch_retry_enabled(hud) then return end
+    local from = LT.want(memory.readbyte, memory.read_u16_be, party_base_addr, mapKey)
+    if from == nil then return end
+    LT.tries[mapKey] = (LT.tries[mapKey] or 0) + 1
+    print(string.format("Smart catching: putting %s (party slot %d, Mean Look) in front - a Teleport user here gets no switch.",
+        get_pokemon_name(memory.readbyte(party_base_addr + 1 + from)), from + 1))
+    PotionUse.busy = true
+    local ok, why = LT.swap({
+        read8 = memory.readbyte, read16 = memory.read_u16_be,
+        press = press_button, wait = PotionUse.wait,
+        back_out = function()
+            for _ = 1, 8 do
+                press_button("B")
+                if not PotionUse.wait(20) then return end
+            end
+        end,
+        write8 = memory.writebyte, menuItemsAddr = PotionUse.menuItemsAddr, submenuAddr = PotionUse.submenuAddr,
+        log = function(text) vprint("Smart catching: " .. text) end,
+        cursorYAddr = MENU_CURSOR_Y, partyCountAddr = party_base_addr,
+    }, from)
+    if ok then
+        LT.tries[mapKey] = LT.MAX_TRIES
+        print("Smart catching: done - the Mean Look Pokemon leads now.")
+    else
+        print("Smart catching: couldn't change the order (" .. tostring(why) .. ") - trying again after the next battle.")
+    end
+end
+
 function PotionUse.after_battle()
     if PotionUse.checked == encounterSerial then return end
     PotionUse.checked = encounterSerial
@@ -1471,7 +1516,7 @@ local function do_catch_attack_turn(slot)
     -- can't safely mean "back at the top menu"; a false positive let a
     -- later turn misfire and open the BAG mid-battle. Relying on the
     -- hook plus the plain timeout fails SAFELY instead.
-    local ownDown = 0
+    local ownDown, overFrames = 0, 0
     while not have_battle_controls do
         if stop_was_requested() then
             print("Catch-mode: Stop requested - aborting.")
@@ -1480,6 +1525,15 @@ local function do_catch_attack_turn(slot)
         postAttackWait = postAttackWait + ButtonWait.advance(press_button, "A")
         ownDown = own_pokemon_down() and ownDown + 1 or 0
         if ownDown >= 3 then return "own_fainted" end
+        -- (the battle already over - it ran, Teleported, Roared or fainted:
+        -- wBattleMode and the wild one both 0 for a moment; the stress test,
+        -- 2026-11-22: a Teleporting static target left during the attack and
+        -- this waited out the whole timeout, minutes in Static, every try)
+        overFrames = (memory.readbyte(species_addr) == 0 and memory.readbyte(species_addr - 1) == 0) and overFrames + 1 or 0
+        if overFrames >= 10 then
+            print("Catch-mode: the battle ended during the attack (it got away or fainted) - back to the hunt.")
+            return "stuck"
+        end
         if postAttackWait > postAttackTimeout then
             print("Catch-mode: post-attack wait timed out (enemy may have fainted, or something else is blocking)")
             return "stuck"
@@ -2303,7 +2357,7 @@ function CatchSetup.party()
     for slot0 = 0, math.min(count, 6) - 1 do
         local base = party_base_addr + 8 + slot0 * 0x30
         local mon = {species = memory.readbyte(base), egg = memory.readbyte(party_base_addr + 1 + slot0) == 0xFD,
-            hp = memory.read_u16_be(base + 0x22), maxhp = memory.read_u16_be(base + 0x24), moves = {}, pp = {}}
+            hp = memory.read_u16_be(base + 0x22), maxhp = memory.read_u16_be(base + 0x24), status = memory.readbyte(base + 0x20), moves = {}, pp = {}}
         for i = 1, 4 do
             mon.moves[i] = memory.readbyte(base + 1 + i)
             mon.pp[i] = memory.readbyte(base + 0x16 + i) % 64
@@ -2336,10 +2390,13 @@ function CatchSetup.last_one_low()
     for slot0, mon in pairs(party) do
         if slot0 ~= active and not mon.egg and (mon.hp or 0) > 0 then return nil end
     end
+    -- (the user, 2026-11-22: stop as soon as only one can still fight,
+    -- whatever its HP - a Lv 2 at full HP was knocked out in one hit; the
+    -- 30% line is gone)
     local hp, maxhp = me.hp or 0, memory.read_u16_be(OWN_HP_ADDR + 2)
-    if hp > 0 and maxhp > 0 and hp < maxhp * CatchSetup.LAST_ONE_LOW then
-        return string.format("your last Pokemon that can still fight is down to %d/%d HP (under %d%%) - the bot stopped at the battle menu so it can't faint; finish the catch yourself, the battle is waiting",
-            hp, maxhp, math.floor(CatchSetup.LAST_ONE_LOW * 100 + 0.5))
+    if hp > 0 then
+        return string.format("only one Pokemon in your party can still fight (%d/%d HP) - the bot stopped at the battle menu so it can't faint; finish the catch yourself, the battle is waiting",
+            hp, maxhp)
     end
     return nil
 end
@@ -2392,6 +2449,8 @@ function CatchSetup.turn(st, critsOk, targetPercent, caughtSpeciesName)
     local types = CatchSetup.species.types
     local enemyView = enemy_addr - 6
     local plan = CatchSetup.plan.decide(party, active, enemy, st, {
+        -- (Smart catching off in the Auto-Catch settings: weaken, then balls)
+        simple = Gui.smart_catch_enabled ~= nil and not Gui.smart_catch_enabled(hud),
         targetHP = targetPercent,
         weaken = function(slot0)
             local view = slot0 == active and battle_view()
@@ -4008,10 +4067,13 @@ function M.init(sharedForm, yOffset, existingHud)
     -- Use potions' Start menu list (data/potions.lua): wMenuItemsList.
     if GsJp.japanese(version, region) then
         PotionUse.menuItemsAddr = nil
+        PotionUse.submenuAddr = nil
     elseif version == 0x54 then
         PotionUse.menuItemsAddr = 0xD03E
+        PotionUse.submenuAddr = 0xD1EA   -- (wMonSubmenuCount: data/lead_trapper.lua)
     else
         PotionUse.menuItemsAddr = 0xCF29
+        PotionUse.submenuAddr = 0xD0D3
     end
 
     register_hooks()
@@ -4333,6 +4395,10 @@ function M.step()
             end
         end
 
+        -- Smart catching: a Mean Look Pokemon in front where Teleport users live.
+        PotionUse.busy = false
+        PotionUse.trap_lead()
+        if stop_was_requested() then return false end
         -- Use potions: heal up between battles (see PotionUse.after_battle()).
         if Gui.kill_non_shiny(hud) and Gui.use_potions(hud) then
             PotionUse.busy = false
