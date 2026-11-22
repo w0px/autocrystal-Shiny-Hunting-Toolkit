@@ -67,11 +67,12 @@
 - Perfect DV Detection
 - Perfect Negative DV Detection
 - Discord Notifications
-- Automatic Level Grinding (Kill Mode)
+- Automatic Level Grinding (Kill Mode), with Switch-Training and Learning Better Moves
 - Item Stealing (Thief Mode)
 - Specific Encounter Hunting
 - Stuck Detection & Auto-Recovery
 - Auto Catch Shiny / Perfect DV / Held Items
+- Smart Catching: sleep moves, Mean Look and switching from your party, weakening that never risks a critical hit
 
 ### Starter Module ✅
 - Shiny Detection
@@ -86,11 +87,12 @@
 - Perfect DV Detection
 - Perfect Negative DV Detection
 - Discord Notifications
-- Automatic Level Grinding (Kill Mode)
+- Automatic Level Grinding (Kill Mode), with Switch-Training and Learning Better Moves
 - Item Stealing (Thief Mode)
 - Specific Encounter Hunting
 - Stuck Detection & Auto-Recovery
 - Auto Catch Shiny / Perfect DV / Held Items
+- Smart Catching: sleep moves, Mean Look and switching from your party, weakening that never risks a critical hit
 
 ### Static Encounter Module ✅
 - Shiny Detection
@@ -98,6 +100,7 @@
 - Perfect Negative DV Detection
 - Discord Notifications
 - Auto Catch Shiny / Perfect DV – with Frame Rollback on, retries the same shiny if it gets away (Selfdestruct, Explosion, whiteout)
+- Smart Catching: sleep moves, Mean Look and switching from your party, weakening that never risks a critical hit
 - Frame Search: tries every frame once instead of random soft resets
 - Built-in targets: Sudowoodo, Eevee, Shuckle, Spearow, Celebi, Lapras, Suicune, Snorlax, or any open-world static
 
@@ -107,11 +110,12 @@
 - Perfect DV Detection
 - Perfect Negative DV Detection
 - Discord Notifications
-- Automatic Level Grinding (Kill Mode)
+- Automatic Level Grinding (Kill Mode), with Switch-Training and Learning Better Moves
 - Item Stealing (Thief Mode)
 - Specific Encounter Hunting
 - Stuck Detection & Auto-Recovery
 - Auto Catch Shiny / Perfect DV / Held Items
+- Smart Catching: sleep moves, Mean Look and switching from your party, weakening that never risks a critical hit
 - Tree Overlay (rare tree and rigged-spot check)
 
 ### Egg Module ✅
@@ -492,6 +496,7 @@ On a shiny (or Perfect / Perfect Negative DVs, if you ticked those stops) it pic
 
 - Automatically handles phone calls and other interruptions (e.g. egg hatching)
 - Stand facing a Headbutt tree and start the module – see [How Headbutt Trees Work in Gen 2](#how-headbutt-trees-work-in-gen-2) for picking a good tree
+- One Pokémon in your party (not an egg) has to know Headbutt – without one, the bot stops right away and tells you
 - Turn on the tree overlay (Advanced Settings) before you start: it tells you whether the tree in front is a rare tree, and whether the spot is **rigged** – some spots make shinies far rarer, or impossible for some species. See [Rigged Spots: The Speckle Transition](#rigged-spots-the-speckle-transition)
 <p align="center">
 <img width="504" height="475" alt="Facing a Headbutt tree" src="https://github.com/user-attachments/assets/4ab1a4a0-e977-4c50-8edd-9a53b675d07a" />
@@ -517,6 +522,7 @@ On a shiny (or Perfect / Perfect Negative DVs, if you ticked those stops) it pic
 
 - Pick the **Static target** in the launcher – Sudowoodo, Eevee, Shuckle, Spearow, Celebi, Lapras, Suicune, Snorlax, or **Static (open world)** for any other static encounter
 - Stand where the encounter starts, without interacting: in front of the NPC handing you the Pokémon / in front of the static encounter (for Suicune: outside Tin Tower's door – the bot walks in by itself)
+- **Celebi**: stand facing the Ilex Forest shrine with the GS Ball in your bag. Celebi (Lv 30) knows Safeguard, which can block sleep moves, and Heal Bell, which can wake it up – bring a Pokémon with a gentle attack too
 - Click **Start**. The bot doesn't soft-reset – it uses **[Frame Search](#frame-search-trying-every-frame)**: it tries every frame you could start the encounter on, one after another, and rewinds after each one, so no frame is ever tried twice
 - BizHawk runs unthrottled and muted while searching (your speed and sound settings come back afterwards). Every new Pokémon it rolls counts as an encounter and shows up in Recent Encounters
 - Automatically answers phone calls that ring during the search ([Phone calls during a search](#phone-calls-during-a-search))
